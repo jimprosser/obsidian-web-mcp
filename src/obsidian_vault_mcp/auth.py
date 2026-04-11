@@ -1,5 +1,7 @@
 """Bearer token authentication middleware for the vault MCP server."""
 
+import hmac
+
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import JSONResponse
@@ -37,7 +39,7 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
             )
 
         token = auth_header[7:]
-        if token != VAULT_MCP_TOKEN:
+        if not hmac.compare_digest(token, VAULT_MCP_TOKEN):
             return JSONResponse(
                 {"error": "Invalid token"},
                 status_code=401,
