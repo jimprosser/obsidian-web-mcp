@@ -18,12 +18,22 @@ _AUTH_EXEMPT_PATHS = {
     "/oauth/register",
 }
 
+# (method, path) pairs exempt from auth — used for the MCP spec probe on /,
+# which must answer GET/HEAD without credentials while POST / stays authenticated.
+_AUTH_EXEMPT_METHOD_PATHS = {
+    ("GET", "/"),
+    ("HEAD", "/"),
+}
+
 
 class BearerAuthMiddleware(BaseHTTPMiddleware):
     """Validates Bearer tokens on all requests except OAuth and health endpoints."""
 
     async def dispatch(self, request: Request, call_next):
         if request.url.path in _AUTH_EXEMPT_PATHS:
+            return await call_next(request)
+
+        if (request.method, request.url.path) in _AUTH_EXEMPT_METHOD_PATHS:
             return await call_next(request)
 
         if not VAULT_MCP_TOKEN:

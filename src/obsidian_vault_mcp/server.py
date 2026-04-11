@@ -35,8 +35,9 @@ async def lifespan(server):
 # Create the MCP server
 mcp = FastMCP(
     "obsidian_web_mcp",
-    stateless_http=True,
+    stateless_http=False,
     json_response=True,
+    streamable_http_path="/",
     lifespan=lifespan,
     transport_security=TransportSecuritySettings(
         enable_dns_rebinding_protection=True,
@@ -204,10 +205,22 @@ def main():
 
     # Build the Starlette app with auth middleware and OAuth endpoints
     try:
+        from starlette.responses import Response
+        from starlette.routing import Route
+
         from .auth import BearerAuthMiddleware
         from .oauth import oauth_routes
 
         app = mcp.streamable_http_app()
+
+        # MCP spec 2025-06-18 probe: HEAD/GET / must return the protocol version.
+        async def mcp_root_probe(request):
+            return Response(
+                status_code=200,
+                headers={"MCP-Protocol-Version": "2025-06-18"},
+            )
+
+        app.routes.insert(0, Route("/", mcp_root_probe, methods=["GET", "HEAD"]))
 
         # Mount OAuth routes (these are excluded from bearer auth via the middleware)
         for route in oauth_routes:
