@@ -15,9 +15,12 @@ client credentials + PKCE + the bearer token on every MCP request.
 
 import hashlib
 import hmac
+import json
 import logging
+import os
 import secrets
 import time
+from pathlib import Path
 from urllib.parse import urlencode, urlparse, parse_qs
 
 from starlette.requests import Request
@@ -31,6 +34,44 @@ logger = logging.getLogger(__name__)
 # In-memory store for authorization codes (short-lived)
 # Maps code -> {client_id, redirect_uri, code_challenge, code_challenge_method, expires_at}
 _auth_codes: dict[str, dict] = {}
+
+# Persistent store for dynamically registered OAuth clients.
+# Without this, every server restart would invalidate claude.ai's stored client_id
+# and force the user to re-connect the integration.
+_CLIENTS_FILE = Path(__file__).resolve().parents[2] / ".oauth_clients.json"
+_registered_clients: dict[str, dict] = {}
+
+
+def _load_clients() -> None:
+    global _registered_clients
+    if not _CLIENTS_FILE.exists():
+        _registered_clients = {}
+        return
+    try:
+        with _CLIENTS_FILE.open("r") as f:
+            _registered_clients = json.load(f)
+        logger.info(f"Loaded {len(_registered_clients)} registered OAuth client(s) from disk")
+    except Exception as e:
+        logger.error(f"Failed to load OAuth clients from {_CLIENTS_FILE}: {e}")
+        _registered_clients = {}
+
+
+def _save_clients() -> None:
+    try:
+        _CLIENTS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        tmp = _CLIENTS_FILE.with_suffix(_CLIENTS_FILE.suffix + ".tmp")
+        with tmp.open("w") as f:
+            json.dump(_registered_clients, f, indent=2)
+        os.replace(tmp, _CLIENTS_FILE)
+        try:
+            os.chmod(_CLIENTS_FILE, 0o600)
+        except OSError:
+            pass
+    except Exception as e:
+        logger.error(f"Failed to save OAuth clients to {_CLIENTS_FILE}: {e}")
+
+
+_load_clients()
 
 # Clean up expired codes periodically
 def _cleanup_codes():
@@ -163,22 +204,30 @@ async def _handle_authorization_code(form, client_id: str, client_secret: str) -
 
 async def _handle_client_credentials(client_id: str, client_secret: str) -> JSONResponse:
     """Exchange client credentials for a bearer token."""
-    if not config.VAULT_OAUTH_CLIENT_SECRET:
-        return JSONResponse({"error": "server_error"}, status_code=500)
+    # Check dynamically registered clients first
+    client = _registered_clients.get(client_id)
+    if client and hmac.compare_digest(client_secret, client["client_secret"]):
+        logger.info(f"OAuth token issued via client_credentials (registered {client_id})")
+        return JSONResponse({
+            "access_token": config.VAULT_MCP_TOKEN,
+            "token_type": "bearer",
+            "expires_in": 86400,
+        })
 
-    id_match = hmac.compare_digest(client_id, config.VAULT_OAUTH_CLIENT_ID)
-    secret_match = hmac.compare_digest(client_secret, config.VAULT_OAUTH_CLIENT_SECRET)
+    # Fallback to the env-var-configured client (README flow)
+    if config.VAULT_OAUTH_CLIENT_SECRET:
+        id_match = hmac.compare_digest(client_id, config.VAULT_OAUTH_CLIENT_ID)
+        secret_match = hmac.compare_digest(client_secret, config.VAULT_OAUTH_CLIENT_SECRET)
+        if id_match and secret_match:
+            logger.info("OAuth token issued via client_credentials (env-configured)")
+            return JSONResponse({
+                "access_token": config.VAULT_MCP_TOKEN,
+                "token_type": "bearer",
+                "expires_in": 86400,
+            })
 
-    if not (id_match and secret_match):
-        logger.warning(f"OAuth client_credentials failed (client_id={client_id!r})")
-        return JSONResponse({"error": "invalid_client"}, status_code=401)
-
-    logger.info("OAuth token issued via client_credentials grant")
-    return JSONResponse({
-        "access_token": config.VAULT_MCP_TOKEN,
-        "token_type": "bearer",
-        "expires_in": 86400,
-    })
+    logger.warning(f"OAuth client_credentials failed (client_id={client_id!r})")
+    return JSONResponse({"error": "invalid_client"}, status_code=401)
 
 
 async def oauth_register(request: Request) -> JSONResponse:
@@ -192,16 +241,28 @@ async def oauth_register(request: Request) -> JSONResponse:
     except Exception:
         body = {}
 
-    # Generate a unique client_id for this registration
+    # Generate a unique client_id and per-client secret for this registration
     client_id = f"vault-mcp-{secrets.token_hex(8)}"
+    client_secret = secrets.token_hex(32)
+    client_name = body.get("client_name", "Obsidian Vault MCP Client")
+    redirect_uris = body.get("redirect_uris", [])
+
+    _registered_clients[client_id] = {
+        "client_secret": client_secret,
+        "client_name": client_name,
+        "redirect_uris": redirect_uris,
+        "created_at": time.time(),
+    }
+    _save_clients()
+    logger.info(f"Registered OAuth client {client_id} ({client_name})")
 
     return JSONResponse({
         "client_id": client_id,
-        "client_secret": config.VAULT_OAUTH_CLIENT_SECRET,
-        "client_name": body.get("client_name", "Obsidian Vault MCP Client"),
+        "client_secret": client_secret,
+        "client_name": client_name,
         "grant_types": ["authorization_code"],
         "response_types": ["code"],
-        "redirect_uris": body.get("redirect_uris", []),
+        "redirect_uris": redirect_uris,
         "token_endpoint_auth_method": "client_secret_post",
     }, status_code=201)
 
