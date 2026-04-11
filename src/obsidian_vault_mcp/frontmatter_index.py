@@ -26,6 +26,11 @@ class FrontmatterIndex:
 
     def start(self) -> None:
         """Walk all .md files, parse frontmatter, and start watching for changes."""
+        # Defensive guard: the observer is a process-wide singleton. Re-entering
+        # start() would double-schedule the same FSEvents watch and crash.
+        if self._observer is not None:
+            return
+
         t0 = time.monotonic()
         count = 0
 

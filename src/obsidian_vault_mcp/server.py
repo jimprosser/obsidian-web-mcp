@@ -23,13 +23,11 @@ frontmatter_index = FrontmatterIndex()
 
 @asynccontextmanager
 async def lifespan(server):
-    """Start frontmatter index on server startup, stop on shutdown."""
-    logger.info(f"Starting vault MCP server. Vault: {VAULT_PATH}")
-    frontmatter_index.start()
-    logger.info(f"Frontmatter index built: {frontmatter_index.file_count} files indexed")
+    """Per-session MCP lifespan. The frontmatter index has a process-wide
+    lifecycle (started in main(), stopped at process exit) to avoid
+    double-scheduling the vault watcher when multiple sessions initialize.
+    """
     yield {"frontmatter_index": frontmatter_index}
-    frontmatter_index.stop()
-    logger.info("Vault MCP server shut down.")
 
 
 # Create the MCP server
@@ -202,6 +200,15 @@ def main():
 
     if not VAULT_MCP_TOKEN:
         logger.warning("VAULT_MCP_TOKEN is not set -- auth will reject all requests")
+
+    # Start the frontmatter index once for the process lifetime. The watcher
+    # thread is a daemon and will terminate when the process exits.
+    import atexit
+
+    logger.info(f"Starting vault MCP server. Vault: {VAULT_PATH}")
+    frontmatter_index.start()
+    logger.info(f"Frontmatter index built: {frontmatter_index.file_count} files indexed")
+    atexit.register(frontmatter_index.stop)
 
     # Build the Starlette app with auth middleware and OAuth endpoints
     try:
