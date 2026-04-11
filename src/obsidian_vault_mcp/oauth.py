@@ -210,6 +210,7 @@ async def oauth_register(request: Request) -> JSONResponse:
 oauth_routes = [
     Route("/.well-known/oauth-authorization-server", oauth_metadata, methods=["GET"]),
     Route("/oauth/authorize", oauth_authorize, methods=["GET"]),
+    Route("/authorize", oauth_authorize, methods=["GET"]),
     Route("/oauth/token", oauth_token, methods=["POST"]),
     Route("/oauth/register", oauth_register, methods=["POST"]),
 ]

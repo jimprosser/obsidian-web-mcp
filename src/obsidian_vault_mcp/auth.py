@@ -12,6 +12,7 @@ from .config import VAULT_MCP_TOKEN
 _AUTH_EXEMPT_PATHS = {
     "/health",
     "/.well-known/oauth-authorization-server",
+    "/authorize",
     "/oauth/authorize",
     "/oauth/token",
     "/oauth/register",
