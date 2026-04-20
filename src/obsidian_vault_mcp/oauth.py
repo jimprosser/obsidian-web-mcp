@@ -157,7 +157,7 @@ async def _handle_authorization_code(form, client_id: str, client_secret: str) -
     return JSONResponse({
         "access_token": config.VAULT_MCP_TOKEN,
         "token_type": "bearer",
-        "expires_in": 86400,
+        "expires_in": 31536000,
     })
 
 
@@ -177,7 +177,7 @@ async def _handle_client_credentials(client_id: str, client_secret: str) -> JSON
     return JSONResponse({
         "access_token": config.VAULT_MCP_TOKEN,
         "token_type": "bearer",
-        "expires_in": 86400,
+        "expires_in": 31536000,
     })
 
 
