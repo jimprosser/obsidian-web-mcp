@@ -53,13 +53,32 @@ This is a server that provides network access to your personal notes. Security i
 |------|-------------|
 | `vault_read` | Read a file, returning content, metadata, and parsed YAML frontmatter |
 | `vault_batch_read` | Read multiple files in one call; handles missing files gracefully |
-| `vault_write` | Write a file with optional frontmatter merging; creates parent dirs |
+| `vault_write` | Write a file with optional frontmatter merging; creates parent dirs. Blocks Markdown checkboxes (`- [ ]`) by default — set `allow_checkboxes=True` only when the user explicitly asked for tasks (see "Checkbox guard" below) |
 | `vault_batch_frontmatter_update` | Update YAML frontmatter fields on multiple files without touching body content |
 | `vault_search` | Full-text search across vault files (uses ripgrep if available, falls back to Python) |
 | `vault_search_frontmatter` | Query the in-memory frontmatter index by field value, substring, or field existence |
 | `vault_list` | List directory contents with recursion depth, glob filtering, and file/dir toggles |
 | `vault_move` | Move or rename a file or directory within the vault |
 | `vault_delete` | Soft-delete a file by moving it to `.trash/` (requires explicit confirmation) |
+
+### Checkbox guard
+
+Vaults that use the **Task Forge** plugin treat every Markdown checkbox
+(`- [ ]`, `* [x]`, `+ [ ]`, …) as a tracked task. LLMs love sprinkling
+checkboxes into ordinary notes ("meeting follow-ups", "next steps", etc.),
+which silently floods the task list.
+
+`vault_write` ships with a server-side guard:
+
+- `allow_checkboxes` defaults to **`False`**. If the content contains a
+  checkbox outside a fenced code block, the write is rejected with an
+  error explaining how to opt in.
+- Set `allow_checkboxes=True` only when the caller explicitly intends
+  to create tasks ("タスク登録して", "TODO リストにして", etc.).
+- Checkboxes inside ` ``` ` fenced code blocks are ignored (Task Forge
+  ignores them too).
+
+Existing scripts that pass plain markdown are unaffected.
 
 ## Prerequisites
 

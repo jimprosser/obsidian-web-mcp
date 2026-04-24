@@ -2,6 +2,7 @@
 
 import json
 import logging
+import re
 
 import frontmatter
 
@@ -10,10 +11,46 @@ from ..vault import resolve_vault_path, read_file, write_file_atomic
 logger = logging.getLogger(__name__)
 
 
-def vault_write(path: str, content: str, create_dirs: bool = True, merge_frontmatter: bool = False) -> str:
+# Matches Markdown task checkboxes: `- [ ]`, `* [x]`, `+ [X]`, etc.
+# Task Forge (Obsidian plugin used in this vault) converts ALL such lines into
+# tracked tasks. Block writes that contain them unless the caller explicitly
+# opts in via allow_checkboxes=True.
+_CHECKBOX_PATTERN = re.compile(r'^\s*[-*+]\s*\[[ xX]\]', re.MULTILINE)
+
+# Strip fenced code blocks before checking — Task Forge respects markdown
+# structure and ignores ``` fenced regions.
+# TODO: extend to inline-code (`...`) if false positives appear in practice.
+_FENCED_BLOCK_PATTERN = re.compile(r'```.*?```', re.DOTALL)
+
+
+def _content_has_checkbox(content: str) -> bool:
+    """True if `content` contains a Markdown checkbox outside fenced code blocks."""
+    stripped = _FENCED_BLOCK_PATTERN.sub('', content)
+    return bool(_CHECKBOX_PATTERN.search(stripped))
+
+
+def vault_write(
+    path: str,
+    content: str,
+    create_dirs: bool = True,
+    merge_frontmatter: bool = False,
+    allow_checkboxes: bool = False,
+) -> str:
     """Write a file to the vault, optionally merging frontmatter with existing content."""
     try:
         resolve_vault_path(path)
+
+        if not allow_checkboxes and _content_has_checkbox(content):
+            return json.dumps({
+                "error": (
+                    "Checkboxes detected in content but allow_checkboxes=False.\n"
+                    "Task Forge will pick these up as tasks automatically.\n"
+                    "If you intend to create tasks: set allow_checkboxes=True\n"
+                    "If this is a regular note: use plain bullets (- item) or "
+                    "numbered lists (1. item) instead."
+                ),
+                "path": path,
+            })
 
         if merge_frontmatter:
             try:

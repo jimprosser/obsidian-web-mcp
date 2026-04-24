@@ -51,6 +51,14 @@ class VaultWriteInput(BaseModel):
         default=False,
         description="If true, merge YAML frontmatter with existing file's frontmatter instead of replacing",
     )
+    allow_checkboxes: bool = Field(
+        default=False,
+        description=(
+            "Set to True ONLY when the user explicitly asked to create tasks / TODOs. "
+            "Default False for all regular note-taking. Task Forge converts checkboxes "
+            "(- [ ]) to tasks automatically, so misuse creates phantom tasks."
+        ),
+    )
 
 
 class VaultListInput(BaseModel):

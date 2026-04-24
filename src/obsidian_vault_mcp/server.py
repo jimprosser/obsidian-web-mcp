@@ -94,13 +94,44 @@ def vault_batch_read(paths: list[str], include_content: bool = True) -> str:
 
 @mcp.tool(
     name="vault_write",
-    description="Write a file to the Obsidian vault. Supports frontmatter merging with existing files. Creates parent directories by default.",
+    description=(
+        "Write a file to the Obsidian vault. Supports frontmatter merging with existing files. "
+        "Creates parent directories by default.\n\n"
+        "IMPORTANT: This vault uses Task Forge which converts ALL checkboxes (- [ ]) into tasks.\n\n"
+        "- Regular notes (meeting memos, knowledge notes, drafts, etc.):\n"
+        "  Leave allow_checkboxes as False (default). Use plain bullets (- item) instead.\n"
+        "  Even if checkboxes feel natural for the content, do NOT use them unless\n"
+        "  the user explicitly asked for tasks.\n\n"
+        "- Task lists / TODO notes (when user says \"タスク登録して\", \"TODOリスト作って\",\n"
+        "  \"やることリスト\", or similar explicit task-creation intent):\n"
+        "  Set allow_checkboxes=True. Checkboxes are expected and correct here.\n\n"
+        "The rule: allow_checkboxes=True requires EXPLICIT user intent to create tasks. "
+        "Never set it True just because checkboxes would look nice in the note."
+    ),
     annotations={"readOnlyHint": False, "destructiveHint": True, "idempotentHint": False, "openWorldHint": False},
 )
-def vault_write(path: str, content: str, create_dirs: bool = True, merge_frontmatter: bool = False) -> str:
+def vault_write(
+    path: str,
+    content: str,
+    create_dirs: bool = True,
+    merge_frontmatter: bool = False,
+    allow_checkboxes: bool = False,
+) -> str:
     """Write a file to the vault."""
-    inp = VaultWriteInput(path=path, content=content, create_dirs=create_dirs, merge_frontmatter=merge_frontmatter)
-    return _vault_write(inp.path, inp.content, inp.create_dirs, inp.merge_frontmatter)
+    inp = VaultWriteInput(
+        path=path,
+        content=content,
+        create_dirs=create_dirs,
+        merge_frontmatter=merge_frontmatter,
+        allow_checkboxes=allow_checkboxes,
+    )
+    return _vault_write(
+        inp.path,
+        inp.content,
+        inp.create_dirs,
+        inp.merge_frontmatter,
+        inp.allow_checkboxes,
+    )
 
 
 @mcp.tool(
