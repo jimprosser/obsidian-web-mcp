@@ -8,4 +8,4 @@ wheels/
 .venv/
 .env
 uv.lock
-.oauth_clients.json
+.oauth_clients.json*

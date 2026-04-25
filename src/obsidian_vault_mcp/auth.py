@@ -8,10 +8,11 @@ from starlette.responses import JSONResponse
 
 from .config import VAULT_MCP_TOKEN
 
-# Paths that don't require bearer auth (OAuth flow + health)
+# Paths that don't require bearer auth (OAuth flow + health + RFC 9728 metadata)
 _AUTH_EXEMPT_PATHS = {
     "/health",
     "/.well-known/oauth-authorization-server",
+    "/.well-known/oauth-protected-resource",
     "/authorize",
     "/oauth/authorize",
     "/oauth/token",
@@ -26,10 +27,29 @@ _AUTH_EXEMPT_METHOD_PATHS = {
 }
 
 
+def _challenge_header(request: Request) -> dict[str, str]:
+    """Build a WWW-Authenticate header pointing at the resource metadata endpoint
+    so spec-compliant MCP clients can auto-discover the auth server (RFC 9728)."""
+    base_url = str(request.base_url).rstrip("/")
+    metadata_url = f"{base_url}/.well-known/oauth-protected-resource"
+    return {
+        "WWW-Authenticate": (
+            f'Bearer realm="vault-mcp", '
+            f'resource_metadata="{metadata_url}"'
+        )
+    }
+
+
 class BearerAuthMiddleware(BaseHTTPMiddleware):
     """Validates Bearer tokens on all requests except OAuth and health endpoints."""
 
     async def dispatch(self, request: Request, call_next):
+        # CORS preflight requests carry no credentials by design — the browser
+        # uses the response to decide whether to send the real request. Returning
+        # 401 here would prevent the real request from ever happening.
+        if request.method == "OPTIONS":
+            return await call_next(request)
+
         if request.url.path in _AUTH_EXEMPT_PATHS:
             return await call_next(request)
 
@@ -47,6 +67,7 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
             return JSONResponse(
                 {"error": "Missing or malformed Authorization header"},
                 status_code=401,
+                headers=_challenge_header(request),
             )
 
         token = auth_header[7:]
@@ -54,6 +75,7 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
             return JSONResponse(
                 {"error": "Invalid token"},
                 status_code=401,
+                headers=_challenge_header(request),
             )
 
         return await call_next(request)
