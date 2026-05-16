@@ -228,7 +228,19 @@ def main():
             app.routes.insert(0, route)
 
         app.add_middleware(BearerAuthMiddleware)
-        logger.info(f"Starting server on port {VAULT_MCP_PORT} with bearer auth + OAuth")
+
+        from starlette.middleware.cors import CORSMiddleware
+        app.add_middleware(
+            CORSMiddleware,
+            allow_origins=["https://claude.ai", "https://*.claude.ai", "https://anthropic.com", "https://*.anthropic.com"],
+            allow_origin_regex=r"https://([a-z0-9-]+\.)*(claude\.ai|anthropic\.com)",
+            allow_methods=["GET", "POST", "OPTIONS", "HEAD", "DELETE"],
+            allow_headers=["authorization", "content-type", "mcp-protocol-version", "mcp-session-id", "accept"],
+            expose_headers=["mcp-protocol-version", "mcp-session-id", "www-authenticate"],
+            allow_credentials=True,
+            max_age=86400,
+        )
+        logger.info(f"Starting server on port {VAULT_MCP_PORT} with bearer auth + OAuth + CORS")
 
         import uvicorn
         uvicorn.run(

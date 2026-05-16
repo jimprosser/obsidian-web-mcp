@@ -89,10 +89,11 @@ async def oauth_metadata(request: Request) -> JSONResponse:
         "authorization_endpoint": f"{base_url}/oauth/authorize",
         "token_endpoint": f"{base_url}/oauth/token",
         "registration_endpoint": f"{base_url}/oauth/register",
-        "grant_types_supported": ["authorization_code"],
+        "scopes_supported": ["mcp:read", "mcp:write"],
+        "grant_types_supported": ["authorization_code", "refresh_token"],
         "response_types_supported": ["code"],
         "code_challenge_methods_supported": ["S256"],
-        "token_endpoint_auth_methods_supported": ["client_secret_post"],
+        "token_endpoint_auth_methods_supported": ["none", "client_secret_post"],
     })
 
 
@@ -104,10 +105,10 @@ async def protected_resource_metadata(request: Request) -> JSONResponse:
     """
     base_url = str(request.base_url).rstrip("/")
     return JSONResponse({
-        "resource": base_url,
+        "resource": f"{base_url}/mcp",
         "authorization_servers": [base_url],
         "bearer_methods_supported": ["header"],
-        "scopes_supported": [],
+        "scopes_supported": ["mcp:read", "mcp:write"],
     })
 
 
@@ -275,17 +276,19 @@ async def oauth_register(request: Request) -> JSONResponse:
         "client_id": client_id,
         "client_secret": client_secret,
         "client_name": client_name,
-        "grant_types": ["authorization_code"],
+        "grant_types": ["authorization_code", "refresh_token"],
         "response_types": ["code"],
         "redirect_uris": redirect_uris,
-        "token_endpoint_auth_method": "client_secret_post",
+        "token_endpoint_auth_method": "none",
     }, status_code=201)
 
 
 # Starlette routes to mount on the app
 oauth_routes = [
     Route("/.well-known/oauth-authorization-server", oauth_metadata, methods=["GET"]),
+    Route("/.well-known/oauth-authorization-server/mcp", oauth_metadata, methods=["GET"]),
     Route("/.well-known/oauth-protected-resource", protected_resource_metadata, methods=["GET"]),
+    Route("/.well-known/oauth-protected-resource/mcp", protected_resource_metadata, methods=["GET"]),
     Route("/oauth/authorize", oauth_authorize, methods=["GET"]),
     Route("/authorize", oauth_authorize, methods=["GET"]),
     Route("/oauth/token", oauth_token, methods=["POST"]),

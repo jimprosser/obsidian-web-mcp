@@ -53,6 +53,12 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
         if request.url.path in _AUTH_EXEMPT_PATHS:
             return await call_next(request)
 
+        # RFC 9728 / RFC 8414 allow resource-specific suffixes on well-known
+        # metadata paths (e.g. /.well-known/oauth-protected-resource/mcp).
+        # Claude.ai's connector broker probes these and aborts silently if they 401.
+        if request.url.path.startswith("/.well-known/"):
+            return await call_next(request)
+
         if (request.method, request.url.path) in _AUTH_EXEMPT_METHOD_PATHS:
             return await call_next(request)
 
