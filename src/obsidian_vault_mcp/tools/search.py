@@ -1,6 +1,6 @@
 """Search tools for the Obsidian vault MCP server."""
 
-import json
+from ..json_utils import dumps as json_dumps
 import logging
 import shutil
 import subprocess
@@ -153,7 +153,7 @@ def vault_search(
             search_path = config.VAULT_PATH
 
         if not search_path.is_dir():
-            return json.dumps({"error": f"Search path is not a directory: {path_prefix}"})
+            return json_dumps({"error": f"Search path is not a directory: {path_prefix}"})
 
         if shutil.which("rg"):
             matches = _search_ripgrep(query, search_path, file_pattern, max_results, context_lines)
@@ -166,16 +166,16 @@ def vault_search(
 
         truncated = len(matches) >= max_results
 
-        return json.dumps({
+        return json_dumps({
             "results": matches,
             "total_matches": len(matches),
             "truncated": truncated,
         })
     except ValueError as e:
-        return json.dumps({"error": str(e)})
+        return json_dumps({"error": str(e)})
     except Exception as e:
         logger.error(f"vault_search error: {e}")
-        return json.dumps({"error": str(e)})
+        return json_dumps({"error": str(e)})
 
 
 def vault_search_frontmatter(
@@ -209,11 +209,11 @@ def vault_search_frontmatter(
 
         truncated = len(results) > max_results
 
-        return json.dumps({
+        return json_dumps({
             "results": formatted,
             "total": len(formatted),
             "truncated": truncated,
         })
     except Exception as e:
         logger.error(f"vault_search_frontmatter error: {e}")
-        return json.dumps({"error": str(e)})
+        return json_dumps({"error": str(e)})
