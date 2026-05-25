@@ -1,5 +1,6 @@
 """Search tools for the Obsidian vault MCP server."""
 
+import datetime
 import json
 import logging
 import shutil
@@ -12,6 +13,12 @@ from .. import config
 from ..vault import resolve_vault_path
 
 logger = logging.getLogger(__name__)
+
+
+def _json_default(obj):
+    if isinstance(obj, (datetime.date, datetime.datetime, datetime.time)):
+        return obj.isoformat()
+    raise TypeError(f"Object of type {type(obj).__name__} is not JSON serializable")
 
 
 def _search_ripgrep(
@@ -170,7 +177,7 @@ def vault_search(
             "results": matches,
             "total_matches": len(matches),
             "truncated": truncated,
-        })
+        }, default=_json_default)
     except ValueError as e:
         return json.dumps({"error": str(e)})
     except Exception as e:
@@ -213,7 +220,7 @@ def vault_search_frontmatter(
             "results": formatted,
             "total": len(formatted),
             "truncated": truncated,
-        })
+        }, default=_json_default)
     except Exception as e:
         logger.error(f"vault_search_frontmatter error: {e}")
         return json.dumps({"error": str(e)})

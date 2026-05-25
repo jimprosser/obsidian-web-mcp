@@ -1,5 +1,6 @@
 """Read tools for the Obsidian vault MCP server."""
 
+import datetime
 import json
 import logging
 
@@ -8,6 +9,12 @@ import frontmatter
 from ..vault import resolve_vault_path, read_file
 
 logger = logging.getLogger(__name__)
+
+
+def _json_default(obj):
+    if isinstance(obj, (datetime.date, datetime.datetime, datetime.time)):
+        return obj.isoformat()
+    raise TypeError(f"Object of type {type(obj).__name__} is not JSON serializable")
 
 
 def vault_read(path: str) -> str:
@@ -29,7 +36,7 @@ def vault_read(path: str) -> str:
             "content": content,
             "metadata": metadata,
             "frontmatter": fm_data,
-        })
+        }, default=_json_default)
     except ValueError as e:
         return json.dumps({"error": str(e), "path": path})
     except FileNotFoundError:
@@ -74,4 +81,4 @@ def vault_batch_read(paths: list[str], include_content: bool = True) -> str:
             results.append({"path": path, "error": str(e)})
             missing += 1
 
-    return json.dumps({"files": results, "found": found, "missing": missing})
+    return json.dumps({"files": results, "found": found, "missing": missing}, default=_json_default)
