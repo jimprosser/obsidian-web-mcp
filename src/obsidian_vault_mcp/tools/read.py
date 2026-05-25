@@ -7,6 +7,17 @@ import frontmatter
 
 from ..vault import resolve_vault_path, read_file
 
+def _normalize_fm(value):
+    """Convert date/datetime objects to ISO strings for JSON serialization."""
+    import datetime
+    if isinstance(value, (datetime.date, datetime.datetime)):
+        return value.isoformat()
+    if isinstance(value, dict):
+        return {k: _normalize_fm(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_normalize_fm(v) for v in value]
+    return value
+
 logger = logging.getLogger(__name__)
 
 
@@ -20,7 +31,7 @@ def vault_read(path: str) -> str:
         try:
             post = frontmatter.loads(content)
             if post.metadata:
-                fm_data = post.metadata
+                fm_data = _normalize_fm(post.metadata)
         except Exception:
             pass
 
@@ -53,7 +64,7 @@ def vault_batch_read(paths: list[str], include_content: bool = True) -> str:
             try:
                 post = frontmatter.loads(content)
                 if post.metadata:
-                    fm_data = post.metadata
+                    fm_data = _normalize_fm(post.metadata)
             except Exception:
                 pass
 

@@ -124,6 +124,16 @@ def _search_python(
 
     return matches
 
+def _normalize_fm(value):
+    """Convert date/datetime objects to ISO strings for JSON serialization."""
+    import datetime
+    if isinstance(value, (datetime.date, datetime.datetime)):
+        return value.isoformat()
+    if isinstance(value, dict):
+        return {k: _normalize_fm(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_normalize_fm(v) for v in value]
+    return value
 
 def _get_frontmatter_excerpt(file_path: Path, max_keys: int = 3) -> dict | None:
     """Read frontmatter from a file, returning first N key-value pairs."""
@@ -133,7 +143,7 @@ def _get_frontmatter_excerpt(file_path: Path, max_keys: int = 3) -> dict | None:
         if not post.metadata:
             return None
         keys = list(post.metadata.keys())[:max_keys]
-        return {k: post.metadata[k] for k in keys}
+        return _normalize_fm({k: post.metadata[k] for k in keys})
     except Exception:
         return None
 
