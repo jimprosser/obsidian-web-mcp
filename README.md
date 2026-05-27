@@ -134,11 +134,14 @@ All configuration is via environment variables:
 |----------|----------|---------|-------------|
 | `VAULT_PATH` | Yes | `~/Obsidian/MyVault` | Absolute path to your Obsidian vault directory |
 | `VAULT_MCP_TOKEN` | Yes | (none) | 256-bit bearer token for authenticating MCP requests |
+| `VAULT_OAUTH_CLIENT_SECRET` | Yes | (none) | OAuth 2.0 client secret for Claude integration |
 | `VAULT_MCP_PORT` | No | `8420` | Port the HTTP server listens on |
 | `VAULT_OAUTH_CLIENT_ID` | No | `vault-mcp-client` | OAuth 2.0 client ID for Claude integration |
-| `VAULT_OAUTH_CLIENT_SECRET` | Yes | (none) | OAuth 2.0 client secret for Claude integration |
+| `VAULT_MCP_ALLOWED_HOSTS` | No | (none) | Comma-separated extra allowed `Host` headers for DNS rebinding protection. Required when connecting from remote clients (Claude web, MCPJam, etc). Example: `agentbrain.mcpnative.dev,vault-mcp.example.com` |
 
-Generate tokens with: `python -c "import secrets; print(secrets.token_hex(32))"`
+Generate tokens with: `python3 -c "import secrets; print(secrets.token_hex(32))"`
+
+See `.env.template` for a ready-to-copy configuration file.
 
 ## Connecting to Claude
 

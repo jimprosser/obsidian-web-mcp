@@ -21,6 +21,10 @@ if [ ${#missing[@]} -gt 0 ]; then
     exit 1
 fi
 
+if [ -z "${VAULT_MCP_ALLOWED_HOSTS:-}" ]; then
+    echo "INFO: VAULT_MCP_ALLOWED_HOSTS not set -- server only reachable via localhost"
+fi
+
 if [ ! -d ".venv" ]; then
     echo "Virtual environment not found."
     read -rp "Run 'uv sync' now? [Y/n] " answer
