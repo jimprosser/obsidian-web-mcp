@@ -10,6 +10,7 @@ import frontmatter
 
 from .. import config
 from ..vault import resolve_vault_path
+from .json_utils import dumps as json_dumps_safe
 
 logger = logging.getLogger(__name__)
 
@@ -166,7 +167,7 @@ def vault_search(
 
         truncated = len(matches) >= max_results
 
-        return json.dumps({
+        return json_dumps_safe({
             "results": matches,
             "total_matches": len(matches),
             "truncated": truncated,
@@ -209,7 +210,7 @@ def vault_search_frontmatter(
 
         truncated = len(results) > max_results
 
-        return json.dumps({
+        return json_dumps_safe({
             "results": formatted,
             "total": len(formatted),
             "truncated": truncated,

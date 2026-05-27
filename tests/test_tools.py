@@ -6,7 +6,7 @@ import pytest
 
 from obsidian_vault_mcp.tools.read import vault_read, vault_batch_read
 from obsidian_vault_mcp.tools.write import vault_write, vault_batch_frontmatter_update
-from obsidian_vault_mcp.tools.search import vault_search
+from obsidian_vault_mcp.tools.search import vault_search, vault_search_frontmatter
 from obsidian_vault_mcp.tools.manage import vault_list, vault_delete
 
 
@@ -74,3 +74,40 @@ def test_vault_delete_requires_confirm(vault_dir):
     result = json.loads(vault_delete("delete-me.md", confirm=False))
     assert "error" in result
     assert (vault_dir / "delete-me.md").exists()  # still there
+
+
+def test_date_frontmatter_serializes(vault_dir):
+    """Frontmatter with unquoted ISO date (parsed as datetime.date by PyYAML)
+    must not raise TypeError during JSON serialization."""
+    # unquoted date — PyYAML converts to datetime.date
+    (vault_dir / "dated-unquoted.md").write_text(
+        "---\ndata: 2026-01-24\ntitle: Dated\n---\n\nConteudo com data.\n"
+    )
+    # quoted date — stays as str, must also work
+    (vault_dir / "dated-quoted.md").write_text(
+        '---\ndata: "2026-01-24"\ntitle: Dated Quoted\n---\n\nConteudo com data.\n'
+    )
+
+    # vault_read — unquoted
+    result = json.loads(vault_read("dated-unquoted.md"))
+    assert "error" not in result
+    assert result["frontmatter"]["data"] == "2026-01-24"
+
+    # vault_read — quoted
+    result = json.loads(vault_read("dated-quoted.md"))
+    assert "error" not in result
+    assert result["frontmatter"]["data"] == "2026-01-24"
+
+    # vault_batch_read
+    result = json.loads(vault_batch_read(["dated-unquoted.md", "dated-quoted.md"]))
+    assert result["found"] == 2
+    assert result["missing"] == 0
+    for f in result["files"]:
+        assert "error" not in f
+        assert f["frontmatter"]["data"] == "2026-01-24"
+
+    # vault_search — frontmatter_excerpt is injected into results
+    result = json.loads(vault_search("Conteudo com data"))
+    assert "error" not in result
+    # just confirming no serialization error; result may have 1 or 2 hits
+    assert result["total_matches"] >= 1

@@ -6,6 +6,7 @@ import logging
 import frontmatter
 
 from ..vault import resolve_vault_path, read_file
+from .json_utils import dumps as json_dumps_safe
 
 logger = logging.getLogger(__name__)
 
@@ -24,7 +25,7 @@ def vault_read(path: str) -> str:
         except Exception:
             pass
 
-        return json.dumps({
+        return json_dumps_safe({
             "path": path,
             "content": content,
             "metadata": metadata,
@@ -74,4 +75,4 @@ def vault_batch_read(paths: list[str], include_content: bool = True) -> str:
             results.append({"path": path, "error": str(e)})
             missing += 1
 
-    return json.dumps({"files": results, "found": found, "missing": missing})
+    return json_dumps_safe({"files": results, "found": found, "missing": missing})
