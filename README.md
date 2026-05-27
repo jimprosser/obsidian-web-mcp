@@ -231,6 +231,118 @@ scripts/
     launchd/                # macOS launchd plist templates
 ```
 
+## VPS Setup With Cloudflare Origin TLS + Caddy Reverse Proxy
+
+This is an alternative to the Cloudflare Tunnel flow above. In this setup, the MCP server runs on a VPS, Cloudflare proxies a public hostname such as `your-mcp-server.dev`, Caddy terminates TLS with a Cloudflare Origin Certificate, and Caddy reverse-proxies requests to the local MCP server on `VAULT_MCP_PORT`. No Cloudflare Tunnel is required.
+
+These steps assume Ubuntu 24.04 on the VPS. Expose only ports `80` and `443` publicly. Do not open `VAULT_MCP_PORT` to the internet.
+
+### 1. Prepare the VPS
+
+- Point `your-mcp-server.dev` at your VPS in Cloudflare DNS
+- Turn on the Cloudflare proxy for that record (orange cloud)
+- In the Cloudflare dashboard, set **SSL/TLS** mode to **Full (Strict)**
+
+### 2. Install Caddy
+
+```bash
+sudo apt update
+sudo apt install -y debian-keyring debian-archive-keyring curl
+
+curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' | \
+  sudo gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
+
+curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' | \
+  sudo tee /etc/apt/sources.list.d/caddy-stable.list
+
+sudo apt update
+sudo apt install -y caddy
+caddy version
+```
+
+### 3. Create and install a Cloudflare Origin Certificate
+
+Generate the certificate in the Cloudflare dashboard under **SSL/TLS > Origin Server > Create Certificate**.
+
+```bash
+sudo mkdir -p /etc/your-mcp-server/tls
+sudo cp cert.pem key.pem /etc/your-mcp-server/tls/
+sudo chmod 750 /etc/your-mcp-server/tls
+sudo chmod 640 /etc/your-mcp-server/tls/cert.pem
+sudo chmod 600 /etc/your-mcp-server/tls/key.pem
+```
+
+### 4. Configure Caddy
+
+Edit `/etc/caddy/Caddyfile`:
+
+```caddyfile
+your-mcp-server.dev {
+    tls /etc/your-mcp-server/tls/cert.pem /etc/your-mcp-server/tls/key.pem
+    reverse_proxy localhost:8420
+}
+
+:80 {
+    redir https://{host}{uri}
+}
+```
+
+If you use a different local port, replace `8420` with the value you set for `VAULT_MCP_PORT`.
+
+Apply the config and verify Caddy is healthy:
+
+```bash
+sudo systemctl restart caddy
+sudo systemctl status caddy --no-pager
+```
+
+Live logs:
+
+```bash
+journalctl -u caddy -f
+```
+
+### 5. Allow the public hostname in the server
+
+The MCP library enables DNS rebinding protection, so you must add your public hostname to `allowed_hosts` in `src/obsidian_vault_mcp/server.py`:
+
+```python
+allowed_hosts=[
+    "127.0.0.1:*",
+    "localhost:*",
+    "[::1]:*",
+    "your-mcp-server.dev",
+]
+```
+
+### 6. Start obsidian-web-mcp on the VPS
+
+Use the same environment variables described in [Configuration](#configuration), then start the server on the local port Caddy proxies to:
+
+```bash
+export VAULT_MCP_PORT=8420
+uv run vault-mcp
+```
+
+If you run the service under `systemd`, keep `VAULT_MCP_PORT` aligned with the `reverse_proxy` target in the Caddyfile.
+
+### 7. Verify the deployment
+
+From the VPS, confirm the local server is responding:
+
+```bash
+curl -s http://localhost:8420/.well-known/oauth-authorization-server
+```
+
+Then confirm the public HTTPS endpoint works through Cloudflare and Caddy:
+
+```bash
+curl -I https://your-mcp-server.dev
+curl -s https://your-mcp-server.dev/.well-known/oauth-authorization-server
+```
+
+When you add the integration in Claude, use `https://your-mcp-server.dev` as the server URL.
+
 ## License
 
 MIT -- see [LICENSE](LICENSE).
