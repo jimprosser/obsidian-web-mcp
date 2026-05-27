@@ -34,4 +34,4 @@ if [ ! -d ".venv" ]; then
     fi
 fi
 
-VAULT_MCP_PORT=${VAULT_MCP_PORT:-3001} VAULT_PATH=${VAULT_PATH:-"$HOME/obsidian_vaults"} uv run vault-mcp
+VAULT_PATH=${VAULT_PATH:-"$HOME/obsidian_vaults"} uv run vault-mcp
