@@ -91,6 +91,41 @@ uv run vault-mcp
 
 The server starts on port 8420 by default. It serves MCP over Streamable HTTP at `/mcp/`.
 
+## Start Server Script (experimental)
+
+```bash
+# Install uv
+curl -LsSf https://astral.sh/uv/install.sh | sh
+
+# Install dependencies
+uv sync
+
+# Generate secrets (writes to .env, gitignored)
+./scripts/generate_secrets.sh
+
+# Start the server on port 3001
+./scripts/start-server.sh
+```
+
+### Manual Verify with Curl
+
+```bash
+source .env
+
+# Get a bearer token
+TOKEN=$(curl -s -X POST http://localhost:3001/oauth/token \
+  -d "grant_type=client_credentials" \
+  -d "client_id=$VAULT_OAUTH_CLIENT_ID" \
+  -d "client_secret=$VAULT_OAUTH_CLIENT_SECRET" | python3 -c "import sys,json; print(json.load(sys.stdin)['access_token'])")
+
+# List available tools
+curl -s -X POST http://localhost:3001/mcp \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -H "Accept: application/json, text/event-stream" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}'
+```
+
 ## Configuration
 
 All configuration is via environment variables:
