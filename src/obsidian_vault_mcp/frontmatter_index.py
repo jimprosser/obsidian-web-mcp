@@ -170,3 +170,22 @@ class _VaultEventHandler(FileSystemEventHandler):
 
     def on_deleted(self, event: FileSystemEvent) -> None:
         self._handle(event)
+
+    def on_moved(self, event: FileSystemEvent) -> None:
+        # Atomic writes (write_file_atomic: tempfile.mkstemp + os.replace) and
+        # vault_move/vault_delete (shutil.move) surface as MOVED events, not
+        # created/modified -- without this the index never sees vault_write output.
+        # Schedule BOTH endpoints: src (now gone -> popped on flush) and dest
+        # (now present -> re-parsed + added). .tmp/.trash paths are filtered out
+        # by the .md-suffix and _is_excluded checks inside the loop.
+        if event.is_directory:
+            return
+        for raw_path in (event.src_path, getattr(event, "dest_path", None)):
+            if not raw_path:
+                continue
+            path = Path(raw_path)
+            if path.suffix != ".md":
+                continue
+            if self._index._is_excluded(path):
+                continue
+            self._index._schedule_debounce(raw_path)
