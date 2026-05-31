@@ -53,6 +53,58 @@ class VaultWriteInput(BaseModel):
     )
 
 
+class VaultPatchInput(BaseModel):
+    """Surgical string replacement in a vault file."""
+
+    model_config = ConfigDict(str_strip_whitespace=False, extra="forbid")
+
+    path: str = Field(
+        ...,
+        description="Relative path from vault root",
+        min_length=1,
+        max_length=500,
+    )
+    old_string: str = Field(
+        ...,
+        description="Exact string to find and replace",
+        min_length=1,
+        max_length=MAX_CONTENT_SIZE,
+    )
+    new_string: str = Field(
+        ...,
+        description="Replacement string",
+        max_length=MAX_CONTENT_SIZE,
+    )
+    replace_all: bool = Field(
+        default=False,
+        description="If true, replace all occurrences; if false (default), fail unless exactly one occurrence exists",
+    )
+
+
+class VaultAppendInput(BaseModel):
+    """Append content to a vault file."""
+
+    model_config = ConfigDict(str_strip_whitespace=False, extra="forbid")
+
+    path: str = Field(
+        ...,
+        description="Relative path from vault root",
+        min_length=1,
+        max_length=500,
+    )
+    content: str = Field(
+        ...,
+        description="Content to append",
+        min_length=1,
+        max_length=MAX_CONTENT_SIZE,
+    )
+    separator: str = Field(
+        default="\n",
+        description="String inserted between existing content and new content. Default is a single newline. Ignored when the file does not exist yet.",
+        max_length=100,
+    )
+
+
 class VaultListInput(BaseModel):
     """List files and directories under a vault path."""
 
