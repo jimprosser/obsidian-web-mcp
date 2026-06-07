@@ -1,6 +1,6 @@
 [project]
 name = "obsidian-web-mcp"
-version = "0.1.0"
+version = "0.2.0"
 description = "Secure remote MCP server for Obsidian vaults -- access your notes from Claude, your phone, or any MCP client, anywhere"
 readme = "README.md"
 requires-python = ">=3.12"
