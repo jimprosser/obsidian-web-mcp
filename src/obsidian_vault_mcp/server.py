@@ -37,6 +37,9 @@ mcp = FastMCP(
     "obsidian_web_mcp",
     stateless_http=True,
     json_response=True,
+    # Serve MCP at "/" (not the /mcp default) so connectors that POST to the root
+    # complete the handshake instead of 404ing (#19).
+    streamable_http_path="/",
     lifespan=lifespan,
     transport_security=TransportSecuritySettings(
         enable_dns_rebinding_protection=True,

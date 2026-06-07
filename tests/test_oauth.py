@@ -192,3 +192,19 @@ def test_no_password_fails_closed_even_via_post(client):
     r = client.post("/oauth/authorize", data=data, follow_redirects=False)
     assert r.status_code == 503
     assert "location" not in {k.lower() for k in r.headers}
+
+
+# --- #20: RFC 9728 protected-resource metadata --------------------------------
+
+def test_oauth_protected_resource_metadata(client):
+    r = client.get("/.well-known/oauth-protected-resource")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["resource"]
+    assert isinstance(body["authorization_servers"], list) and body["authorization_servers"]
+    assert body["bearer_methods_supported"] == ["header"]
+
+
+def test_protected_resource_path_is_auth_exempt():
+    from obsidian_vault_mcp.auth import _AUTH_EXEMPT_PATHS
+    assert "/.well-known/oauth-protected-resource" in _AUTH_EXEMPT_PATHS

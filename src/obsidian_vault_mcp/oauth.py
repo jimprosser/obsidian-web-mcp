@@ -186,6 +186,18 @@ async def oauth_metadata(request: Request) -> JSONResponse:
     })
 
 
+async def oauth_protected_resource(request: Request) -> JSONResponse:
+    """RFC 9728 OAuth protected-resource metadata. Claude/ChatGPT request this path
+    during discovery; it must be reachable without a bearer token (#20). With the MCP
+    endpoint served at "/" (#19), the protected resource is the base URL itself."""
+    base_url = str(request.base_url).rstrip("/")
+    return JSONResponse({
+        "resource": base_url,
+        "authorization_servers": [base_url],
+        "bearer_methods_supported": ["header"],
+    })
+
+
 async def oauth_authorize(request: Request):
     """OAuth 2.0 authorization endpoint with an interactive login gate.
 
@@ -380,6 +392,7 @@ async def oauth_register(request: Request) -> JSONResponse:
 # Starlette routes to mount on the app
 oauth_routes = [
     Route("/.well-known/oauth-authorization-server", oauth_metadata, methods=["GET"]),
+    Route("/.well-known/oauth-protected-resource", oauth_protected_resource, methods=["GET"]),
     Route("/oauth/authorize", oauth_authorize, methods=["GET", "POST"]),
     Route("/oauth/token", oauth_token, methods=["POST"]),
     Route("/oauth/register", oauth_register, methods=["POST"]),

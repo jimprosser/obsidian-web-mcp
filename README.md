@@ -93,7 +93,7 @@ export VAULT_PATH="$HOME/Obsidian/MyVault"
 uv run vault-mcp
 ```
 
-The server starts on port 8420 by default and serves MCP over Streamable HTTP at `/mcp/`. It binds to `127.0.0.1` -- reachable locally and through a Cloudflare Tunnel, but not exposed on your LAN. Set `VAULT_MCP_HOST=0.0.0.0` only if you deliberately want direct network exposure.
+The server starts on port 8420 by default and serves MCP over Streamable HTTP at `/` (the root path — MCP clients connect to the base URL directly). It binds to `127.0.0.1` -- reachable locally and through a Cloudflare Tunnel, but not exposed on your LAN. Set `VAULT_MCP_HOST=0.0.0.0` only if you deliberately want direct network exposure.
 
 ## Configuration
 
