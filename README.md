@@ -37,9 +37,9 @@ Obsidian and the MCP server both operate on the same directory of markdown files
 
 This is a server that provides network access to your personal notes. Security is not optional.
 
-**Authentication is enforced on every request.** The server implements OAuth 2.0 authorization code flow with PKCE for initial client authentication (what Claude uses when you connect the integration), plus bearer token validation on every subsequent MCP tool call. No request reaches a tool function without a valid token.
+**A human logs in before any client is authorized.** Connecting a client uses the OAuth 2.0 authorization-code + PKCE flow, which opens a browser at `/oauth/authorize`. There, you must sign in with `VAULT_OAUTH_USERNAME` / `VAULT_OAUTH_PASSWORD` before the server issues an authorization code -- the password is required on every authorization. Every subsequent MCP tool call is then validated against a bearer token. No authorization code is issued to an unauthenticated visitor, and no request reaches a tool function without a valid token. **If `VAULT_OAUTH_PASSWORD` is not set, the server fails closed and refuses to authorize anyone** -- there is no anonymous auto-approve.
 
-**Your vault is never exposed directly to the internet.** The recommended deployment uses a Cloudflare Tunnel -- an outbound-only encrypted connection. Your machine opens no inbound ports. You can layer Cloudflare Access on top for additional authentication (SSO, device posture checks, IP restrictions) if you want defense in depth.
+**Your vault is never exposed directly to the internet.** The recommended deployment uses a Cloudflare Tunnel -- an outbound-only encrypted connection. Your machine opens no inbound ports, and the server itself binds to loopback (`127.0.0.1`) by default. The login above is the authentication boundary; you can additionally layer Cloudflare Access (SSO, device posture, IP restrictions) on top for defense in depth.
 
 **Path traversal is blocked at the filesystem layer.** Every file operation resolves paths against the vault root directory and rejects any attempt to escape it -- `..` traversal, symlink following, null byte injection, and dotfile access (`.obsidian`, `.git`, `.trash`) are all caught before they reach the filesystem. The server will never read or write outside your vault directory.
 
@@ -78,9 +78,13 @@ This is a server that provides network access to your personal notes. Security i
 git clone https://github.com/yourname/obsidian-web-mcp.git
 cd obsidian-web-mcp
 
-# Generate auth tokens
+# Generate the MCP bearer token
 export VAULT_MCP_TOKEN=$(python -c "import secrets; print(secrets.token_hex(32))")
-export VAULT_OAUTH_CLIENT_SECRET=$(python -c "import secrets; print(secrets.token_hex(32))")
+
+# Set the login the OAuth browser step requires. REQUIRED -- without a password
+# the server fails closed and refuses to authorize any client.
+export VAULT_OAUTH_USERNAME="you"
+export VAULT_OAUTH_PASSWORD="$(python -c "import secrets; print(secrets.token_urlsafe(24))")"   # or a passphrase you'll remember
 
 # Point at your vault
 export VAULT_PATH="$HOME/Obsidian/MyVault"
@@ -89,7 +93,7 @@ export VAULT_PATH="$HOME/Obsidian/MyVault"
 uv run vault-mcp
 ```
 
-The server starts on port 8420 by default. It serves MCP over Streamable HTTP at `/mcp/`.
+The server starts on port 8420 by default and serves MCP over Streamable HTTP at `/mcp/`. It binds to `127.0.0.1` -- reachable locally and through a Cloudflare Tunnel, but not exposed on your LAN. Set `VAULT_MCP_HOST=0.0.0.0` only if you deliberately want direct network exposure.
 
 ## Configuration
 
@@ -98,12 +102,15 @@ All configuration is via environment variables:
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
 | `VAULT_PATH` | Yes | `~/Obsidian/MyVault` | Absolute path to your Obsidian vault directory |
-| `VAULT_MCP_TOKEN` | Yes | (none) | 256-bit bearer token for authenticating MCP requests |
+| `VAULT_MCP_TOKEN` | Yes | (none) | 256-bit bearer token validated on every MCP request |
+| `VAULT_OAUTH_PASSWORD` | **Yes** | (none) | Password for the interactive login at `/oauth/authorize`. **If unset, the server refuses to authorize any client (fail-closed).** |
+| `VAULT_OAUTH_USERNAME` | No | `obsidian` | Username for the interactive login |
+| `VAULT_MCP_HOST` | No | `127.0.0.1` | Bind address. Loopback by default; set `0.0.0.0` only for deliberate LAN exposure |
 | `VAULT_MCP_PORT` | No | `8420` | Port the HTTP server listens on |
-| `VAULT_OAUTH_CLIENT_ID` | No | `vault-mcp-client` | OAuth 2.0 client ID for Claude integration |
-| `VAULT_OAUTH_CLIENT_SECRET` | Yes | (none) | OAuth 2.0 client secret for Claude integration |
+| `VAULT_OAUTH_CLIENT_ID` | No | `vault-mcp-client` | Client ID for the headless `client_credentials` grant |
+| `VAULT_OAUTH_CLIENT_SECRET` | No | (none) | Only required for the headless `client_credentials` grant. The Claude/ChatGPT browser flow uses dynamic client registration and does **not** need this. |
 
-Generate tokens with: `python -c "import secrets; print(secrets.token_hex(32))"`
+Generate secrets with: `python -c "import secrets; print(secrets.token_hex(32))"`
 
 ## Connecting to Claude
 
@@ -112,9 +119,9 @@ The Claude desktop and mobile apps can connect to remote MCP servers via OAuth.
 1. Start the server (locally or behind a tunnel)
 2. Open Claude and go to **Settings > Integrations > Add Integration**
 3. Enter your server URL (e.g. `https://vault-mcp.yourdomain.com`)
-4. Enter the OAuth client ID and client secret you configured
-5. Claude will discover the OAuth endpoints automatically and open a browser window
-6. The server auto-approves the authorization (single-user model) and redirects back
+4. Claude registers automatically (dynamic client registration) and discovers the OAuth endpoints
+5. Claude opens a browser window at the server's `/oauth/authorize`
+6. **Sign in** with your `VAULT_OAUTH_USERNAME` / `VAULT_OAUTH_PASSWORD`; the server then issues the authorization and redirects back
 7. Claude now has access to all nine vault tools -- on desktop and mobile
 
 For local-only use (no tunnel), point Claude at `http://localhost:8420`.
@@ -161,7 +168,8 @@ Open each plist and replace the placeholder tokens:
 - `REPLACE_WITH_PROJECT_PATH` -- absolute path to this project directory
 - `REPLACE_WITH_VAULT_PATH` -- absolute path to your Obsidian vault
 - `REPLACE_WITH_TOKEN` -- your `VAULT_MCP_TOKEN` value
-- `REPLACE_WITH_OAUTH_SECRET` -- your `VAULT_OAUTH_CLIENT_SECRET` value
+- `REPLACE_WITH_OAUTH_USERNAME` -- the login username you want (e.g. your name)
+- `REPLACE_WITH_OAUTH_PASSWORD` -- your `VAULT_OAUTH_PASSWORD` value (required; the server refuses to authorize without it)
 - `REPLACE_WITH_HOME` -- your home directory (e.g. `/Users/yourname`)
 - `REPLACE_WITH_CLOUDFLARED_PATH` -- path to `cloudflared` binary (run `which cloudflared`)
 

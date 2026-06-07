@@ -21,10 +21,10 @@
         <string>REPLACE_WITH_TOKEN</string>
         <key>VAULT_MCP_PORT</key>
         <string>8420</string>
-        <key>VAULT_OAUTH_CLIENT_ID</key>
-        <string>vault-mcp-client</string>
-        <key>VAULT_OAUTH_CLIENT_SECRET</key>
-        <string>REPLACE_WITH_OAUTH_SECRET</string>
+        <key>VAULT_OAUTH_USERNAME</key>
+        <string>REPLACE_WITH_OAUTH_USERNAME</string>
+        <key>VAULT_OAUTH_PASSWORD</key>
+        <string>REPLACE_WITH_OAUTH_PASSWORD</string>
     </dict>
     <key>RunAtLoad</key>
     <true/>
