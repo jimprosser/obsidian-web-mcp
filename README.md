@@ -47,6 +47,10 @@ This is a server that provides network access to your personal notes. Security i
 
 **Safety limits prevent abuse.** Writes are capped at 1MB per file, batch operations at 20 files per request, and search results at 50 matches. Deletions are soft -- files move to `.trash/` rather than being permanently removed, matching Obsidian's own behavior. The delete tool also requires an explicit `confirm=true` parameter as a safety gate.
 
+## Reporting Security Issues
+
+Found a vulnerability? Please report it privately rather than opening a public issue or pull request. This repository has [private vulnerability reporting](https://github.com/jimprosser/obsidian-web-mcp/security/advisories) enabled: open the repo's **Security** tab and click **Report a vulnerability**. I'll acknowledge the report, coordinate a fix, and credit you in the resulting advisory. Please hold public disclosure until a patch is available.
+
 ## Tools
 
 | Tool | Description |
@@ -75,7 +79,7 @@ This is a server that provides network access to your personal notes. Security i
 
 ```bash
 # Clone and enter the project
-git clone https://github.com/yourname/obsidian-web-mcp.git
+git clone https://github.com/jimprosser/obsidian-web-mcp.git
 cd obsidian-web-mcp
 
 # Generate the MCP bearer token
@@ -107,6 +111,7 @@ All configuration is via environment variables:
 | `VAULT_OAUTH_USERNAME` | No | `obsidian` | Username for the interactive login |
 | `VAULT_MCP_HOST` | No | `127.0.0.1` | Bind address. Loopback by default; set `0.0.0.0` only for deliberate LAN exposure |
 | `VAULT_MCP_PORT` | No | `8420` | Port the HTTP server listens on |
+| `VAULT_MCP_ALLOWED_HOSTS` | No | (none) | Comma-separated hostnames allowed through the MCP library's DNS-rebinding protection, **appended** to the loopback defaults (`127.0.0.1`, `localhost`, `[::1]`). Set this to your tunnel/proxy hostname (e.g. `vault-mcp.yourdomain.com`) for any remote deployment, otherwise requests carrying that `Host` are rejected. |
 | `VAULT_MCP_FORWARDED_ALLOW_IPS` | No | `127.0.0.1` | Client IPs uvicorn trusts to set `X-Forwarded-*` headers. Loopback-only by default, because a trusted Cloudflare Tunnel / Caddy proxy connects over localhost. **Never set this to `*`** -- that lets any caller spoof the advertised OAuth origin via `X-Forwarded-Host`. Set to `::1` if your proxy connects over IPv6 loopback. |
 | `VAULT_MCP_PUBLIC_URL` | No | (none) | Canonical public origin (e.g. `https://vault-mcp.yourdomain.com`) for every URL the server advertises -- the OAuth discovery metadata and the `WWW-Authenticate` challenge. When set it **pins** those URLs so a spoofed `Host` / `X-Forwarded-Host` header cannot redirect OAuth discovery to an attacker. When unset, the per-request base URL is used. Recommended for any reverse-proxy deployment. |
 | `VAULT_OAUTH_CLIENT_ID` | No | `vault-mcp-client` | Client ID for the headless `client_credentials` grant |
@@ -171,6 +176,15 @@ Open each plist and replace the placeholder tokens:
 - `REPLACE_WITH_HOME` -- your home directory (e.g. `/Users/yourname`)
 - `REPLACE_WITH_CLOUDFLARED_PATH` -- path to `cloudflared` binary (run `which cloudflared`)
 
+**Remote deployments (tunnel or VPS):** a launchd service does not inherit shell `export`s, so the `VAULT_MCP_ALLOWED_HOSTS` you set in the Tunnel section above must be added directly to the plist's `EnvironmentVariables` dict — otherwise DNS-rebinding protection rejects your public hostname. Add your hostname (and, recommended, pin the advertised origin):
+
+```xml
+<key>VAULT_MCP_ALLOWED_HOSTS</key>
+<string>vault-mcp.yourdomain.com</string>
+<key>VAULT_MCP_PUBLIC_URL</key>
+<string>https://vault-mcp.yourdomain.com</string>
+```
+
 ### 2. Load the services
 
 ```bash
@@ -206,10 +220,10 @@ The server coexists with Obsidian Sync (or any file-based sync mechanism) withou
 ### Running tests
 
 ```bash
-uv run pytest tests/ -v
+uv run --extra dev pytest tests/ -v
 ```
 
-Tests use temporary directories and never touch your real vault.
+(`pytest` lives in the optional `dev` extra, so the `--extra dev` flag is what installs and runs it.) Tests use temporary directories and never touch your real vault.
 
 ### Project structure
 
@@ -220,6 +234,7 @@ src/obsidian_vault_mcp/
     frontmatter_index.py    # In-memory YAML frontmatter index with filesystem watcher
     models.py               # Pydantic input validation models
     oauth.py                # OAuth 2.0 authorization code flow with PKCE
+    serialization.py        # JSON encoder for tool responses (dates, etc.)
     server.py               # FastMCP server setup, tool registration, entry point
     vault.py                # Core filesystem operations (path security, atomic writes)
     tools/
@@ -229,7 +244,11 @@ src/obsidian_vault_mcp/
         write.py            # write, batch_frontmatter_update tools
 tests/
     conftest.py             # Shared fixtures (temp vault with sample files)
+    test_auth.py            # Bearer middleware + WWW-Authenticate challenge tests
+    test_config.py          # Environment-variable parsing tests
     test_frontmatter.py     # Frontmatter index and query tests
+    test_issues_5_28.py     # Regression tests for date serialization + index rebuild
+    test_oauth.py           # OAuth flow, PKCE, and auth-bypass regression tests
     test_tools.py           # Integration tests for tool functions
     test_vault.py           # Path resolution and file operation tests
 scripts/
