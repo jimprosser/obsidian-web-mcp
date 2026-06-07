@@ -109,6 +109,7 @@ All configuration is via environment variables:
 | `VAULT_MCP_PORT` | No | `8420` | Port the HTTP server listens on |
 | `VAULT_OAUTH_CLIENT_ID` | No | `vault-mcp-client` | Client ID for the headless `client_credentials` grant |
 | `VAULT_OAUTH_CLIENT_SECRET` | No | (none) | Only required for the headless `client_credentials` grant. The Claude/ChatGPT browser flow uses dynamic client registration and does **not** need this. |
+| `VAULT_OAUTH_REDIRECT_URIS` | No | (none) | Comma-separated allowlist of redirect URIs for the static `VAULT_OAUTH_CLIENT_ID` when using the browser flow. Dynamically-registered clients (Claude/ChatGPT) carry their own; leave unset unless you connect a static client through `/oauth/authorize`. |
 
 Generate secrets with: `python -c "import secrets; print(secrets.token_hex(32))"`
 
