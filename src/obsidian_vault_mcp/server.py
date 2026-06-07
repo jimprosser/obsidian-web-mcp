@@ -4,6 +4,7 @@ Exposes read/write access to an Obsidian vault over Streamable HTTP.
 Designed to run behind Cloudflare Tunnel for secure remote access.
 """
 
+import atexit
 import json
 import logging
 import sys
@@ -23,13 +24,14 @@ frontmatter_index = FrontmatterIndex()
 
 @asynccontextmanager
 async def lifespan(server):
-    """Start frontmatter index on server startup, stop on shutdown."""
-    logger.info(f"Starting vault MCP server. Vault: {VAULT_PATH}")
-    frontmatter_index.start()
-    logger.info(f"Frontmatter index built: {frontmatter_index.file_count} files indexed")
+    """Per-request MCP lifespan.
+
+    With stateless_http=True this runs on EVERY HTTP request, so it must NOT build
+    or tear down the index -- doing so rebuilt the whole index per request and timed
+    out large vaults (#28). The index is built once in main() before serving; here we
+    only expose the already-built instance to tools.
+    """
     yield {"frontmatter_index": frontmatter_index}
-    frontmatter_index.stop()
-    logger.info("Vault MCP server shut down.")
 
 
 # Create the MCP server
@@ -201,6 +203,12 @@ def main():
 
     if not VAULT_MCP_TOKEN:
         logger.warning("VAULT_MCP_TOKEN is not set -- auth will reject all requests")
+
+    # Build the frontmatter index ONCE, before serving. With stateless_http the
+    # per-request MCP lifespan would otherwise rebuild it on every request (#28).
+    logger.info(f"Starting vault MCP server. Vault: {VAULT_PATH}")
+    frontmatter_index.start()
+    atexit.register(frontmatter_index.stop)
 
     # Build the Starlette app with auth middleware and OAuth endpoints
     try:

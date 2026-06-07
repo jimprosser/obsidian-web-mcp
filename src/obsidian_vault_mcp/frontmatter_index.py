@@ -25,7 +25,13 @@ class FrontmatterIndex:
         self._pending_paths: set[str] = set()
 
     def start(self) -> None:
-        """Walk all .md files, parse frontmatter, and start watching for changes."""
+        """Walk all .md files, parse frontmatter, and start watching for changes.
+
+        Idempotent: a second call while already running is a no-op. The index is
+        built once at process start (server.main), never per request -- see #28.
+        """
+        if self._observer is not None:
+            return
         t0 = time.monotonic()
         count = 0
 
