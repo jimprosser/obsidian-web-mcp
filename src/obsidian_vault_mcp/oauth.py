@@ -80,8 +80,12 @@ def _check_credentials(username: str, password: str) -> bool:
 
 
 def _redirect_uri_ok(client_id: str, redirect_uri: str) -> bool:
-    """Validate redirect_uri: https (or loopback http), and -- for a registered
-    client -- an exact match against a registered URI."""
+    """Validate redirect_uri: must be https (or loopback http) AND exact-match an
+    allowlist for the client -- no open fallthrough (#4):
+      - DCR-registered client  -> must match one of its registered redirect_uris.
+      - operator-configured client -> must match VAULT_OAUTH_REDIRECT_URIS.
+    A client with no allowlisted URIs cannot use the browser authorization-code flow.
+    """
     if not redirect_uri:
         return False
     parsed = urlparse(redirect_uri)
@@ -89,11 +93,13 @@ def _redirect_uri_ok(client_id: str, redirect_uri: str) -> bool:
     if parsed.scheme != "https" and not is_loopback:
         return False
     record = _clients.get(client_id)
-    if record is not None and record.get("redirect_uris"):
-        return redirect_uri in record["redirect_uris"]
-    # Unregistered or operator-configured client: no stored allowlist to match
-    # against. The login gate is still enforced, so this is not an auth bypass.
-    return True
+    if record is not None:
+        # DCR-registered client: exact-match its registered URIs (empty list -> deny).
+        return redirect_uri in (record.get("redirect_uris") or [])
+    if client_id == config.VAULT_OAUTH_CLIENT_ID:
+        # Operator-configured client: only the explicit allowlist is accepted.
+        return redirect_uri in config.VAULT_OAUTH_REDIRECT_URIS
+    return False
 
 
 def _client_known(client_id: str) -> bool:
@@ -287,6 +293,11 @@ async def _handle_authorization_code(form) -> JSONResponse:
         return JSONResponse({"error": "invalid_grant", "error_description": "Invalid or expired code"}, status_code=400)
 
     code_data = _auth_codes.pop(code)  # single-use
+
+    # RFC 6749 4.1.3: the code must be redeemed by the client it was issued to (#4).
+    request_client_id = form.get("client_id", "")
+    if not hmac.compare_digest(request_client_id or "", code_data.get("client_id") or ""):
+        return JSONResponse({"error": "invalid_grant", "error_description": "client_id mismatch"}, status_code=400)
 
     # redirect_uri must be present and match what was bound to the code.
     if not redirect_uri or redirect_uri != code_data["redirect_uri"]:

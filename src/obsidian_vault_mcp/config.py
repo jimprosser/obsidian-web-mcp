@@ -18,6 +18,12 @@ VAULT_OAUTH_CLIENT_SECRET = os.environ.get("VAULT_OAUTH_CLIENT_SECRET", "")
 VAULT_OAUTH_USERNAME = os.environ.get("VAULT_OAUTH_USERNAME", "obsidian")
 VAULT_OAUTH_PASSWORD = os.environ.get("VAULT_OAUTH_PASSWORD", "")
 
+# Allowed redirect URIs for the operator-configured client (VAULT_OAUTH_CLIENT_ID),
+# comma-separated. Dynamically-registered clients carry their own redirect_uris; this
+# governs only the static operator client. If empty, the operator client cannot use the
+# browser authorization-code flow (it can still use the client_credentials grant).
+VAULT_OAUTH_REDIRECT_URIS = [u.strip() for u in os.environ.get("VAULT_OAUTH_REDIRECT_URIS", "").split(",") if u.strip()]
+
 # Network bind address. Defaults to loopback so the server is NOT exposed on the LAN;
 # Cloudflare Tunnel reaches it over localhost. Set to 0.0.0.0 only if you deliberately
 # want direct network exposure.

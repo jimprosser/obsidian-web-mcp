@@ -27,6 +27,7 @@ def reset_state(monkeypatch):
     monkeypatch.setattr(config, "VAULT_OAUTH_PASSWORD", "")  # unset by default
     monkeypatch.setattr(config, "VAULT_OAUTH_CLIENT_ID", "vault-mcp-client")
     monkeypatch.setattr(config, "VAULT_OAUTH_CLIENT_SECRET", "configured-server-secret")
+    monkeypatch.setattr(config, "VAULT_OAUTH_REDIRECT_URIS", [])
     yield
 
 
@@ -121,7 +122,7 @@ def test_full_flow_with_correct_password(client, monkeypatch):
 
     # Exchange the code (with the PKCE verifier) for a token.
     tok = client.post("/oauth/token", data={
-        "grant_type": "authorization_code", "code": code,
+        "grant_type": "authorization_code", "code": code, "client_id": client_id,
         "redirect_uri": redirect, "code_verifier": verifier,
     })
     assert tok.status_code == 200
@@ -139,7 +140,8 @@ def test_token_requires_pkce_verifier(client, monkeypatch):
 
     # Same code, but NO verifier -> rejected.
     tok = client.post("/oauth/token", data={
-        "grant_type": "authorization_code", "code": code, "redirect_uri": redirect,
+        "grant_type": "authorization_code", "code": code, "client_id": client_id,
+        "redirect_uri": redirect,
     })
     assert tok.status_code == 400
 
@@ -192,3 +194,67 @@ def test_no_password_fails_closed_even_via_post(client):
     r = client.post("/oauth/authorize", data=data, follow_redirects=False)
     assert r.status_code == 503
     assert "location" not in {k.lower() for k in r.headers}
+
+
+# --- #4: client identity at token exchange + redirect allowlist ---------------
+
+def _login_and_get_code(client, client_id, redirect, challenge):
+    data = _authz_params(client_id, redirect, challenge)
+    data.update({"username": "obsidian", "password": "hunter2"})
+    r = client.post("/oauth/authorize", data=data, follow_redirects=False)
+    assert r.status_code == 302
+    return r.headers["location"].split("code=")[1].split("&")[0]
+
+
+def test_token_rejects_client_id_mismatch(client, monkeypatch):
+    """A code issued to client A cannot be redeemed by client B (RFC 6749 4.1.3)."""
+    monkeypatch.setattr(config, "VAULT_OAUTH_PASSWORD", "hunter2")
+    client_id, redirect = _register(client)
+    other_id, _ = _register(client, redirect_uri="https://other.example/cb")
+    verifier, challenge = _pkce()
+    code = _login_and_get_code(client, client_id, redirect, challenge)
+    tok = client.post("/oauth/token", data={
+        "grant_type": "authorization_code", "code": code, "client_id": other_id,
+        "redirect_uri": redirect, "code_verifier": verifier,
+    })
+    assert tok.status_code == 400
+    assert tok.json()["error"] == "invalid_grant"
+
+
+def test_operator_client_redirect_requires_allowlist(client, monkeypatch):
+    """The operator-configured client_id no longer accepts an arbitrary redirect_uri;
+    it must match VAULT_OAUTH_REDIRECT_URIS (#4a fallthrough closed)."""
+    monkeypatch.setattr(config, "VAULT_OAUTH_PASSWORD", "hunter2")
+    _, challenge = _pkce()
+    op = config.VAULT_OAUTH_CLIENT_ID  # not DCR-registered
+
+    # No allowlist -> any redirect rejected.
+    r = client.get("/oauth/authorize",
+                   params=_authz_params(op, "https://anywhere.example/cb", challenge),
+                   follow_redirects=False)
+    assert r.status_code == 400
+
+    # Allowlist set -> only the listed URI is accepted.
+    monkeypatch.setattr(config, "VAULT_OAUTH_REDIRECT_URIS", ["https://allowed.example/cb"])
+    r_bad = client.get("/oauth/authorize",
+                       params=_authz_params(op, "https://anywhere.example/cb", challenge),
+                       follow_redirects=False)
+    assert r_bad.status_code == 400
+    r_ok = client.get("/oauth/authorize",
+                      params=_authz_params(op, "https://allowed.example/cb", challenge),
+                      follow_redirects=False)
+    assert r_ok.status_code == 200  # login form for an allowed redirect
+
+
+def test_registered_client_empty_redirects_denied(client, monkeypatch):
+    """A DCR client that registered no usable (https/loopback) redirect_uris
+    cannot use the authorization-code flow (no fallthrough)."""
+    monkeypatch.setattr(config, "VAULT_OAUTH_PASSWORD", "hunter2")
+    r = client.post("/oauth/register", json={"redirect_uris": ["http://evil.example/cb"]})
+    cid = r.json()["client_id"]
+    assert r.json()["redirect_uris"] == []  # http non-loopback filtered out
+    _, challenge = _pkce()
+    r2 = client.get("/oauth/authorize",
+                    params=_authz_params(cid, "https://evil.example/cb", challenge),
+                    follow_redirects=False)
+    assert r2.status_code == 400
