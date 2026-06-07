@@ -142,15 +142,10 @@ export VAULT_MCP_HOSTNAME="vault-mcp.yourdomain.com"
 
 The script authenticates with Cloudflare, creates a tunnel, writes the config, and sets up the DNS record. You will need a domain managed by Cloudflare.
 
-After setup, add your tunnel hostname to the `allowed_hosts` list in `server.py` so the MCP library's DNS rebinding protection accepts requests from your domain:
+After setup, allow your tunnel hostname through the MCP library's DNS rebinding protection by setting `VAULT_MCP_ALLOWED_HOSTS` (comma-separated; appended to the loopback defaults, so no source edit is needed):
 
-```python
-allowed_hosts=[
-    "127.0.0.1:*",
-    "localhost:*",
-    "[::1]:*",
-    "vault-mcp.yourdomain.com",  # add your hostname here
-],
+```bash
+export VAULT_MCP_ALLOWED_HOSTS="vault-mcp.yourdomain.com"
 ```
 
 ## Production Deployment (macOS)
@@ -313,15 +308,10 @@ journalctl -u caddy -f
 
 ### 5. Allow the public hostname in the server
 
-The MCP library enables DNS rebinding protection, so you must add your public hostname to `allowed_hosts` in `src/obsidian_vault_mcp/server.py`:
+The MCP library enables DNS rebinding protection, so set `VAULT_MCP_ALLOWED_HOSTS` to your public hostname (comma-separated; appended to the loopback defaults — no need to edit the source):
 
-```python
-allowed_hosts=[
-    "127.0.0.1:*",
-    "localhost:*",
-    "[::1]:*",
-    "your-mcp-server.dev",
-]
+```bash
+export VAULT_MCP_ALLOWED_HOSTS="your-mcp-server.dev"
 ```
 
 ### 6. Start obsidian-web-mcp on the VPS

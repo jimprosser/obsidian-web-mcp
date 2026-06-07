@@ -29,6 +29,12 @@ VAULT_OAUTH_REDIRECT_URIS = [u.strip() for u in os.environ.get("VAULT_OAUTH_REDI
 # want direct network exposure.
 VAULT_MCP_HOST = os.environ.get("VAULT_MCP_HOST", "127.0.0.1")
 
+# Extra hostnames allowed through the MCP library's DNS-rebinding protection,
+# comma-separated. Loopback (127.0.0.1, localhost, [::1]) is always allowed; set this
+# to your public tunnel/proxy hostname, e.g. "vault-mcp.example.com". Operator-supplied
+# hosts are APPENDED to the loopback defaults in server.py, never replace them.
+VAULT_MCP_ALLOWED_HOSTS = [h.strip() for h in os.environ.get("VAULT_MCP_ALLOWED_HOSTS", "").split(",") if h.strip()]
+
 # Safety limits
 MAX_CONTENT_SIZE = 1_000_000  # 1MB max write size
 MAX_BATCH_SIZE = 20           # Max files per batch operation
