@@ -19,6 +19,21 @@ _AUTH_EXEMPT_PATHS = {
 }
 
 
+def _www_authenticate(request: Request, error: str) -> str:
+    """RFC 9728 challenge header pointing clients at the protected-resource metadata.
+
+    Without it a 401 just looks like a failed request; with it, a spec-compliant MCP
+    client (e.g. Claude Code, ChatGPT) knows to fetch the metadata and start the OAuth
+    flow -- "Needs authentication" instead of "Failed to connect". The resource URL is
+    derived from request.base_url, matching the oauth_metadata / oauth_protected_resource
+    endpoints, so it is only as trustworthy as the Host/forwarded-header validation in
+    front of the app.
+    """
+    base_url = str(request.base_url).rstrip("/")
+    resource_metadata = f"{base_url}/.well-known/oauth-protected-resource"
+    return f'Bearer realm="mcp", resource_metadata="{resource_metadata}", error="{error}"'
+
+
 class BearerAuthMiddleware(BaseHTTPMiddleware):
     """Validates Bearer tokens on all requests except OAuth and health endpoints."""
 
@@ -37,6 +52,7 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
             return JSONResponse(
                 {"error": "Missing or malformed Authorization header"},
                 status_code=401,
+                headers={"WWW-Authenticate": _www_authenticate(request, "invalid_request")},
             )
 
         token = auth_header[7:]
@@ -45,6 +61,7 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
             return JSONResponse(
                 {"error": "Invalid token"},
                 status_code=401,
+                headers={"WWW-Authenticate": _www_authenticate(request, "invalid_token")},
             )
 
         return await call_next(request)
