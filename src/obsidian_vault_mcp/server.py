@@ -13,7 +13,14 @@ from contextlib import asynccontextmanager
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 
-from .config import VAULT_MCP_ALLOWED_HOSTS, VAULT_MCP_HOST, VAULT_MCP_PORT, VAULT_MCP_TOKEN, VAULT_PATH
+from .config import (
+    VAULT_MCP_ALLOWED_HOSTS,
+    VAULT_MCP_FORWARDED_ALLOW_IPS,
+    VAULT_MCP_HOST,
+    VAULT_MCP_PORT,
+    VAULT_MCP_TOKEN,
+    VAULT_PATH,
+)
 from .frontmatter_index import FrontmatterIndex
 
 logger = logging.getLogger(__name__)
@@ -238,8 +245,11 @@ def main():
         host=VAULT_MCP_HOST,
         port=VAULT_MCP_PORT,
         log_level="info",
+        # Honor X-Forwarded-* ONLY from the trusted loopback proxy (Cloudflare
+        # Tunnel / Caddy), never from arbitrary clients. Trusting "*" let any
+        # caller spoof the advertised OAuth origin via X-Forwarded-Host.
         proxy_headers=True,
-        forwarded_allow_ips="*",
+        forwarded_allow_ips=VAULT_MCP_FORWARDED_ALLOW_IPS,
     )
 
 

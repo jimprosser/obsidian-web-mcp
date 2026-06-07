@@ -107,6 +107,8 @@ All configuration is via environment variables:
 | `VAULT_OAUTH_USERNAME` | No | `obsidian` | Username for the interactive login |
 | `VAULT_MCP_HOST` | No | `127.0.0.1` | Bind address. Loopback by default; set `0.0.0.0` only for deliberate LAN exposure |
 | `VAULT_MCP_PORT` | No | `8420` | Port the HTTP server listens on |
+| `VAULT_MCP_FORWARDED_ALLOW_IPS` | No | `127.0.0.1` | Client IPs uvicorn trusts to set `X-Forwarded-*` headers. Loopback-only by default, because a trusted Cloudflare Tunnel / Caddy proxy connects over localhost. **Never set this to `*`** -- that lets any caller spoof the advertised OAuth origin via `X-Forwarded-Host`. Set to `::1` if your proxy connects over IPv6 loopback. |
+| `VAULT_MCP_PUBLIC_URL` | No | (none) | Canonical public origin (e.g. `https://vault-mcp.yourdomain.com`) for every URL the server advertises -- the OAuth discovery metadata and the `WWW-Authenticate` challenge. When set it **pins** those URLs so a spoofed `Host` / `X-Forwarded-Host` header cannot redirect OAuth discovery to an attacker. When unset, the per-request base URL is used. Recommended for any reverse-proxy deployment. |
 | `VAULT_OAUTH_CLIENT_ID` | No | `vault-mcp-client` | Client ID for the headless `client_credentials` grant |
 | `VAULT_OAUTH_CLIENT_SECRET` | No | (none) | Only required for the headless `client_credentials` grant. The Claude/ChatGPT browser flow uses dynamic client registration and does **not** need this. |
 | `VAULT_OAUTH_REDIRECT_URIS` | No | (none) | Comma-separated allowlist of redirect URIs for the static `VAULT_OAUTH_CLIENT_ID` when using the browser flow. Dynamically-registered clients (Claude/ChatGPT) carry their own; leave unset unless you connect a static client through `/oauth/authorize`. |
@@ -312,6 +314,12 @@ The MCP library enables DNS rebinding protection, so set `VAULT_MCP_ALLOWED_HOST
 
 ```bash
 export VAULT_MCP_ALLOWED_HOSTS="your-mcp-server.dev"
+```
+
+Caddy reverse-proxies from `localhost`, so the loopback-only `VAULT_MCP_FORWARDED_ALLOW_IPS` default already trusts its `X-Forwarded-*` headers — no change needed. As defense in depth, pin the origin the server advertises in OAuth discovery so a spoofed `X-Forwarded-Host` can never redirect it:
+
+```bash
+export VAULT_MCP_PUBLIC_URL="https://your-mcp-server.dev"
 ```
 
 ### 6. Start obsidian-web-mcp on the VPS

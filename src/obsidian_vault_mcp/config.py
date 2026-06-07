@@ -35,6 +35,35 @@ VAULT_MCP_HOST = os.environ.get("VAULT_MCP_HOST", "127.0.0.1")
 # hosts are APPENDED to the loopback defaults in server.py, never replace them.
 VAULT_MCP_ALLOWED_HOSTS = [h.strip() for h in os.environ.get("VAULT_MCP_ALLOWED_HOSTS", "").split(",") if h.strip()]
 
+# Which client IPs uvicorn trusts to set X-Forwarded-* headers. Because the server
+# derives request.base_url from those headers and advertises it in OAuth discovery
+# metadata + the RFC 9728 WWW-Authenticate challenge, trusting them from arbitrary
+# sources lets an attacker spoof the advertised authorization-server / resource URL
+# (X-Forwarded-Host: evil.example) -- a token-redirection vector. The server binds
+# loopback and is reached by Cloudflare Tunnel / Caddy over localhost, so the only
+# trustworthy forwarder is loopback. Defaults to uvicorn's own default, "127.0.0.1";
+# override only if your reverse proxy connects from a different address (e.g. "::1").
+# Never set this to "*".
+VAULT_MCP_FORWARDED_ALLOW_IPS = os.environ.get("VAULT_MCP_FORWARDED_ALLOW_IPS", "127.0.0.1")
+
+# Canonical public origin for every URL the server advertises -- the OAuth metadata
+# endpoints (issuer / authorization_endpoint / token_endpoint / registration_endpoint /
+# resource) and the WWW-Authenticate resource_metadata pointer. When set (e.g.
+# "https://vault-mcp.example.com") it PINS those URLs so a spoofed Host / X-Forwarded-Host
+# header cannot redirect OAuth discovery to an attacker-controlled server. When empty,
+# the server falls back to the per-request base_url. A trailing slash is ignored.
+VAULT_MCP_PUBLIC_URL = os.environ.get("VAULT_MCP_PUBLIC_URL", "").strip()
+
+
+def advertised_base_url(request_base_url: str) -> str:
+    """Return the canonical origin to advertise, with no trailing slash.
+
+    Prefers the operator-pinned VAULT_MCP_PUBLIC_URL; falls back to the request's
+    own base_url. Centralizing this keeps the OAuth metadata endpoints and the
+    WWW-Authenticate challenge consistent and spoof-resistant.
+    """
+    return (VAULT_MCP_PUBLIC_URL or request_base_url).rstrip("/")
+
 # Safety limits
 MAX_CONTENT_SIZE = 1_000_000  # 1MB max write size
 MAX_BATCH_SIZE = 20           # Max files per batch operation

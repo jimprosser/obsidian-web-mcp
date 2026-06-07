@@ -6,6 +6,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
+from . import config
 from .config import VAULT_MCP_TOKEN
 
 # Paths that don't require bearer auth (OAuth flow + health)
@@ -25,11 +26,11 @@ def _www_authenticate(request: Request, error: str) -> str:
     Without it a 401 just looks like a failed request; with it, a spec-compliant MCP
     client (e.g. Claude Code, ChatGPT) knows to fetch the metadata and start the OAuth
     flow -- "Needs authentication" instead of "Failed to connect". The resource URL is
-    derived from request.base_url, matching the oauth_metadata / oauth_protected_resource
-    endpoints, so it is only as trustworthy as the Host/forwarded-header validation in
-    front of the app.
+    derived from VAULT_MCP_PUBLIC_URL when set (otherwise request.base_url), matching the
+    oauth_metadata / oauth_protected_resource endpoints. Pinning the public URL keeps a
+    spoofed Host/X-Forwarded-Host header from pointing clients at an attacker's server.
     """
-    base_url = str(request.base_url).rstrip("/")
+    base_url = config.advertised_base_url(str(request.base_url))
     resource_metadata = f"{base_url}/.well-known/oauth-protected-resource"
     return f'Bearer realm="mcp", resource_metadata="{resource_metadata}", error="{error}"'
 

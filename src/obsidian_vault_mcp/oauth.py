@@ -179,7 +179,7 @@ def _misconfigured_page() -> HTMLResponse:
 
 async def oauth_metadata(request: Request) -> JSONResponse:
     """RFC 8414 OAuth authorization server metadata."""
-    base_url = str(request.base_url).rstrip("/")
+    base_url = config.advertised_base_url(str(request.base_url))
     return JSONResponse({
         "issuer": base_url,
         "authorization_endpoint": f"{base_url}/oauth/authorize",
@@ -196,7 +196,7 @@ async def oauth_protected_resource(request: Request) -> JSONResponse:
     """RFC 9728 OAuth protected-resource metadata. Claude/ChatGPT request this path
     during discovery; it must be reachable without a bearer token (#20). With the MCP
     endpoint served at "/" (#19), the protected resource is the base URL itself."""
-    base_url = str(request.base_url).rstrip("/")
+    base_url = config.advertised_base_url(str(request.base_url))
     return JSONResponse({
         "resource": base_url,
         "authorization_servers": [base_url],
