@@ -86,10 +86,10 @@ def test_vault_edit_rejects_mixed_old_and_old_alias(vault_dir):
 # --- P1: near-miss diagnostics ----------------------------------------------
 
 def test_vault_edit_zero_match_reports_near_miss(vault_dir):
-    """A single-character typo surfaces the closest line and a similarity hint."""
+    """A single-character typo surfaces the closest line with a high similarity."""
     result = json.loads(vault_edit(
         "test-note.md",
-        # actual text is "some content"; introduce a typo
+        # actual text contains "some content"; introduce a typo
         [{"old_text": "some kontent", "new_text": "x"}],
     ))
 
@@ -97,11 +97,14 @@ def test_vault_edit_zero_match_reports_near_miss(vault_dir):
     assert result["changed"] is False
     nm = result.get("near_miss")
     assert nm, "zero-match error should carry a near_miss hint"
-    assert "some content" in json.dumps(nm)
+    assert "some content" in nm["line"]
+    # A one-character typo must score as clearly similar, otherwise the hint is
+    # indistinguishable from unrelated input and the feature is pointless.
+    assert nm["similarity"] > 0.6
 
 
 def test_vault_edit_zero_match_unrelated_input_has_no_false_near_miss(vault_dir):
-    """Input unrelated to any line does not fabricate a high-confidence match."""
+    """Input unrelated to any line does not fabricate a near_miss hint at all."""
     result = json.loads(vault_edit(
         "test-note.md",
         [{"old_text": "zzzzz totally unrelated payload qqqqq", "new_text": "x"}],
@@ -109,10 +112,43 @@ def test_vault_edit_zero_match_unrelated_input_has_no_false_near_miss(vault_dir)
 
     assert "error" in result
     assert result["changed"] is False
-    # near_miss is either absent or explicitly low similarity, never a clean hit.
+    # Below the similarity floor: no misleading hint is emitted.
+    assert result.get("near_miss") is None
+
+
+def test_vault_edit_multiline_zero_match_is_coherent(vault_dir):
+    """A multi-line old_text that does not match yields a coherent error, no crash."""
+    (vault_dir / "test-note.md").write_text(
+        "---\nstatus: active\n---\n\nfirst line here\nsecond line here\n"
+    )
+    result = json.loads(vault_edit(
+        "test-note.md",
+        [{"old_text": "first line here\nsecnd line here", "new_text": "x"}],
+    ))
+
+    assert "error" in result
+    assert result["changed"] is False
+    # near_miss is optional for multi-line input, but if present it must be a
+    # real line from the file with a bounded similarity.
     nm = result.get("near_miss")
     if nm:
-        assert nm.get("similarity", 0) < 0.6
+        assert 0.0 <= nm["similarity"] <= 1.0
+        assert nm["line"] in (vault_dir / "test-note.md").read_text()
+
+
+def test_vault_edit_missing_old_text_reports_explicit_error(vault_dir):
+    """An edit with no old_text fails with a clear message, not a phantom count."""
+    before = (vault_dir / "test-note.md").read_text()
+    result = json.loads(vault_edit(
+        "test-note.md",
+        [{"new_text": "x"}],
+    ))
+
+    assert "error" in result
+    assert "match" not in result["error"] or "old_text" in result["error"]
+    assert "found" not in result["error"], "must not report a fabricated match count"
+    assert result["changed"] is False
+    assert (vault_dir / "test-note.md").read_text() == before
 
 
 # --- P2: dry_run aggregates match counts against the original ----------------
@@ -131,12 +167,45 @@ def test_vault_edit_dry_run_aggregates_all_match_counts(vault_dir):
 
     matches = result.get("match_counts")
     assert matches is not None, "dry_run should report per-edit match counts"
-    assert [m["count"] for m in matches] == [1, 0, pytest.approx(matches[2]["count"])]
     assert matches[0]["count"] == 1
     assert matches[1]["count"] == 0
     assert matches[2]["count"] > 1
+    # the zero-count edit carries a near_miss in the dry_run path too
+    assert matches[1].get("near_miss") is not None
+    # a non-unique set is not applicable: no diff preview, nothing counted applied
+    assert result["diff"] == ""
+    assert result["edits_applied"] == 0
     # nothing written
     assert result["changed"] is False
+
+
+def test_vault_edit_dry_run_all_unique_previews_diff_without_writing(vault_dir):
+    """When every edit matches once, dry_run returns the diff and applies nothing."""
+    before = (vault_dir / "test-note.md").read_text()
+    result = json.loads(vault_edit(
+        "test-note.md",
+        [{"old_text": "some content", "new_text": "more focused content"}],
+        dry_run=True,
+    ))
+
+    assert result["changed"] is False
+    assert result["edits_applied"] == 1
+    assert result["match_counts"] == [{"index": 0, "count": 1}]
+    assert "more focused content" in result["diff"]
+    assert (vault_dir / "test-note.md").read_text() == before
+
+
+def test_vault_edit_dry_run_accepts_old_new_aliases(vault_dir):
+    """old/new aliases are normalized before the dry_run fork."""
+    result = json.loads(vault_edit(
+        "test-note.md",
+        [{"old": "some content", "new": "x"}],
+        dry_run=True,
+    ))
+
+    assert result["match_counts"] == [{"index": 0, "count": 1}]
+    assert result["edits_applied"] == 1
+    assert "error" not in result
 
 
 def test_vault_edit_dry_run_counts_against_original_not_sequential(vault_dir):

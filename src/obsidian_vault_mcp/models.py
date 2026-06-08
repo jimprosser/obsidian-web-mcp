@@ -1,6 +1,6 @@
 """Pydantic input models for obsidian-vault-mcp tool endpoints."""
 
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -61,7 +61,7 @@ _EDIT_FIELD_ALIASES: dict[str, tuple[str, ...]] = {
 }
 
 
-def normalize_edit_aliases(data):
+def normalize_edit_aliases(data: Any) -> Any:
     """Map edit-field aliases onto their canonical old_text/new_text keys.
 
     Shared by the pydantic model (the MCP schema path) and the write tool (the

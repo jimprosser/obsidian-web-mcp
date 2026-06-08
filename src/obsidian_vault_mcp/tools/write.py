@@ -54,8 +54,20 @@ def _unified_diff(path: str, before: str, after: str) -> str:
     ))
 
 
+# A near-miss hint is only emitted when the closest line shares at least this
+# fraction of old_text. Below it the "hint" is noise (unrelated input, blank
+# lines) and would mislead more than help.
+_NEAR_MISS_MIN_SIMILARITY = 0.5
+
+
 def _normalize_edit_aliases(edit: dict) -> tuple[dict | None, str | None]:
-    """Apply the shared alias normalization, returning (normalized, error)."""
+    """Apply the shared alias normalization, returning (normalized, error).
+
+    This guards the direct-dict callers of vault_edit (tests, internal use).
+    The MCP path is already canonicalized: server.py validates each edit as a
+    VaultEditOperationInput and passes model_dump() output, so this is a no-op
+    there rather than dead code.
+    """
     try:
         return normalize_edit_aliases(edit), None
     except ValueError as exc:
@@ -63,28 +75,35 @@ def _normalize_edit_aliases(edit: dict) -> tuple[dict | None, str | None]:
 
 
 def _find_near_miss(content: str, old_text: str) -> dict | None:
-    """Return the document line most similar to old_text for a zero-match edit.
+    """Return the document line closest to old_text for a zero-match edit.
 
-    Line-scoped so the cost stays linear in the file size. The similarity ratio
-    lets a caller distinguish a one-character typo (high) from an old_text that
-    simply is not in the file (low), instead of guessing from a bare count.
+    Line-scoped: one SequenceMatcher pass per line, so work grows with file
+    size rather than quadratically across lines (for a fixed old_text). The
+    similarity is the fraction of old_text matched on the closest line, which
+    separates a one-character typo (high) from text that is simply absent
+    (low). Returns None when the best line is below the similarity floor, so
+    unrelated input produces no misleading hint.
     """
     lines = content.splitlines()
-    if not lines:
+    if not lines or not old_text:
         return None
 
     matcher = difflib.SequenceMatcher(a=old_text)
-    best_ratio, best_index = 0.0, 0
+    best_similarity, best_index = 0.0, 0
     for index, line in enumerate(lines):
         matcher.set_seq2(line)
-        ratio = matcher.ratio()
-        if ratio > best_ratio:
-            best_ratio, best_index = ratio, index
+        matched = sum(block.size for block in matcher.get_matching_blocks())
+        similarity = matched / len(old_text)
+        if similarity > best_similarity:
+            best_similarity, best_index = similarity, index
+
+    if best_similarity < _NEAR_MISS_MIN_SIMILARITY:
+        return None
 
     return {
         "line_number": best_index + 1,
         "line": lines[best_index],
-        "similarity": round(best_ratio, 2),
+        "similarity": round(best_similarity, 2),
     }
 
 
@@ -94,13 +113,25 @@ def _dry_run_report(path: str, original_content: str, normalized_edits: list[dic
     Unlike the apply path this does not fail fast: every edit's match count
     (0, 1, or many) is reported so one response surfaces all mismatches. When
     every edit matches exactly once the sequential diff preview is included too.
+
+    Counts are measured independently against the original document, so for
+    chained edits (one edit's new_text feeds another's old_text) this preview
+    will not predict the sequential apply outcome; the apply path's fail-fast
+    is the safety net there.
     """
     match_counts = []
     all_unique = True
     for index, edit in enumerate(normalized_edits):
         old_text = edit.get("old_text", "")
+        entry = {"index": index}
+        if not old_text:
+            entry["count"] = 0
+            entry["error"] = "no old_text to match"
+            all_unique = False
+            match_counts.append(entry)
+            continue
         count = original_content.count(old_text)
-        entry = {"index": index, "count": count}
+        entry["count"] = count
         if count == 0:
             near_miss = _find_near_miss(original_content, old_text)
             if near_miss:
@@ -158,6 +189,20 @@ def vault_edit(path: str, edits: list[dict], dry_run: bool = False) -> str:
         for index, normalized_edit in enumerate(normalized_edits):
             old_text = normalized_edit.get("old_text", "")
             new_text = normalized_edit.get("new_text", "")
+
+            if not old_text:
+                # An empty old_text would make content.count() report a phantom
+                # match for every position; reject it as the malformed edit it is.
+                return dumps({
+                    "error": f"Edit {index} has no old_text to match",
+                    "path": path,
+                    "changed": False,
+                    "dry_run": dry_run,
+                    "diff": "",
+                    "edits_applied": 0,
+                    "size": len(original_content.encode("utf-8")),
+                })
+
             count = content.count(old_text)
 
             if count != 1:
