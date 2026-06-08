@@ -133,6 +133,14 @@ def test_batch_read_is_verbatim_and_preserves_each_file(vault_dir):
         assert _udhr(lang) in by_path[path]["content"]
 
 
+def test_batch_read_missing_non_ascii_path_is_verbatim(vault_dir):
+    raw = vault_batch_read(["없는폴더/회의록.md"])
+    assert "\\u" not in raw
+    parsed = json.loads(raw)
+    assert parsed["missing"] == 1
+    assert parsed["files"][0]["path"] == "없는폴더/회의록.md"
+
+
 # --- batch frontmatter update: non-ASCII field values --------------------------
 
 def test_batch_frontmatter_update_writes_non_ascii_values(vault_dir):

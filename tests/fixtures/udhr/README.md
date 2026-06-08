@@ -7,11 +7,11 @@ and response size at scale).
 
 ## Source and license
 
-The UDHR is in the **public domain**; the United Nations encourages its free
-reproduction and translation. Plain-text UTF-8 translations are distributed by
-the Unicode UDHR project and the NLTK `udhr2` corpus. The files here are bounded
-excerpts (roughly the opening of the preamble, about 700 to 900 characters per
-language) taken from that public-domain text. No attribution is required; the
+The UDHR is treated as **freely reproducible**: the United Nations encourages its
+free reproduction and translation. Plain-text UTF-8 translations are distributed
+by the Unicode UDHR project and the NLTK `udhr2` corpus. The files here are
+bounded excerpts (roughly the opening of the preamble, under about 1000
+characters per language) taken from that text. No attribution is required; the
 source is recorded here only for provenance.
 
 ## Files

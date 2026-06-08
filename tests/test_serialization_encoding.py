@@ -25,9 +25,9 @@ from datetime import date
 import pytest
 
 from obsidian_vault_mcp.serialization import dumps
-from obsidian_vault_mcp.tools.manage import vault_list
+from obsidian_vault_mcp.tools.manage import vault_delete, vault_list, vault_move
 from obsidian_vault_mcp.tools.read import vault_read
-from obsidian_vault_mcp.tools.search import vault_search
+from obsidian_vault_mcp.tools.search import vault_search, vault_search_frontmatter
 from obsidian_vault_mcp.tools.write import vault_edit, vault_write
 
 # (id, sample text, a substring to search for, a filename stem) per script.
@@ -42,7 +42,7 @@ LANGUAGES = [
     ("hebrew", "ההחלטות שהתקבלו בפגישה היום", "ההחלטות", "פרוטוקול"),
     ("thai", "การประชุมในวันนี้มีการตัดสินใจหลายอย่าง", "ประชุม", "บันทึก"),
     ("accented_latin", "Décisions prises lors de la réunion", "Décisions", "réunion"),
-    ("emoji_non_bmp", "Done shipped 🚀 review notes 📝", "🚀", "notes_rocket"),
+    ("emoji_non_bmp", "Done shipped 🚀 review notes 📝", "🚀", "notes_🚀"),
 ]
 LANG_IDS = [row[0] for row in LANGUAGES]
 
@@ -142,3 +142,80 @@ def test_vault_edit_dryrun_diff_unescaped(vault_dir, lang, text, term, stem):
     assert "\\u" not in raw
     parsed = json.loads(raw)
     assert text in parsed["diff"]
+
+
+# --- kwargs override contract (the new defaults must be overridable) -----------
+
+def test_dumps_respects_explicit_ensure_ascii_override():
+    raw = dumps({"title": "회의"}, ensure_ascii=True)
+    assert "회의" not in raw
+    assert "\\ud68c" in raw
+
+
+def test_dumps_respects_explicit_separators_override():
+    assert dumps({"a": 1, "b": 2}, separators=(", ", ": ")) == '{"a": 1, "b": 2}'
+
+
+# --- robustness: non-UTF-8 (surrogate-escaped) filesystem names ----------------
+
+def test_dumps_output_is_always_utf8_encodable():
+    # Files whose names are not valid UTF-8 reach us as lone surrogates via
+    # os.fsdecode(surrogateescape). The response string must still encode for the
+    # wire; otherwise a single odd filename crashes the response at transport.
+    raw = dumps({"path": "bad\udce9name.md", "items": []})
+    raw.encode("utf-8")  # must not raise
+
+
+# --- non-ASCII error-path responses (except branches route through dumps too) --
+
+def test_vault_read_missing_non_ascii_path_unescaped(vault_dir):
+    raw = vault_read("없는폴더/회의록.md")
+    assert "\\u" not in raw
+    parsed = json.loads(raw)
+    assert "error" in parsed
+    assert parsed["path"] == "없는폴더/회의록.md"
+
+
+def test_vault_edit_nonmatching_old_text_error_unescaped(vault_dir):
+    vault_write("회의.md", "원본 내용\n")
+    raw = vault_edit("회의.md", [{"old_text": "존재하지않는텍스트", "new_text": "x"}])
+    assert "\\u" not in raw
+    parsed = json.loads(raw)
+    assert "error" in parsed
+    assert parsed["path"] == "회의.md"
+
+
+# --- vault_move / vault_delete echo non-ASCII paths verbatim -------------------
+
+def test_vault_move_response_unescaped(vault_dir):
+    vault_write("원본/회의.md", "내용\n")
+    raw = vault_move("원본/회의.md", "보관/회의_이동.md")
+    assert "\\u" not in raw
+    parsed = json.loads(raw)
+    assert parsed["source"] == "원본/회의.md"
+    assert parsed["destination"] == "보관/회의_이동.md"
+
+
+def test_vault_delete_response_unescaped(vault_dir):
+    vault_write("삭제대상.md", "내용\n")
+    raw = vault_delete("삭제대상.md", confirm=True)
+    assert "\\u" not in raw
+    parsed = json.loads(raw)
+    assert parsed["path"] == "삭제대상.md"
+
+
+# --- vault_search_frontmatter returns non-ASCII frontmatter verbatim -----------
+
+def test_vault_search_frontmatter_unescaped(vault_dir, monkeypatch):
+    from obsidian_vault_mcp import server
+    from obsidian_vault_mcp.frontmatter_index import FrontmatterIndex
+
+    idx = FrontmatterIndex()
+    idx._index = {"회의록.md": {"title": "주간 회의 議事録", "tags": ["업무", "회의"]}}
+    monkeypatch.setattr(server, "frontmatter_index", idx)
+
+    raw = vault_search_frontmatter("title", "주간 회의 議事録", match_type="exact")
+    assert "\\u" not in raw
+    parsed = json.loads(raw)
+    assert parsed["total"] >= 1
+    assert parsed["results"][0]["frontmatter"]["title"] == "주간 회의 議事録"
