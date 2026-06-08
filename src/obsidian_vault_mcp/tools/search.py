@@ -1,5 +1,6 @@
 """Search tools for the Obsidian vault MCP server."""
 
+import base64
 import json
 import logging
 import shutil
@@ -13,6 +14,55 @@ from ..serialization import dumps
 from ..vault import resolve_vault_path
 
 logger = logging.getLogger(__name__)
+
+
+def _split_lines(text: str) -> list[str]:
+    """Split text into lines the way ripgrep counts them: on "\\n" only.
+
+    Python's str.splitlines() also breaks on other separators (NEL, LINE and
+    PARAGRAPH SEPARATOR, vertical tab, form feed, lone carriage return), which
+    would desync the line index from ripgrep's "\\n"-based line_number. A
+    trailing carriage return is stripped per line so CRLF files read the same as
+    str.splitlines(), and a final empty element from a trailing newline is
+    dropped. Both backends use this so their line numbering stays identical.
+    """
+    lines = text.split("\n")
+    if lines and lines[-1] == "":
+        lines.pop()
+    return [line[:-1] if line.endswith("\r") else line for line in lines]
+
+
+def _rg_match_line(match_data: dict) -> str:
+    """Return ripgrep's matched line text, decoding base64 bytes if needed.
+
+    ripgrep emits "bytes" instead of "text" when the matched line is not valid
+    UTF-8; decode it lossily so the fallback never produces an empty snippet.
+    """
+    line = match_data["lines"]
+    text = line.get("text")
+    if text is None:
+        encoded = line.get("bytes")
+        text = (
+            base64.b64decode(encoded).decode("utf-8", errors="replace")
+            if encoded
+            else ""
+        )
+    return text.rstrip("\n")
+
+
+def _assemble_context(
+    file_lines: list[str], match_index: int, context_lines: int
+) -> str:
+    """Return the matched line plus up to context_lines lines on each side.
+
+    match_index is the 0-based index of the matched line. The slice is clamped
+    at the file boundaries. Both search backends share this helper so they
+    produce identical match_context for the same query, except when the ripgrep
+    backend cannot re-read a matched file and degrades to the matched line only.
+    """
+    start = max(0, match_index - context_lines)
+    end = min(len(file_lines), match_index + context_lines + 1)
+    return "\n".join(file_lines[start:end])
 
 
 def _search_ripgrep(
@@ -29,7 +79,6 @@ def _search_ripgrep(
         f"--max-count={max_results}",
         f"--glob={file_pattern}",
         "-i",
-        f"--context={context_lines}",
     ]
 
     for excluded in config.EXCLUDED_DIRS:
@@ -48,7 +97,10 @@ def _search_ripgrep(
         return []
 
     matches = []
-    current_match = None
+    # Cache each matched file's lines so multiple matches in one file read it
+    # once. None means the file could not be re-read; in that case we degrade to
+    # the matched line that ripgrep already gave us, with no surrounding context.
+    file_lines_cache: dict[str, list[str] | None] = {}
 
     for line in result.stdout.splitlines():
         try:
@@ -65,12 +117,35 @@ def _search_ripgrep(
                 continue
 
             line_number = match_data["line_number"]
-            line_text = match_data["lines"]["text"].rstrip("\n")
+
+            if file_path not in file_lines_cache:
+                try:
+                    # read_bytes, not read_text: text mode translates lone "\r"
+                    # to "\n", which would desync _split_lines from rg's count.
+                    file_lines_cache[file_path] = _split_lines(
+                        Path(file_path).read_bytes().decode("utf-8")
+                    )
+                except (OSError, UnicodeDecodeError) as exc:
+                    logger.warning(
+                        "vault_search: could not re-read %s for context, "
+                        "falling back to matched line only (%s)",
+                        file_path,
+                        exc,
+                    )
+                    file_lines_cache[file_path] = None
+
+            file_lines = file_lines_cache[file_path]
+            if file_lines is not None:
+                match_context = _assemble_context(
+                    file_lines, line_number - 1, context_lines
+                )
+            else:
+                match_context = _rg_match_line(match_data)
 
             matches.append({
                 "path": rel_path,
                 "line_number": line_number,
-                "match_context": line_text,
+                "match_context": match_context,
             })
 
             if len(matches) >= max_results:
@@ -103,17 +178,15 @@ def _search_python(
             continue
 
         try:
-            content = file_path.read_text(encoding="utf-8")
-        except (UnicodeDecodeError, PermissionError):
+            # read_bytes, not read_text: avoid universal-newline translation so
+            # _split_lines counts lines the same way as the ripgrep backend.
+            content = file_path.read_bytes().decode("utf-8")
+        except (OSError, UnicodeDecodeError):
             continue
 
-        lines = content.splitlines()
+        lines = _split_lines(content)
         for i, line in enumerate(lines):
             if query_lower in line.lower():
-                start = max(0, i - context_lines)
-                end = min(len(lines), i + context_lines + 1)
-                context = "\n".join(lines[start:end])
-
                 try:
                     rel_path = str(file_path.relative_to(config.VAULT_PATH))
                 except ValueError:
@@ -122,7 +195,7 @@ def _search_python(
                 matches.append({
                     "path": rel_path,
                     "line_number": i + 1,
-                    "match_context": context,
+                    "match_context": _assemble_context(lines, i, context_lines),
                 })
 
                 if len(matches) >= max_results:
