@@ -67,12 +67,19 @@ mcp = FastMCP(
 # --- Register all tools ---
 
 from .tools.read import vault_read as _vault_read, vault_batch_read as _vault_batch_read
-from .tools.write import vault_write as _vault_write, vault_batch_frontmatter_update as _vault_batch_frontmatter_update
+from .tools.write import (
+    vault_append as _vault_append,
+    vault_batch_frontmatter_update as _vault_batch_frontmatter_update,
+    vault_edit as _vault_edit,
+    vault_write as _vault_write,
+)
 from .tools.search import vault_search as _vault_search, vault_search_frontmatter as _vault_search_frontmatter
 from .tools.manage import vault_list as _vault_list, vault_move as _vault_move, vault_delete as _vault_delete
 from .models import (
     VaultReadInput,
     VaultWriteInput,
+    VaultEditInput,
+    VaultAppendInput,
     VaultBatchReadInput,
     VaultBatchFrontmatterUpdateInput,
     VaultSearchInput,
@@ -114,6 +121,38 @@ def vault_write(path: str, content: str, create_dirs: bool = True, merge_frontma
     """Write a file to the vault."""
     inp = VaultWriteInput(path=path, content=content, create_dirs=create_dirs, merge_frontmatter=merge_frontmatter)
     return _vault_write(inp.path, inp.content, inp.create_dirs, inp.merge_frontmatter)
+
+
+@mcp.tool(
+    name="vault_edit",
+    description=(
+        "Patch an existing vault file with exact text replacements. Use this for token-efficient partial edits "
+        "when only small fragments change; supports dry-run diff previews and avoids resending the full file."
+    ),
+    annotations={"readOnlyHint": False, "destructiveHint": True, "idempotentHint": False, "openWorldHint": False},
+)
+def vault_edit(path: str, edits: list[dict], dry_run: bool = False) -> str:
+    """Patch a file with exact text replacements."""
+    inp = VaultEditInput(path=path, edits=edits, dry_run=dry_run)
+    return _vault_edit(
+        inp.path,
+        [edit.model_dump() for edit in inp.edits],
+        inp.dry_run,
+    )
+
+
+@mcp.tool(
+    name="vault_append",
+    description=(
+        "Append content to a vault file without sending the existing file body. Use this for token-efficient "
+        "additions; creates the file when it does not exist."
+    ),
+    annotations={"readOnlyHint": False, "destructiveHint": True, "idempotentHint": False, "openWorldHint": False},
+)
+def vault_append(path: str, content: str, separator: str = "\n\n", create_dirs: bool = True) -> str:
+    """Append content to a file."""
+    inp = VaultAppendInput(path=path, content=content, separator=separator, create_dirs=create_dirs)
+    return _vault_append(inp.path, inp.content, inp.separator, inp.create_dirs)
 
 
 @mcp.tool(

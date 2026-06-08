@@ -58,6 +58,8 @@ Found a vulnerability? Please report it privately rather than opening a public i
 | `vault_read` | Read a file, returning content, metadata, and parsed YAML frontmatter |
 | `vault_batch_read` | Read multiple files in one call; handles missing files gracefully |
 | `vault_write` | Write a file with optional frontmatter merging; creates parent dirs |
+| `vault_edit` | Patch a file with ordered exact text replacements (token-efficient partial edits); supports dry-run diff previews |
+| `vault_append` | Append content to the end of a file without resending the existing body; creates the file when missing |
 | `vault_batch_frontmatter_update` | Update YAML frontmatter fields on multiple files without touching body content |
 | `vault_search` | Full-text search across vault files (uses ripgrep if available, falls back to Python) |
 | `vault_search_frontmatter` | Query the in-memory frontmatter index by field value, substring, or field existence |

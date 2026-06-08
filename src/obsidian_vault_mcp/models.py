@@ -2,7 +2,7 @@
 
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from .config import (
     CONTEXT_LINES,
@@ -50,6 +50,89 @@ class VaultWriteInput(BaseModel):
     merge_frontmatter: bool = Field(
         default=False,
         description="If true, merge YAML frontmatter with existing file's frontmatter instead of replacing",
+    )
+
+
+class VaultEditOperationInput(BaseModel):
+    """Replace one exact text fragment inside a vault file."""
+
+    model_config = ConfigDict(str_strip_whitespace=False, extra="forbid")
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_str_replace_aliases(cls, data):
+        if not isinstance(data, dict):
+            return data
+
+        normalized = dict(data)
+        for canonical, alias in (("old_text", "old_str"), ("new_text", "new_str")):
+            if canonical in normalized and alias in normalized:
+                raise ValueError(f"Use either '{canonical}' or '{alias}', not both")
+            if alias in normalized:
+                normalized[canonical] = normalized.pop(alias)
+
+        return normalized
+
+    old_text: str = Field(
+        ...,
+        description="Exact existing text fragment to replace; must appear exactly once",
+        min_length=1,
+        max_length=MAX_CONTENT_SIZE,
+    )
+    new_text: str = Field(
+        ...,
+        description="Replacement text for old_text",
+        max_length=MAX_CONTENT_SIZE,
+    )
+
+
+class VaultEditInput(BaseModel):
+    """Patch an existing file with exact text replacements."""
+
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    path: str = Field(
+        ...,
+        description="Relative path from vault root",
+        min_length=1,
+        max_length=500,
+    )
+    edits: list[VaultEditOperationInput] = Field(
+        ...,
+        description="Ordered exact text replacements to apply without resending the full file",
+        min_length=1,
+        max_length=MAX_BATCH_SIZE,
+    )
+    dry_run: bool = Field(
+        default=False,
+        description="Preview the patch and diff without writing the file",
+    )
+
+
+class VaultAppendInput(BaseModel):
+    """Append content to a file without resending the existing body."""
+
+    model_config = ConfigDict(str_strip_whitespace=False, extra="forbid")
+
+    path: str = Field(
+        ...,
+        description="Relative path from vault root",
+        min_length=1,
+        max_length=500,
+    )
+    content: str = Field(
+        ...,
+        description="Content to append or write if the file does not exist",
+        max_length=MAX_CONTENT_SIZE,
+    )
+    separator: str = Field(
+        default="\n\n",
+        description="Text inserted between existing content and appended content",
+        max_length=100,
+    )
+    create_dirs: bool = Field(
+        default=True,
+        description="Create parent directories if they don't exist",
     )
 
 
