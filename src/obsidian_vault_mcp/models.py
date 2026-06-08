@@ -53,6 +53,37 @@ class VaultWriteInput(BaseModel):
     )
 
 
+# Aliases accepted for each canonical edit field. old_str/new_str mirror the
+# str_replace_editor tool; old/new are the shorthands models reach for most.
+_EDIT_FIELD_ALIASES: dict[str, tuple[str, ...]] = {
+    "old_text": ("old_str", "old"),
+    "new_text": ("new_str", "new"),
+}
+
+
+def normalize_edit_aliases(data):
+    """Map edit-field aliases onto their canonical old_text/new_text keys.
+
+    Shared by the pydantic model (the MCP schema path) and the write tool (the
+    direct-call path) so both accept the same alias set. Raises ValueError,
+    naming the offending keys, if a canonical field and one of its aliases (or
+    two aliases) are supplied together.
+    """
+    if not isinstance(data, dict):
+        return data
+
+    normalized = dict(data)
+    for canonical, aliases in _EDIT_FIELD_ALIASES.items():
+        present = [key for key in (canonical, *aliases) if key in normalized]
+        if len(present) > 1:
+            joined = ", ".join(f"'{key}'" for key in present)
+            raise ValueError(f"Use only one of {joined}, not several")
+        if present and present[0] != canonical:
+            normalized[canonical] = normalized.pop(present[0])
+
+    return normalized
+
+
 class VaultEditOperationInput(BaseModel):
     """Replace one exact text fragment inside a vault file."""
 
@@ -61,17 +92,7 @@ class VaultEditOperationInput(BaseModel):
     @model_validator(mode="before")
     @classmethod
     def normalize_str_replace_aliases(cls, data):
-        if not isinstance(data, dict):
-            return data
-
-        normalized = dict(data)
-        for canonical, alias in (("old_text", "old_str"), ("new_text", "new_str")):
-            if canonical in normalized and alias in normalized:
-                raise ValueError(f"Use either '{canonical}' or '{alias}', not both")
-            if alias in normalized:
-                normalized[canonical] = normalized.pop(alias)
-
-        return normalized
+        return normalize_edit_aliases(data)
 
     old_text: str = Field(
         ...,

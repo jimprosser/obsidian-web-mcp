@@ -5,6 +5,7 @@ import logging
 
 import frontmatter
 
+from ..models import normalize_edit_aliases
 from ..serialization import dumps
 from ..vault import resolve_vault_path, read_file, write_file_atomic
 
@@ -54,14 +55,79 @@ def _unified_diff(path: str, before: str, after: str) -> str:
 
 
 def _normalize_edit_aliases(edit: dict) -> tuple[dict | None, str | None]:
-    normalized = dict(edit)
-    for canonical, alias in (("old_text", "old_str"), ("new_text", "new_str")):
-        if canonical in normalized and alias in normalized:
-            return None, f"Use either '{canonical}' or '{alias}', not both"
-        if alias in normalized:
-            normalized[canonical] = normalized.pop(alias)
+    """Apply the shared alias normalization, returning (normalized, error)."""
+    try:
+        return normalize_edit_aliases(edit), None
+    except ValueError as exc:
+        return None, str(exc)
 
-    return normalized, None
+
+def _find_near_miss(content: str, old_text: str) -> dict | None:
+    """Return the document line most similar to old_text for a zero-match edit.
+
+    Line-scoped so the cost stays linear in the file size. The similarity ratio
+    lets a caller distinguish a one-character typo (high) from an old_text that
+    simply is not in the file (low), instead of guessing from a bare count.
+    """
+    lines = content.splitlines()
+    if not lines:
+        return None
+
+    matcher = difflib.SequenceMatcher(a=old_text)
+    best_ratio, best_index = 0.0, 0
+    for index, line in enumerate(lines):
+        matcher.set_seq2(line)
+        ratio = matcher.ratio()
+        if ratio > best_ratio:
+            best_ratio, best_index = ratio, index
+
+    return {
+        "line_number": best_index + 1,
+        "line": lines[best_index],
+        "similarity": round(best_ratio, 2),
+    }
+
+
+def _dry_run_report(path: str, original_content: str, normalized_edits: list[dict]) -> str:
+    """Preview edits without writing, counting each old_text against the original.
+
+    Unlike the apply path this does not fail fast: every edit's match count
+    (0, 1, or many) is reported so one response surfaces all mismatches. When
+    every edit matches exactly once the sequential diff preview is included too.
+    """
+    match_counts = []
+    all_unique = True
+    for index, edit in enumerate(normalized_edits):
+        old_text = edit.get("old_text", "")
+        count = original_content.count(old_text)
+        entry = {"index": index, "count": count}
+        if count == 0:
+            near_miss = _find_near_miss(original_content, old_text)
+            if near_miss:
+                entry["near_miss"] = near_miss
+        if count != 1:
+            all_unique = False
+        match_counts.append(entry)
+
+    if all_unique:
+        preview = original_content
+        for edit in normalized_edits:
+            preview = preview.replace(edit.get("old_text", ""), edit.get("new_text", ""), 1)
+        diff = _unified_diff(path, original_content, preview)
+        size = len(preview.encode("utf-8"))
+    else:
+        diff = ""
+        size = len(original_content.encode("utf-8"))
+
+    return dumps({
+        "path": path,
+        "changed": False,
+        "dry_run": True,
+        "diff": diff,
+        "match_counts": match_counts,
+        "edits_applied": len(normalized_edits) if all_unique else 0,
+        "size": size,
+    })
 
 
 def vault_edit(path: str, edits: list[dict], dry_run: bool = False) -> str:
@@ -70,6 +136,8 @@ def vault_edit(path: str, edits: list[dict], dry_run: bool = False) -> str:
         content, _ = read_file(path)
         original_content = content
 
+        # Normalize aliases up front; an alias conflict fails fast in either mode.
+        normalized_edits = []
         for index, edit in enumerate(edits):
             normalized_edit, alias_error = _normalize_edit_aliases(edit)
             if alias_error:
@@ -82,13 +150,18 @@ def vault_edit(path: str, edits: list[dict], dry_run: bool = False) -> str:
                     "edits_applied": 0,
                     "size": len(original_content.encode("utf-8")),
                 })
+            normalized_edits.append(normalized_edit)
 
+        if dry_run:
+            return _dry_run_report(path, original_content, normalized_edits)
+
+        for index, normalized_edit in enumerate(normalized_edits):
             old_text = normalized_edit.get("old_text", "")
             new_text = normalized_edit.get("new_text", "")
             count = content.count(old_text)
 
             if count != 1:
-                return dumps({
+                payload = {
                     "error": (
                         f"Edit {index} old_text must match exactly once; "
                         f"found {count} matches"
@@ -99,22 +172,17 @@ def vault_edit(path: str, edits: list[dict], dry_run: bool = False) -> str:
                     "diff": "",
                     "edits_applied": 0,
                     "size": len(original_content.encode("utf-8")),
-                })
+                }
+                if count == 0:
+                    near_miss = _find_near_miss(content, old_text)
+                    if near_miss:
+                        payload["near_miss"] = near_miss
+                return dumps(payload)
 
             content = content.replace(old_text, new_text, 1)
 
         diff = _unified_diff(path, original_content, content)
         size = len(content.encode("utf-8"))
-
-        if dry_run:
-            return dumps({
-                "path": path,
-                "changed": False,
-                "dry_run": True,
-                "diff": diff,
-                "edits_applied": len(edits),
-                "size": size,
-            })
 
         changed = content != original_content
         if changed:
