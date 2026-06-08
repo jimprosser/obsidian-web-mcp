@@ -166,6 +166,7 @@ from .models import (
     VaultWriteInput,
     VaultWriteBinaryInput,
     VaultEditInput,
+    VaultEditOperationInput,
     VaultAppendInput,
     VaultBatchReadInput,
     VaultBatchFrontmatterUpdateInput,
@@ -340,11 +341,12 @@ def vault_write_binary(path: str, data: str, media_type: str, overwrite: bool = 
     name="vault_edit",
     description=(
         "Patch an existing vault file with exact text replacements. Use this for token-efficient partial edits "
-        "when only small fragments change; supports dry-run diff previews and avoids resending the full file."
+        "when only small fragments change; supports dry-run diff previews and avoids resending the full file. "
+        "Each edit is an object {old_text, new_text}; old_text must match exactly once."
     ),
     annotations={"readOnlyHint": False, "destructiveHint": True, "idempotentHint": False, "openWorldHint": False},
 )
-def vault_edit(path: str, edits: list[dict], dry_run: bool = False) -> str:
+def vault_edit(path: str, edits: list[VaultEditOperationInput], dry_run: bool = False) -> str:
     """Patch a file with exact text replacements."""
     inp = VaultEditInput(path=path, edits=edits, dry_run=dry_run)
     if inp.dry_run:
