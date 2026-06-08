@@ -28,7 +28,7 @@ from obsidian_vault_mcp.serialization import dumps
 from obsidian_vault_mcp.tools.manage import vault_delete, vault_list, vault_move
 from obsidian_vault_mcp.tools.read import vault_read
 from obsidian_vault_mcp.tools.search import vault_search, vault_search_frontmatter
-from obsidian_vault_mcp.tools.write import vault_edit, vault_write
+from obsidian_vault_mcp.tools.write import vault_append, vault_edit, vault_write
 
 # (id, sample text, a substring to search for, a filename stem) per script.
 LANGUAGES = [
@@ -162,8 +162,11 @@ def test_dumps_output_is_always_utf8_encodable():
     # Files whose names are not valid UTF-8 reach us as lone surrogates via
     # os.fsdecode(surrogateescape). The response string must still encode for the
     # wire; otherwise a single odd filename crashes the response at transport.
-    raw = dumps({"path": "bad\udce9name.md", "items": []})
+    obj = {"path": "bad\udce9name.md", "items": []}
+    raw = dumps(obj)
     raw.encode("utf-8")  # must not raise
+    # and the escaped fallback must still round-trip (not drop/replace the surrogate)
+    assert json.loads(raw) == obj
 
 
 # --- non-ASCII error-path responses (except branches route through dumps too) --
@@ -202,6 +205,14 @@ def test_vault_delete_response_unescaped(vault_dir):
     assert "\\u" not in raw
     parsed = json.loads(raw)
     assert parsed["path"] == "삭제대상.md"
+
+
+def test_vault_append_response_unescaped(vault_dir):
+    raw = vault_append("추가/노트.md", "추가된 내용\n")
+    assert "\\u" not in raw
+    parsed = json.loads(raw)
+    assert parsed["path"] == "추가/노트.md"
+    assert parsed["created"] is True
 
 
 # --- vault_search_frontmatter returns non-ASCII frontmatter verbatim -----------

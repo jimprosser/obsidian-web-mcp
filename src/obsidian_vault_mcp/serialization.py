@@ -22,7 +22,10 @@ Callers may override either default by passing the keyword explicitly.
 """
 
 import json
+import logging
 from datetime import date, datetime
+
+logger = logging.getLogger(__name__)
 
 
 class _VaultEncoder(json.JSONEncoder):
@@ -47,5 +50,9 @@ def dumps(obj, **kwargs) -> str:
         try:
             result.encode("utf-8")
         except UnicodeEncodeError:
+            logger.warning(
+                "Response contains a non-UTF-8 (surrogate) string, likely from a "
+                "filename that is not valid UTF-8; falling back to escaped output"
+            )
             result = json.dumps(obj, cls=_VaultEncoder, **{**kwargs, "ensure_ascii": True})
     return result

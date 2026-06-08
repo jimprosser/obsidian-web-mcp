@@ -6,7 +6,7 @@ rigorous as a long one). These tests instead represent the actual workload: a
 web client writing, reading, bulk-editing, and batch-processing multilingual
 documents that are hundreds of lines long.
 
-The text is authentic public-domain content (Universal Declaration of Human
+The text is authentic, freely reproducible content (Universal Declaration of Human
 Rights excerpts, see tests/fixtures/udhr/README.md). Each test asserts, on the
 real tool responses, that the output is emitted verbatim (no \\uXXXX escapes),
 that the decoded payload round-trips exactly (integrity), and that the response
