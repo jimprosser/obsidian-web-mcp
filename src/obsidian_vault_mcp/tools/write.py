@@ -1,11 +1,11 @@
 """Write tools for the Obsidian vault MCP server."""
 
 import difflib
-import json
 import logging
 
 import frontmatter
 
+from ..serialization import dumps
 from ..vault import resolve_vault_path, read_file, write_file_atomic
 
 logger = logging.getLogger(__name__)
@@ -34,12 +34,12 @@ def vault_write(path: str, content: str, create_dirs: bool = True, merge_frontma
 
         is_new, size = write_file_atomic(path, content, create_dirs=create_dirs)
 
-        return json.dumps({"path": path, "created": is_new, "size": size})
+        return dumps({"path": path, "created": is_new, "size": size})
     except ValueError as e:
-        return json.dumps({"error": str(e), "path": path})
+        return dumps({"error": str(e), "path": path})
     except Exception as e:
         logger.error(f"vault_write error for {path}: {e}")
-        return json.dumps({"error": str(e), "path": path})
+        return dumps({"error": str(e), "path": path})
 
 
 def _unified_diff(path: str, before: str, after: str) -> str:
@@ -73,7 +73,7 @@ def vault_edit(path: str, edits: list[dict], dry_run: bool = False) -> str:
         for index, edit in enumerate(edits):
             normalized_edit, alias_error = _normalize_edit_aliases(edit)
             if alias_error:
-                return json.dumps({
+                return dumps({
                     "error": f"Edit {index}: {alias_error}",
                     "path": path,
                     "changed": False,
@@ -88,7 +88,7 @@ def vault_edit(path: str, edits: list[dict], dry_run: bool = False) -> str:
             count = content.count(old_text)
 
             if count != 1:
-                return json.dumps({
+                return dumps({
                     "error": (
                         f"Edit {index} old_text must match exactly once; "
                         f"found {count} matches"
@@ -107,7 +107,7 @@ def vault_edit(path: str, edits: list[dict], dry_run: bool = False) -> str:
         size = len(content.encode("utf-8"))
 
         if dry_run:
-            return json.dumps({
+            return dumps({
                 "path": path,
                 "changed": False,
                 "dry_run": True,
@@ -120,7 +120,7 @@ def vault_edit(path: str, edits: list[dict], dry_run: bool = False) -> str:
         if changed:
             write_file_atomic(path, content, create_dirs=False)
 
-        return json.dumps({
+        return dumps({
             "path": path,
             "changed": changed,
             "dry_run": False,
@@ -129,7 +129,7 @@ def vault_edit(path: str, edits: list[dict], dry_run: bool = False) -> str:
             "size": size,
         })
     except ValueError as e:
-        return json.dumps({
+        return dumps({
             "error": str(e),
             "path": path,
             "changed": False,
@@ -139,7 +139,7 @@ def vault_edit(path: str, edits: list[dict], dry_run: bool = False) -> str:
             "size": 0,
         })
     except FileNotFoundError:
-        return json.dumps({
+        return dumps({
             "error": f"File not found: {path}",
             "path": path,
             "changed": False,
@@ -150,7 +150,7 @@ def vault_edit(path: str, edits: list[dict], dry_run: bool = False) -> str:
         })
     except Exception as e:
         logger.error(f"vault_edit error for {path}: {e}")
-        return json.dumps({
+        return dumps({
             "error": str(e),
             "path": path,
             "changed": False,
@@ -191,7 +191,7 @@ def vault_append(
         else:
             size = len(existing_content.encode("utf-8"))
 
-        return json.dumps({
+        return dumps({
             "path": path,
             "changed": changed,
             "created": created,
@@ -199,7 +199,7 @@ def vault_append(
             "size": size,
         })
     except ValueError as e:
-        return json.dumps({
+        return dumps({
             "error": str(e),
             "path": path,
             "changed": False,
@@ -209,7 +209,7 @@ def vault_append(
         })
     except Exception as e:
         logger.error(f"vault_append error for {path}: {e}")
-        return json.dumps({
+        return dumps({
             "error": str(e),
             "path": path,
             "changed": False,
@@ -245,4 +245,4 @@ def vault_batch_frontmatter_update(updates: list[dict]) -> str:
         except Exception as e:
             results.append({"path": file_path, "updated": False, "error": str(e)})
 
-    return json.dumps({"results": results})
+    return dumps({"results": results})
