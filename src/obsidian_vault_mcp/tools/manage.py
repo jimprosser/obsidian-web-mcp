@@ -3,6 +3,7 @@
 import json
 import logging
 
+from ..hooks import fire_post_write
 from ..vault import list_directory, move_path, delete_path, resolve_vault_path
 
 logger = logging.getLogger(__name__)
@@ -38,6 +39,7 @@ def vault_move(source: str, destination: str, create_dirs: bool = True) -> str:
     """Move a file or directory within the vault."""
     try:
         moved = move_path(source, destination, create_dirs=create_dirs)
+        fire_post_write("moved", [source, destination])
         return json.dumps({"source": source, "destination": destination, "moved": moved})
     except ValueError as e:
         return json.dumps({"error": str(e), "source": source, "destination": destination})
@@ -56,6 +58,7 @@ def vault_delete(path: str, confirm: bool = False) -> str:
 
     try:
         deleted = delete_path(path)
+        fire_post_write("deleted", [path])
         return json.dumps({"path": path, "deleted": deleted})
     except ValueError as e:
         return json.dumps({"error": str(e), "path": path})

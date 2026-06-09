@@ -6,6 +6,7 @@ import logging
 
 import frontmatter
 
+from ..hooks import fire_post_write
 from ..vault import resolve_vault_path, read_file, write_file_atomic
 
 logger = logging.getLogger(__name__)
@@ -33,6 +34,8 @@ def vault_write(path: str, content: str, create_dirs: bool = True, merge_frontma
                 logger.warning(f"Frontmatter merge failed for {path}, writing as-is: {e}")
 
         is_new, size = write_file_atomic(path, content, create_dirs=create_dirs)
+
+        fire_post_write("created" if is_new else "updated", [path])
 
         return json.dumps({"path": path, "created": is_new, "size": size})
     except ValueError as e:
@@ -119,6 +122,7 @@ def vault_edit(path: str, edits: list[dict], dry_run: bool = False) -> str:
         changed = content != original_content
         if changed:
             write_file_atomic(path, content, create_dirs=False)
+            fire_post_write("updated", [path])
 
         return json.dumps({
             "path": path,
@@ -188,6 +192,7 @@ def vault_append(
         changed = new_content != existing_content
         if changed:
             _, size = write_file_atomic(path, new_content, create_dirs=create_dirs)
+            fire_post_write("created" if created else "updated", [path])
         else:
             size = len(existing_content.encode("utf-8"))
 
@@ -222,6 +227,7 @@ def vault_append(
 def vault_batch_frontmatter_update(updates: list[dict]) -> str:
     """Update frontmatter fields on multiple files without changing body content."""
     results = []
+    updated_paths: list[str] = []
 
     for update in updates:
         file_path = update.get("path", "")
@@ -238,11 +244,14 @@ def vault_batch_frontmatter_update(updates: list[dict]) -> str:
             write_file_atomic(file_path, new_content, create_dirs=False)
 
             results.append({"path": file_path, "updated": True})
+            updated_paths.append(file_path)
         except FileNotFoundError:
             results.append({"path": file_path, "updated": False, "error": "File not found"})
         except ValueError as e:
             results.append({"path": file_path, "updated": False, "error": str(e)})
         except Exception as e:
             results.append({"path": file_path, "updated": False, "error": str(e)})
+
+    fire_post_write("updated", updated_paths)
 
     return json.dumps({"results": results})

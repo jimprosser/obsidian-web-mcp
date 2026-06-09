@@ -74,6 +74,13 @@ def advertised_base_url(request_base_url: str) -> str:
     """
     return (VAULT_MCP_PUBLIC_URL or request_base_url).rstrip("/")
 
+# Optional post-write hook. When set, this shell command runs fire-and-forget in
+# a daemon thread after each successful vault mutation, with MCP_OPERATION (e.g.
+# "created"/"updated"/"moved"/"deleted") and MCP_PATHS (colon-separated, vault-
+# relative) injected into its environment. Empty = disabled (no-op, the default).
+# It executes an operator-configured command, so only set it to something you trust.
+VAULT_MCP_POST_WRITE_CMD = os.environ.get("VAULT_MCP_POST_WRITE_CMD", "")
+
 # Safety limits
 MAX_CONTENT_SIZE = 1_000_000  # 1MB max write size
 MAX_BATCH_SIZE = 20           # Max files per batch operation
