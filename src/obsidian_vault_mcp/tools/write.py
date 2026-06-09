@@ -6,6 +6,7 @@ import logging
 import frontmatter
 
 from .. import frontmatter_io
+from ..frontmatter_io import YAMLError
 from ..serialization import dumps
 from ..vault import resolve_vault_path, read_file, write_file_atomic
 
@@ -32,8 +33,15 @@ def vault_write(path: str, content: str, create_dirs: bool = True, merge_frontma
                 content = frontmatter_io.dumps(existing_meta, new_body)
             except FileNotFoundError:
                 pass
-            except Exception as e:
-                logger.warning(f"Frontmatter merge failed for {path}, writing as-is: {e}")
+            except YAMLError as e:
+                # Malformed YAML in either side: abort rather than silently
+                # dropping the existing frontmatter or nesting a stray --- block.
+                # A correctable error beats a lossy write for an agent caller.
+                return dumps({
+                    "error": f"Frontmatter merge aborted: malformed YAML frontmatter ({e})",
+                    "path": path,
+                    "written": False,
+                })
 
         is_new, size = write_file_atomic(path, content, create_dirs=create_dirs)
 
