@@ -8,6 +8,9 @@ import atexit
 import json
 import logging
 import sys
+import threading
+import time
+import urllib.request
 from contextlib import asynccontextmanager
 
 from mcp.server.fastmcp import FastMCP
@@ -16,6 +19,8 @@ from mcp.server.transport_security import TransportSecuritySettings
 from .config import (
     VAULT_MCP_ALLOWED_HOSTS,
     VAULT_MCP_FORWARDED_ALLOW_IPS,
+    VAULT_MCP_HEARTBEAT_INTERVAL,
+    VAULT_MCP_HEARTBEAT_URL,
     VAULT_MCP_HOST,
     VAULT_MCP_PORT,
     VAULT_MCP_TOKEN,
@@ -27,6 +32,27 @@ logger = logging.getLogger(__name__)
 
 # Global frontmatter index instance
 frontmatter_index = FrontmatterIndex()
+
+
+def _heartbeat_ping(url: str) -> None:
+    """Send a single liveness GET. Split out from the loop so it is unit-testable."""
+    with urllib.request.urlopen(url, timeout=10) as resp:
+        resp.read()
+
+
+def _heartbeat_forever(url: str, interval: int) -> None:
+    """Ping ``url`` every ``interval`` seconds for the process lifetime.
+
+    Runs in a daemon thread started from main() -- NOT the per-request MCP lifespan,
+    which fires on every request and would spawn a heartbeat per session. Failures
+    are logged and swallowed so a flaky monitor can never take the server down.
+    """
+    while True:
+        try:
+            _heartbeat_ping(url)
+        except Exception as e:
+            logger.warning("Heartbeat failed: %s", e)
+        time.sleep(interval)
 
 
 @asynccontextmanager
@@ -259,6 +285,17 @@ def main():
     logger.info(f"Starting vault MCP server. Vault: {VAULT_PATH}")
     frontmatter_index.start()
     atexit.register(frontmatter_index.stop)
+
+    # Optional liveness heartbeat. Daemon thread tied to the process (not the
+    # per-request lifespan), started only when configured. No-op when unset.
+    if VAULT_MCP_HEARTBEAT_URL:
+        threading.Thread(
+            target=_heartbeat_forever,
+            args=(VAULT_MCP_HEARTBEAT_URL, VAULT_MCP_HEARTBEAT_INTERVAL),
+            daemon=True,
+            name="heartbeat",
+        ).start()
+        logger.info("Heartbeat enabled (interval: %ds)", VAULT_MCP_HEARTBEAT_INTERVAL)
 
     # Build the Starlette app with auth middleware and OAuth endpoints
     try:

@@ -74,6 +74,13 @@ def advertised_base_url(request_base_url: str) -> str:
     """
     return (VAULT_MCP_PUBLIC_URL or request_base_url).rstrip("/")
 
+# Optional liveness heartbeat. When VAULT_MCP_HEARTBEAT_URL is set, the server GETs
+# it every VAULT_MCP_HEARTBEAT_INTERVAL seconds from a daemon thread, for push-style
+# uptime monitors (Uptime Kuma, Healthchecks.io, Cronitor, ...). Empty = disabled
+# (the default); failures are logged, never fatal.
+VAULT_MCP_HEARTBEAT_URL = os.environ.get("VAULT_MCP_HEARTBEAT_URL", "")
+VAULT_MCP_HEARTBEAT_INTERVAL = int(os.environ.get("VAULT_MCP_HEARTBEAT_INTERVAL", "60"))
+
 # Safety limits
 MAX_CONTENT_SIZE = 1_000_000  # 1MB max write size
 MAX_BATCH_SIZE = 20           # Max files per batch operation
