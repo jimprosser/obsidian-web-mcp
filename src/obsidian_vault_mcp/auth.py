@@ -19,6 +19,14 @@ _AUTH_EXEMPT_PATHS = {
     "/oauth/register",
 }
 
+# (method, path) pairs exempt from auth. The MCP spec 2025-06-18 probe on / must
+# answer GET/HEAD without credentials. This is ONLY active when MCP is mounted off
+# root (VAULT_MCP_PATH != "/"); when MCP is at root the transport owns GET/HEAD /
+# and must stay fully authenticated, so the set is empty and behaviour is unchanged.
+_AUTH_EXEMPT_METHOD_PATHS = (
+    {("GET", "/"), ("HEAD", "/")} if config.VAULT_MCP_PATH != "/" else set()
+)
+
 
 def _www_authenticate(request: Request, error: str) -> str:
     """RFC 9728 challenge header pointing clients at the protected-resource metadata.
@@ -40,6 +48,9 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
 
     async def dispatch(self, request: Request, call_next):
         if request.url.path in _AUTH_EXEMPT_PATHS:
+            return await call_next(request)
+
+        if (request.method, request.url.path) in _AUTH_EXEMPT_METHOD_PATHS:
             return await call_next(request)
 
         if not VAULT_MCP_TOKEN:

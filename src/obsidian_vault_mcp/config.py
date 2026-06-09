@@ -6,6 +6,13 @@ VAULT_PATH = Path(os.environ.get("VAULT_PATH", os.path.expanduser("~/Obsidian/My
 VAULT_MCP_TOKEN = os.environ.get("VAULT_MCP_TOKEN", "")
 VAULT_MCP_PORT = int(os.environ.get("VAULT_MCP_PORT", "8420"))
 
+# HTTP path the MCP transport is mounted at. Defaults to "/" so connectors that
+# POST to the root complete the handshake (#19) -- changing this default would
+# break that, so leave it unless you deliberately host under a path prefix.
+# Setting it (e.g. "/mcp") lets the server live alongside other services on one
+# hostname behind a reverse proxy that cannot rewrite paths (Cloudflare Tunnel).
+VAULT_MCP_PATH = os.environ.get("VAULT_MCP_PATH", "/")
+
 # OAuth 2.0 client credentials (for Claude app integration)
 VAULT_OAUTH_CLIENT_ID = os.environ.get("VAULT_OAUTH_CLIENT_ID", "vault-mcp-client")
 VAULT_OAUTH_CLIENT_SECRET = os.environ.get("VAULT_OAUTH_CLIENT_SECRET", "")
