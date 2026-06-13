@@ -9,10 +9,15 @@ P2: dry_run reports each edit's match count against the original document
 """
 
 import asyncio
+import base64
 import json
+import os
+import random
+import time
 
 import pytest
 
+import obsidian_vault_mcp.tools.write as write_mod
 from obsidian_vault_mcp.models import VaultEditOperationInput
 from obsidian_vault_mcp.server import mcp
 from obsidian_vault_mcp.tools.write import vault_edit
@@ -241,3 +246,56 @@ def test_vault_edit_apply_still_fails_fast_on_non_unique(vault_dir):
     assert "error" in result
     assert result["changed"] is False
     assert (vault_dir / "test-note.md").read_text() == before
+
+
+# --- near-miss DoS guard -----------------------------------------------------
+
+
+def test_near_miss_skipped_for_oversized_old_text():
+    """An old_text past the cap is skipped outright: not a plausible single-line
+    near-miss, even when a line would otherwise match it perfectly."""
+    big = "x" * (write_mod._NEAR_MISS_MAX_OLD_TEXT + 1)
+    content = big + "\nanother line\n"
+    assert write_mod._find_near_miss(content, big) is None
+
+
+def test_near_miss_large_old_text_does_not_pin_cpu():
+    """Regression: a large, high-entropy, zero-match old_text must not run the
+    per-line SequenceMatcher. Before the size cap this pinned the CPU for minutes
+    (an authenticated DoS, since old_text is bounded only by the per-edit limit);
+    the cap short-circuits it, so this returns None effectively instantly."""
+    content = "\n".join("line %d has some ordinary content" % i for i in range(1000))
+    huge = base64.b64encode(os.urandom(800_000)).decode()  # ~1.06 MB, high entropy
+    start = time.monotonic()
+    result = write_mod._find_near_miss(content, huge)
+    elapsed = time.monotonic() - start
+    assert result is None
+    assert elapsed < 5.0, f"near-miss took {elapsed:.1f}s; size cap not applied"
+
+
+def test_near_miss_capped_old_text_over_huge_file_is_bounded():
+    """Even an old_text at the size cap must not pin the CPU against a large
+    many-line file: per-line SequenceMatcher cost grows with old_text * lines, so
+    the cumulative work budget stops the scan. (~15 s unbounded for this input.)"""
+    old = "x" * write_mod._NEAR_MISS_MAX_OLD_TEXT  # at the cap, so not skipped
+    content = "\n".join("line %d ordinary content here" % i for i in range(25000))
+    start = time.monotonic()
+    write_mod._find_near_miss(content, old)
+    elapsed = time.monotonic() - start
+    assert elapsed < 5.0, f"near-miss took {elapsed:.1f}s; work budget not applied"
+
+
+def test_near_miss_low_alphabet_lines_stay_bounded():
+    """difflib's worst case is a low-alphabet, autojunk-disabled (sub-200-char)
+    line: maximum matching blocks per line, where len(old_text)*len(line) most
+    underestimates the real cost. The cumulative work budget must bound this too,
+    not just benign high-entropy content."""
+    rng = random.Random(99)
+    old = "".join(rng.choice("ab") for _ in range(write_mod._NEAR_MISS_MAX_OLD_TEXT))
+    content = "\n".join(
+        "".join(rng.choice("ab") for _ in range(199)) for _ in range(3000)
+    )
+    start = time.monotonic()
+    write_mod._find_near_miss(content, old)
+    elapsed = time.monotonic() - start
+    assert elapsed < 5.0, f"low-alphabet near-miss took {elapsed:.1f}s; budget too loose"

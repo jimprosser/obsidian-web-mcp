@@ -59,6 +59,25 @@ def _unified_diff(path: str, before: str, after: str) -> str:
 # lines) and would mislead more than help.
 _NEAR_MISS_MIN_SIMILARITY = 0.5
 
+# A near-miss is a typo-scale hint, so an old_text larger than this is never a
+# plausible single-line match. It is also the input that pinned the CPU: the
+# per-line SequenceMatcher over a ~1 MB high-entropy old_text on a zero-match
+# edit did not return in minutes (an authenticated DoS, since old_text is bounded
+# only by the per-edit size limit). Skip the scan above this size.
+_NEAR_MISS_MAX_OLD_TEXT = 1024
+
+# The per-line SequenceMatcher cost grows with len(old_text) * len(line), so even
+# a capped old_text (e.g. 1 KB) against a large many-line file still pins the CPU
+# (~15 s for a 1 MB / 25k-line file, and the edited file's size is not otherwise
+# bounded). Stop scanning once the cumulative work crosses this budget; the
+# near-miss is a best-effort hint, so a partial scan is an acceptable trade for
+# the safety. len(old_text)*len(line) is an order-of-magnitude proxy, not exact
+# (difflib's constant factor is worse for low-alphabet, autojunk-disabled lines),
+# so the budget is sized to keep even an adversarial file under ~1 s, well below
+# the per-edit timeout. Typo-scale old_text (small) still scans thousands of
+# lines, so normal notes are covered in full.
+_NEAR_MISS_WORK_BUDGET = 10_000_000
+
 
 def _normalize_edit_aliases(edit: dict) -> tuple[dict | None, str | None]:
     """Apply the shared alias normalization, returning (normalized, error).
@@ -82,15 +101,28 @@ def _find_near_miss(content: str, old_text: str) -> dict | None:
     similarity is the fraction of old_text matched on the closest line, which
     separates a one-character typo (high) from text that is simply absent
     (low). Returns None when the best line is below the similarity floor, so
-    unrelated input produces no misleading hint.
+    unrelated input produces no misleading hint, and skips the scan entirely
+    for an old_text larger than _NEAR_MISS_MAX_OLD_TEXT (not a plausible
+    single-line near-miss, and the input that made the scan a CPU DoS). A
+    cumulative work budget (_NEAR_MISS_WORK_BUDGET) bounds the scan on very
+    large files, so the hint is best-effort there rather than unbounded.
     """
+    if not old_text or len(old_text) > _NEAR_MISS_MAX_OLD_TEXT:
+        return None
+
     lines = content.splitlines()
-    if not lines or not old_text:
+    if not lines:
         return None
 
     matcher = difflib.SequenceMatcher(a=old_text)
     best_similarity, best_index = 0.0, 0
+    budget = _NEAR_MISS_WORK_BUDGET
     for index, line in enumerate(lines):
+        budget -= len(old_text) * (len(line) + 1)
+        if budget < 0:
+            # Cumulative work budget spent (huge file / very many lines): stop
+            # scanning and report the best line found so far rather than pin CPU.
+            break
         matcher.set_seq2(line)
         matched = sum(block.size for block in matcher.get_matching_blocks())
         similarity = matched / len(old_text)
