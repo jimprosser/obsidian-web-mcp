@@ -66,6 +66,9 @@ Found a vulnerability? Please report it privately rather than opening a public i
 | `vault_list` | List directory contents with recursion depth, glob filtering, and file/dir toggles |
 | `vault_move` | Move or rename a file or directory within the vault |
 | `vault_delete` | Soft-delete a file by moving it to `.trash/` (requires explicit confirmation) |
+| `vault_daily_note_path` | Resolve today's daily-note path from the configured folder/format |
+| `vault_daily_note_read` | Read today's daily note; returns an error (does not create it) when missing |
+| `vault_daily_note_append` | Append to today's daily note, creating it from the template when missing |
 
 ## Prerequisites
 
@@ -119,6 +122,9 @@ All configuration is via environment variables:
 | `VAULT_OAUTH_CLIENT_ID` | No | `vault-mcp-client` | Client ID for the headless `client_credentials` grant |
 | `VAULT_OAUTH_CLIENT_SECRET` | No | (none) | Only required for the headless `client_credentials` grant. The Claude/ChatGPT browser flow uses dynamic client registration and does **not** need this. |
 | `VAULT_OAUTH_REDIRECT_URIS` | No | (none) | Comma-separated allowlist of redirect URIs for the static `VAULT_OAUTH_CLIENT_ID` when using the browser flow. Dynamically-registered clients (Claude/ChatGPT) carry their own; leave unset unless you connect a static client through `/oauth/authorize`. |
+| `VAULT_DAILY_NOTES_FOLDER` | No | (none) | Folder for the daily-note tools; empty means the vault root |
+| `VAULT_DAILY_NOTES_FORMAT` | No | `%Y-%m-%d` | `strftime` pattern for the daily-note filename |
+| `VAULT_DAILY_NOTES_TEMPLATE` | No | (none) | `strftime` template prepended when a daily note is first created |
 
 Generate secrets with: `python -c "import secrets; print(secrets.token_hex(32))"`
 

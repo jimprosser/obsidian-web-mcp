@@ -313,3 +313,15 @@ class VaultBatchFrontmatterUpdateInput(BaseModel):
             if "fields" not in item or not isinstance(item["fields"], dict):
                 raise ValueError(f"updates[{i}] must contain a 'fields' key with a dict value")
         return v
+
+
+class VaultDailyNoteAppendInput(BaseModel):
+    """Append content to today's daily note."""
+
+    model_config = ConfigDict(str_strip_whitespace=False, extra="forbid")
+
+    content: str = Field(
+        ...,
+        description="Content to append to today's daily note (the note is created from the template if missing)",
+        max_length=MAX_CONTENT_SIZE,
+    )
