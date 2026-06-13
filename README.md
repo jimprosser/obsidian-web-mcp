@@ -66,6 +66,9 @@ Found a vulnerability? Please report it privately rather than opening a public i
 | `vault_list` | List directory contents with recursion depth, glob filtering, and file/dir toggles |
 | `vault_move` | Move or rename a file or directory within the vault |
 | `vault_delete` | Soft-delete a file by moving it to `.trash/` (requires explicit confirmation) |
+| `vault_canvas_read` | Read an Obsidian `.canvas` file and return its parsed nodes and edges |
+| `vault_canvas_add_node` | Append a node to a `.canvas` file (created if missing); generates an id when omitted and preserves unknown node fields |
+| `vault_canvas_add_edge` | Append an edge to an existing `.canvas` file; both endpoints must reference existing node ids |
 
 ## Prerequisites
 

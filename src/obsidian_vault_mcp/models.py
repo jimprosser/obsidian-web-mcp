@@ -313,3 +313,89 @@ class VaultBatchFrontmatterUpdateInput(BaseModel):
             if "fields" not in item or not isinstance(item["fields"], dict):
                 raise ValueError(f"updates[{i}] must contain a 'fields' key with a dict value")
         return v
+
+
+def _validate_alnum_id(value: str | None) -> str | None:
+    if value is not None and not value.isalnum():
+        raise ValueError("id must be alphanumeric when provided")
+    return value
+
+
+class CanvasNodeInput(BaseModel):
+    """A single Obsidian Canvas node.
+
+    extra='allow' preserves Obsidian-specific fields (text, file, color, label,
+    subpath, ...) so appending a node never strips data on the round-trip.
+    """
+
+    model_config = ConfigDict(extra="allow")
+
+    id: str | None = Field(default=None, description="Optional alphanumeric node id; generated when omitted")
+    type: str = Field(..., min_length=1, description="Canvas node type, e.g. text, file, link, or group")
+    x: int | float = Field(..., description="Canvas x coordinate")
+    y: int | float = Field(..., description="Canvas y coordinate")
+    width: int | float = Field(..., gt=0, description="Node width")
+    height: int | float = Field(..., gt=0, description="Node height")
+
+    @field_validator("id")
+    @classmethod
+    def _node_id_alnum(cls, v: str | None) -> str | None:
+        return _validate_alnum_id(v)
+
+
+class CanvasEdgeInput(BaseModel):
+    """A single Obsidian Canvas edge. extra='allow' preserves color/label/etc."""
+
+    model_config = ConfigDict(extra="allow")
+
+    id: str | None = Field(default=None, description="Optional alphanumeric edge id; generated when omitted")
+    fromNode: str = Field(..., min_length=1, description="Existing source node id")
+    fromSide: Literal["top", "right", "bottom", "left"] = Field(..., description="One of: top, right, bottom, left")
+    toNode: str = Field(..., min_length=1, description="Existing target node id")
+    toSide: Literal["top", "right", "bottom", "left"] = Field(..., description="One of: top, right, bottom, left")
+
+    @field_validator("id")
+    @classmethod
+    def _edge_id_alnum(cls, v: str | None) -> str | None:
+        return _validate_alnum_id(v)
+
+
+class VaultCanvasReadInput(BaseModel):
+    """Read and parse an Obsidian .canvas file."""
+
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    path: str = Field(
+        ...,
+        description="Relative path to a .canvas file from the vault root",
+        min_length=1,
+        max_length=500,
+    )
+
+
+class VaultCanvasAddNodeInput(BaseModel):
+    """Append a node to a .canvas file."""
+
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    path: str = Field(
+        ...,
+        description="Relative path to a .canvas file (created if missing)",
+        min_length=1,
+        max_length=500,
+    )
+    node: CanvasNodeInput = Field(..., description="Node to append")
+
+
+class VaultCanvasAddEdgeInput(BaseModel):
+    """Append an edge to an existing .canvas file."""
+
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    path: str = Field(
+        ...,
+        description="Relative path to an existing .canvas file",
+        min_length=1,
+        max_length=500,
+    )
+    edge: CanvasEdgeInput = Field(..., description="Edge to append; fromNode/toNode must already exist")

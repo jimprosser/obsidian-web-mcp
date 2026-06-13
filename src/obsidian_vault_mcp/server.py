@@ -75,6 +75,11 @@ from .tools.write import (
 )
 from .tools.search import vault_search as _vault_search, vault_search_frontmatter as _vault_search_frontmatter
 from .tools.manage import vault_list as _vault_list, vault_move as _vault_move, vault_delete as _vault_delete
+from .tools.canvas import (
+    vault_canvas_read as _vault_canvas_read,
+    vault_canvas_add_node as _vault_canvas_add_node,
+    vault_canvas_add_edge as _vault_canvas_add_edge,
+)
 from .models import (
     VaultReadInput,
     VaultWriteInput,
@@ -87,6 +92,9 @@ from .models import (
     VaultListInput,
     VaultMoveInput,
     VaultDeleteInput,
+    VaultCanvasReadInput,
+    VaultCanvasAddNodeInput,
+    VaultCanvasAddEdgeInput,
 )
 
 
@@ -237,6 +245,46 @@ def vault_delete(path: str, confirm: bool = False) -> str:
     """Delete a file (move to .trash/)."""
     inp = VaultDeleteInput(path=path, confirm=confirm)
     return _vault_delete(inp.path, inp.confirm)
+
+
+@mcp.tool(
+    name="vault_canvas_read",
+    description="Read an Obsidian .canvas file and return its parsed nodes and edges.",
+    annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False},
+)
+def vault_canvas_read(path: str) -> str:
+    """Read an Obsidian Canvas file."""
+    inp = VaultCanvasReadInput(path=path)
+    return _vault_canvas_read(inp.path)
+
+
+@mcp.tool(
+    name="vault_canvas_add_node",
+    description=(
+        "Append a node to an Obsidian .canvas file, creating the file if it does not exist. Requires type, x, y, "
+        "width, height; an alphanumeric id is generated when omitted. Unknown node fields are preserved."
+    ),
+    annotations={"readOnlyHint": False, "destructiveHint": True, "idempotentHint": False, "openWorldHint": False},
+)
+def vault_canvas_add_node(path: str, node: dict) -> str:
+    """Append a node to a Canvas file."""
+    inp = VaultCanvasAddNodeInput(path=path, node=node)
+    return _vault_canvas_add_node(inp.path, inp.node.model_dump(exclude_none=True, mode="json"))
+
+
+@mcp.tool(
+    name="vault_canvas_add_edge",
+    description=(
+        "Append an edge to an existing Obsidian .canvas file. Requires fromNode, toNode, and fromSide/toSide "
+        "(top, right, bottom, left); both endpoints must reference existing node ids. An alphanumeric id is "
+        "generated when omitted."
+    ),
+    annotations={"readOnlyHint": False, "destructiveHint": True, "idempotentHint": False, "openWorldHint": False},
+)
+def vault_canvas_add_edge(path: str, edge: dict) -> str:
+    """Append an edge to a Canvas file."""
+    inp = VaultCanvasAddEdgeInput(path=path, edge=edge)
+    return _vault_canvas_add_edge(inp.path, inp.edge.model_dump(exclude_none=True, mode="json"))
 
 
 def main():
