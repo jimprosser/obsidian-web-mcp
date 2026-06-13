@@ -3,6 +3,7 @@
 import base64
 import json
 import logging
+import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -65,6 +66,100 @@ def _assemble_context(
     return "\n".join(file_lines[start:end])
 
 
+def _open_in_vault_nofollow(vault_root: Path, rel_path: str) -> int:
+    """Open vault_root/rel_path for reading without following a symlink in any
+    path component below the (trusted, configured) vault root.
+
+    The matched path comes back from a separate ripgrep process and is opened in
+    a later syscall, so a single path-based open is a TOCTOU: a symlink swapped
+    into an intermediate component between a containment check and the open would
+    be followed. Here each component under the root is opened with O_NOFOLLOW
+    relative to its parent's directory fd (openat), so a symlink anywhere (final
+    or intermediate, even one swapped in concurrently) fails the open atomically
+    rather than being resolved by a racy path lookup. The configured root itself
+    is opened normally, since it is allowed to be a symlink (VAULT_PATH may point
+    at, e.g., a mounted volume).
+
+    Where openat/dir_fd is unavailable (e.g. Windows) this degrades to a single
+    O_NOFOLLOW open on the joined path, guarded by a (racy) resolved-path
+    containment check. Raises OSError on any refusal so the caller degrades to
+    ripgrep's matched line.
+    """
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    directory = getattr(os, "O_DIRECTORY", 0)
+    parts = [p for p in Path(rel_path).parts if p not in ("", os.curdir)]
+
+    if os.open not in os.supports_dir_fd or not parts:
+        full = os.path.join(str(vault_root), rel_path)
+        resolved = os.path.realpath(full)
+        root = os.path.realpath(str(vault_root))
+        if resolved != root and not resolved.startswith(root + os.sep):
+            raise OSError("matched path resolves outside the vault")
+        return os.open(full, os.O_RDONLY | nofollow)
+
+    dir_fd = os.open(str(vault_root), os.O_RDONLY | directory)
+    try:
+        for part in parts[:-1]:
+            next_fd = os.open(part, os.O_RDONLY | nofollow | directory, dir_fd=dir_fd)
+            # Reassign before closing so an interrupted close (EINTR) leaves the
+            # finally clause closing the fd we actually still hold, not a stale one.
+            old_fd, dir_fd = dir_fd, next_fd
+            os.close(old_fd)
+        return os.open(parts[-1], os.O_RDONLY | nofollow, dir_fd=dir_fd)
+    finally:
+        os.close(dir_fd)
+
+
+def _read_vault_file_lines(rel_path: str) -> list[str] | None:
+    """Re-read a ripgrep-matched vault file for context, refusing unsafe reads.
+
+    rel_path is the match's path relative to the vault root (already validated as
+    lexically inside it by the caller). Returns the file's lines (per
+    _split_lines), or None if the file cannot be read safely, in which case the
+    caller degrades to ripgrep's matched line.
+
+    Two guards, because ripgrep reports the path from a separate process and we
+    open it later:
+      * Symlinks are never followed below the vault root (see
+        _open_in_vault_nofollow), so a matched note that is, or sits under, a
+        symlink pointing out of the vault cannot leak outside content, even if
+        the symlink is swapped in concurrently.
+      * The size cap bounds memory: the file is read in full to slice context, so
+        without a limit a few huge notes (or a broad query) could spike memory
+        despite the result cap. Oversized files degrade to the matched line.
+
+    Not caught here: a hardlink inside the vault to an outside file (a hardlink is
+    a real directory entry, indistinguishable from a normal file). That is a
+    pre-existing, vault-wide exposure shared with vault.read_file, not specific to
+    search.
+    """
+    try:
+        fd = _open_in_vault_nofollow(config.VAULT_PATH, rel_path)
+        try:
+            if os.fstat(fd).st_size > config.MAX_SEARCH_REREAD_BYTES:
+                raise OSError("matched file too large to re-read for context")
+            chunks = []
+            while True:
+                block = os.read(fd, 65536)
+                if not block:
+                    break
+                chunks.append(block)
+        finally:
+            os.close(fd)
+
+        # read_bytes-equivalent, not read_text: text mode translates lone "\r"
+        # to "\n", which would desync _split_lines from rg's line count.
+        return _split_lines(b"".join(chunks).decode("utf-8"))
+    except (OSError, UnicodeDecodeError, ValueError) as exc:
+        logger.warning(
+            "vault_search: could not safely re-read %s for context, "
+            "falling back to matched line only (%s)",
+            rel_path,
+            exc,
+        )
+        return None
+
+
 def _search_ripgrep(
     query: str,
     search_path: Path,
@@ -119,25 +214,18 @@ def _search_ripgrep(
             line_number = match_data["line_number"]
 
             if file_path not in file_lines_cache:
-                try:
-                    # read_bytes, not read_text: text mode translates lone "\r"
-                    # to "\n", which would desync _split_lines from rg's count.
-                    file_lines_cache[file_path] = _split_lines(
-                        Path(file_path).read_bytes().decode("utf-8")
-                    )
-                except (OSError, UnicodeDecodeError) as exc:
-                    logger.warning(
-                        "vault_search: could not re-read %s for context, "
-                        "falling back to matched line only (%s)",
-                        file_path,
-                        exc,
-                    )
-                    file_lines_cache[file_path] = None
+                file_lines_cache[file_path] = _read_vault_file_lines(rel_path)
 
             file_lines = file_lines_cache[file_path]
-            if file_lines is not None:
+            match_index = line_number - 1
+            # Degrade to ripgrep's matched line when the re-read was refused
+            # (file_lines is None) or when rg's line_number is past the file's
+            # current length -- a content race where the file shrank between rg's
+            # scan and the re-read -- which would otherwise slice to an empty
+            # snippet instead of the matched line.
+            if file_lines is not None and 0 <= match_index < len(file_lines):
                 match_context = _assemble_context(
-                    file_lines, line_number - 1, context_lines
+                    file_lines, match_index, context_lines
                 )
             else:
                 match_context = _rg_match_line(match_data)

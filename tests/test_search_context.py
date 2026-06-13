@@ -7,7 +7,9 @@ return identical match_context for the same query.
 """
 
 import json
+import os
 import shutil
+from types import SimpleNamespace
 
 import pytest
 
@@ -16,6 +18,27 @@ from obsidian_vault_mcp.tools.search import vault_search
 
 RG_AVAILABLE = shutil.which("rg") is not None
 requires_rg = pytest.mark.skipif(not RG_AVAILABLE, reason="ripgrep not installed")
+
+
+def _rg_match_json(path, line_number, text):
+    """One ripgrep --json "match" event line, as _search_ripgrep parses it.
+
+    Used by the re-read hardening tests to make ripgrep "report" a chosen path
+    (e.g. a symlink) without the real binary, which never follows symlinks.
+    """
+    return (
+        json.dumps(
+            {
+                "type": "match",
+                "data": {
+                    "path": {"text": str(path)},
+                    "line_number": line_number,
+                    "lines": {"text": text},
+                },
+            }
+        )
+        + "\n"
+    )
 
 # A file with a known, stable line layout so we can assert exact slices.
 SAMPLE = (
@@ -114,18 +137,14 @@ def test_ripgrep_falls_back_to_match_line_when_reread_fails(monkeypatch, vault_d
     (vault_dir / "sample.md").write_text(SAMPLE)
     _force_backend(monkeypatch, "ripgrep")
 
-    from pathlib import Path
+    real_open = os.open
 
-    real_read_bytes = Path.read_bytes
-
-    def failing_read_bytes(self, *args, **kwargs):
-        if self.name == "sample.md":
+    def failing_open(path, flags, *args, **kwargs):
+        if str(path).endswith("sample.md"):
             raise OSError("simulated read failure")
-        return real_read_bytes(self, *args, **kwargs)
+        return real_open(path, flags, *args, **kwargs)
 
-    monkeypatch.setattr(
-        "obsidian_vault_mcp.tools.search.Path.read_bytes", failing_read_bytes
-    )
+    monkeypatch.setattr(search_mod.os, "open", failing_open)
 
     results = json.loads(
         vault_search("delta", file_pattern="sample.md", context_lines=2)
@@ -247,3 +266,168 @@ def test_default_context_lines_is_two(monkeypatch, vault_dir):
     assert results[0]["match_context"] == (
         "alpha one\nbeta two\nTARGET middle\ngamma four\ndelta five"
     )
+
+
+# --- context re-read hardening (symlink safety + memory bound) -----------------
+#
+# The ripgrep backend re-reads each matched file to assemble context. The path
+# comes back from a separate ripgrep process and the file is opened in a second
+# syscall, so the re-read must not (a) follow a symlink out of the vault, nor
+# (b) read an unbounded amount into memory. ripgrep itself never follows
+# symlinks, so these tests feed _search_ripgrep a crafted match event to stand
+# in for a path that became unsafe between the scan and the re-read.
+
+
+def test_ripgrep_reread_does_not_follow_symlink_to_outside_file(
+    monkeypatch, vault_dir, tmp_path
+):
+    """A matched path that is itself a symlink pointing out of the vault (e.g. a
+    note swapped for a symlink between rg's scan and the re-read) must not leak
+    the target's contents; the backend degrades to rg's matched line."""
+    secret = tmp_path / "secret.txt"
+    secret.write_text("SECRET 0\nSECRET 1\nSECRET 2\n")
+    evil = vault_dir / "evil.md"
+    evil.symlink_to(secret)
+
+    monkeypatch.setattr(
+        search_mod.subprocess,
+        "run",
+        lambda *a, **k: SimpleNamespace(stdout=_rg_match_json(evil, 2, "decoy match\n")),
+    )
+
+    results = search_mod._search_ripgrep(
+        "x", vault_dir, file_pattern="*.md", max_results=10, context_lines=2
+    )
+    assert len(results) == 1
+    ctx = results[0]["match_context"]
+    assert "SECRET" not in ctx, f"symlink re-read leaked outside content: {ctx}"
+    assert ctx == "decoy match"
+
+
+def test_ripgrep_reread_rejects_match_under_symlinked_parent(
+    monkeypatch, vault_dir, tmp_path
+):
+    """A match reached through a symlinked parent directory must be refused. The
+    re-read walks each component with O_NOFOLLOW relative to its parent's dir fd,
+    so a symlinked intermediate directory fails the open; the no-dir_fd fallback
+    catches the same case with its resolved-path containment check."""
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "secret.md").write_text("SECRET a\nSECRET b\nSECRET c\n")
+    link_dir = vault_dir / "linkdir"
+    link_dir.symlink_to(outside, target_is_directory=True)
+    target = link_dir / "secret.md"  # under vault lexically, outside once resolved
+
+    monkeypatch.setattr(
+        search_mod.subprocess,
+        "run",
+        lambda *a, **k: SimpleNamespace(
+            stdout=_rg_match_json(target, 2, "decoy match\n")
+        ),
+    )
+
+    results = search_mod._search_ripgrep(
+        "x", vault_dir, file_pattern="*.md", max_results=10, context_lines=2
+    )
+    assert len(results) == 1
+    ctx = results[0]["match_context"]
+    assert "SECRET" not in ctx, f"symlinked-parent re-read leaked: {ctx}"
+    assert ctx == "decoy match"
+
+
+def test_ripgrep_oversized_file_degrades_to_matched_line(monkeypatch, vault_dir):
+    """A matched file larger than the re-read cap is not read in full (which
+    bounds memory); the backend degrades to rg's matched line with no context.
+
+    Faked subprocess.run so the memory-bound case is covered even with no rg on
+    PATH; the line below the TARGET would appear as context if the file were
+    read, so its absence proves the cap forced the degrade."""
+    monkeypatch.setattr(search_mod.config, "MAX_SEARCH_REREAD_BYTES", 64)
+    big = vault_dir / "big.md"
+    big.write_text("pad line\n" * 50 + "TARGET line\n" + "pad line\n" * 50)
+
+    monkeypatch.setattr(
+        search_mod.subprocess,
+        "run",
+        lambda *a, **k: SimpleNamespace(stdout=_rg_match_json(big, 51, "TARGET line\n")),
+    )
+
+    results = search_mod._search_ripgrep(
+        "TARGET", vault_dir, file_pattern="big.md", max_results=10, context_lines=3
+    )
+    assert len(results) == 1
+    assert results[0]["match_context"] == "TARGET line"
+
+
+@requires_rg
+def test_ripgrep_oversized_file_degrades_to_matched_line_real_rg(monkeypatch, vault_dir):
+    """Same memory-bound behavior, exercised through the real ripgrep binary."""
+    monkeypatch.setattr(search_mod.config, "MAX_SEARCH_REREAD_BYTES", 64)
+    (vault_dir / "big.md").write_text(
+        "pad line\n" * 50 + "TARGET line\n" + "pad line\n" * 50
+    )
+
+    results = search_mod._search_ripgrep(
+        "TARGET", vault_dir, file_pattern="big.md", max_results=10, context_lines=3
+    )
+    assert len(results) == 1
+    assert results[0]["match_context"] == "TARGET line"
+
+
+def test_reread_fallback_without_dir_fd_refuses_outside_symlink(
+    monkeypatch, vault_dir, tmp_path
+):
+    """Where openat/dir_fd is unavailable (e.g. Windows), the re-read falls back
+    to a single O_NOFOLLOW open guarded by a resolved-path containment check. It
+    must still read a legitimate in-vault file and still refuse a symlink that
+    resolves out of the vault. Forced on this platform by emptying
+    os.supports_dir_fd so the fallback branch is actually exercised."""
+    monkeypatch.setattr(search_mod.os, "supports_dir_fd", frozenset())
+
+    (vault_dir / "ok.md").write_text("a\nb\nc\n")
+    assert search_mod._read_vault_file_lines("ok.md") == ["a", "b", "c"]
+
+    secret = tmp_path / "secret.txt"
+    secret.write_text("SECRET 0\nSECRET 1\n")
+    (vault_dir / "evil.md").symlink_to(secret)
+    assert search_mod._read_vault_file_lines("evil.md") is None
+
+
+@requires_rg
+def test_ripgrep_context_for_deeply_nested_file(monkeypatch, vault_dir):
+    """The no-symlink re-read walks the path component by component; a match in a
+    legitimately nested directory must still get full context (regression guard
+    for the component-wise open path)."""
+    nested = vault_dir / "a" / "b"
+    nested.mkdir(parents=True)
+    (nested / "deep.md").write_text("ctx above\nTARGET deep\nctx below\n")
+    _force_backend(monkeypatch, "ripgrep")
+
+    results = json.loads(
+        vault_search("TARGET deep", file_pattern="*.md", context_lines=1)
+    )["results"]
+    assert len(results) == 1
+    assert results[0]["path"] == "a/b/deep.md"
+    assert results[0]["match_context"] == "ctx above\nTARGET deep\nctx below"
+
+
+def test_ripgrep_stale_line_number_degrades_to_matched_line(monkeypatch, vault_dir):
+    """If rg reports a line_number past the file's current length (a content race
+    where the file shrank between rg's scan and the re-read), the backend must
+    degrade to rg's matched line, not slice to an empty snippet."""
+    note = vault_dir / "note.md"
+    note.write_text("line one\nline two\n")  # only 2 lines on disk now
+
+    monkeypatch.setattr(
+        search_mod.subprocess,
+        "run",
+        lambda *a, **k: SimpleNamespace(
+            stdout=_rg_match_json(note, 7, "the matched line\n")
+        ),
+    )
+
+    results = search_mod._search_ripgrep(
+        "x", vault_dir, file_pattern="*.md", max_results=10, context_lines=2
+    )
+    assert len(results) == 1
+    assert results[0]["match_context"] == "the matched line"
