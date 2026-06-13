@@ -30,12 +30,17 @@ def _search_ripgrep(
         f"--glob={file_pattern}",
         "-i",
         f"--context={context_lines}",
-        query,
-        str(search_path),
     ]
 
     for excluded in config.EXCLUDED_DIRS:
-        cmd.insert(-2, f"--glob=!{excluded}/")
+        cmd.append(f"--glob=!{excluded}/")
+
+    # Pass the user-supplied query with `-e` so a value beginning with "-"
+    # (e.g. "--pre=/bin/sh", a ripgrep preprocessor flag that executes an
+    # arbitrary program per searched file) is parsed as a SEARCH PATTERN, not
+    # as a ripgrep option. Appending it bare here was an argv option-injection
+    # that allowed remote code execution via the vault_search query argument.
+    cmd += ["-e", query, str(search_path)]
 
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
