@@ -5,10 +5,11 @@ file: a UTC timestamp, a SHA-256 hash of the bearer token (never the token itsel
 operation, the target path, and the size + checksum of the target before and after the
 change. Read/search operations are logged too when VAULT_AUDIT_LOG_INCLUDE_READS is on.
 
-Auditing is off unless a log path is configured. A failure to write a record is logged
-and counted but never alters the tool result -- the audit trail must not be able to break
-a write. The log path is validated as writable at startup (see server.main), so a
-misconfigured path fails the server closed rather than silently dropping records.
+Auditing is off unless a log path is configured. At startup the path is validated as
+writable AND rejected if it resolves inside the vault (where the vault tools could rewrite
+it), so a misconfigured path fails the server closed. At runtime the log is best-effort:
+a failure to write a record is logged but never alters the tool result -- the audit trail
+must not be able to break a write.
 """
 
 from __future__ import annotations
@@ -17,8 +18,7 @@ import hashlib
 import logging
 import os
 import uuid
-from collections import deque
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -53,8 +53,8 @@ READ_OPERATIONS = {
     "vault_daily_note_read",
 }
 
-_AUDIT_WINDOW = timedelta(hours=24)
-_audit_write_events: deque[dict[str, Any]] = deque()
+# Mutations whose result reports per-file outcomes; audited one record per file.
+BATCH_OPERATIONS = {"vault_batch_frontmatter_update"}
 
 
 def audit_enabled() -> bool:
@@ -105,47 +105,26 @@ def audit_path_writable(path: Path | None = None) -> bool:
         return False
 
 
+def audit_path_inside_vault() -> bool:
+    """True when the configured audit log resolves inside the vault.
+
+    A same-vault log is just another file the vault tools can reach: resolve_vault_path
+    only blocks traversal and dotfiles, so an authenticated caller could overwrite it via
+    vault_write or relocate it via vault_delete, defeating the append-only integrity
+    premise. Such a path is rejected at startup (see server.main).
+    """
+    if not audit_enabled():
+        return False
+    try:
+        log = audit_log_path().resolve()
+        vault = config.VAULT_PATH.resolve()
+    except OSError:
+        return False
+    return log == vault or vault in log.parents
+
+
 def _now_utc() -> datetime:
     return datetime.now(timezone.utc)
-
-
-def _prune_audit_events(now: datetime | None = None) -> None:
-    now = now or _now_utc()
-    cutoff = now - _AUDIT_WINDOW
-    while _audit_write_events and _audit_write_events[0]["timestamp"] < cutoff:
-        _audit_write_events.popleft()
-
-
-def reset_audit_health_state() -> None:
-    """Clear the in-memory health counters. For tests and restarts."""
-    _audit_write_events.clear()
-
-
-def _record_audit_write(success: bool, bytes_written: int = 0) -> None:
-    now = _now_utc()
-    _audit_write_events.append(
-        {"timestamp": now, "success": success, "bytes_written": bytes_written if success else 0}
-    )
-    _prune_audit_events(now)
-
-
-def audit_health_payload() -> dict[str, Any]:
-    """Audit status for the /health endpoint (process-local 24h counters)."""
-    if not audit_enabled():
-        return {"enabled": False}
-    if not audit_path_writable():
-        return {"enabled": False, "writable": False, "log_path": str(audit_log_path())}
-    now = _now_utc()
-    _prune_audit_events(now)
-    successful = [e for e in _audit_write_events if e["success"]]
-    return {
-        "enabled": True,
-        "log_path": str(audit_log_path()),
-        "includes_reads": bool(config.VAULT_AUDIT_LOG_INCLUDE_READS),
-        "last_write_at": successful[-1]["timestamp"].isoformat() if successful else None,
-        "write_errors_count_24h": sum(1 for e in _audit_write_events if not e["success"]),
-        "bytes_written_24h": sum(int(e["bytes_written"]) for e in _audit_write_events),
-    }
 
 
 def _hash_value(value: str | None) -> str | None:
@@ -233,7 +212,7 @@ def build_audit_record(
 
 
 def write_audit_record(record: dict[str, Any]) -> bool:
-    """Append one JSON record. A write failure is logged, counted, and swallowed."""
+    """Append one JSON record. A write failure is logged and swallowed (best-effort)."""
     if not audit_enabled():
         return False
     try:
@@ -242,9 +221,7 @@ def write_audit_record(record: dict[str, Any]) -> bool:
         line = dumps(record, sort_keys=True) + "\n"
         with path.open("a", encoding="utf-8") as handle:
             handle.write(line)
-        _record_audit_write(True, len(line.encode("utf-8")))
         return True
     except Exception as exc:
-        _record_audit_write(False)
         logger.error("Audit log write failed: %s", exc)
         return False

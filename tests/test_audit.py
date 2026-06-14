@@ -22,11 +22,9 @@ def audit_log(vault_dir, tmp_path, monkeypatch):
     log_path = tmp_path / "audit" / "mutations.jsonl"
     monkeypatch.setattr(config, "VAULT_AUDIT_LOG_PATH", str(log_path))
     monkeypatch.setattr(config, "VAULT_AUDIT_LOG_INCLUDE_READS", False)
-    audit.reset_audit_health_state()
     token = context.set_request_context(principal=PRINCIPAL, request_id="req-1", client="pytest")
     yield log_path
     context.reset_request_context(token)
-    audit.reset_audit_health_state()
 
 
 def _records(log_path):
@@ -126,27 +124,31 @@ def test_audit_write_failure_does_not_break_tool(vault_dir, monkeypatch):
     # Parent of the log path is an existing FILE, so mkdir/open fails on every write.
     bad = vault_dir / "test-note.md" / "audit.jsonl"
     monkeypatch.setattr(config, "VAULT_AUDIT_LOG_PATH", str(bad))
-    audit.reset_audit_health_state()
+    assert audit.audit_path_writable() is False
     token = context.set_request_context(principal=PRINCIPAL, request_id="r", client="c")
     try:
         result = json.loads(server.vault_write("still-works.md", "body"))
-        assert result["created"] is True        # the write itself succeeded
-        health = audit.audit_health_payload()
-        assert health["enabled"] is False        # path not writable
+        assert result["created"] is True        # the write itself succeeded despite audit failing
     finally:
         context.reset_request_context(token)
-        audit.reset_audit_health_state()
 
 
-# --- health + writability ---
+# --- in-vault audit log rejected (#2 integrity) ---
 
-def test_health_payload_reflects_state(audit_log, monkeypatch):
-    enabled = audit.audit_health_payload()
-    assert enabled["enabled"] is True
-    assert enabled["includes_reads"] is False
-    monkeypatch.setattr(config, "VAULT_AUDIT_LOG_PATH", "")
-    assert audit.audit_health_payload() == {"enabled": False}
+def test_audit_path_inside_vault_detected(vault_dir, monkeypatch):
+    monkeypatch.setattr(config, "VAULT_AUDIT_LOG_PATH", str(vault_dir / "audit.jsonl"))
+    assert audit.audit_path_inside_vault() is True
+    monkeypatch.setattr(config, "VAULT_AUDIT_LOG_PATH", str(vault_dir / "subfolder" / "a.jsonl"))
+    assert audit.audit_path_inside_vault() is True
 
+
+def test_audit_path_outside_vault_ok(vault_dir, tmp_path, monkeypatch):
+    # tmp_path is the vault's parent, so a sibling dir is outside the vault.
+    monkeypatch.setattr(config, "VAULT_AUDIT_LOG_PATH", str(tmp_path / "outside" / "audit.jsonl"))
+    assert audit.audit_path_inside_vault() is False
+
+
+# --- writability ---
 
 def test_path_writable_checks(vault_dir, tmp_path, monkeypatch):
     good = tmp_path / "ok.jsonl"
@@ -174,3 +176,41 @@ def test_snapshot_path_stays_in_vault(vault_dir):
 ])
 def test_audited_tools_still_registered(vault_dir, name):
     assert server.mcp._tool_manager.get_tool(name) is not None
+
+
+# --- batch: one record per file with correct per-file status (#3) ---
+
+def test_batch_emits_one_record_per_file_with_status(audit_log):
+    server.vault_write("a.md", "---\nx: 1\n---\nbody")
+    # a.md exists, missing.md does not -> partial failure within one batch call
+    updates = [
+        {"path": "a.md", "fields": {"status": "done"}},
+        {"path": "missing.md", "fields": {"status": "done"}},
+    ]
+    server.vault_batch_frontmatter_update(updates)
+    recs = [r for r in _records(audit_log) if r["operation"] == "vault_batch_frontmatter_update"]
+    assert len(recs) == 2                      # one record per file, not one for the call
+    by_path = {r["target_path"]: r for r in recs}
+    assert by_path["a.md"]["operation_status"] == "success"
+    assert by_path["a.md"]["checksum_after"] is not None   # real snapshot, not null
+    assert by_path["missing.md"]["operation_status"] == "error"   # partial failure surfaced
+    assert by_path["missing.md"]["error"]
+
+
+# --- dry-run edit is not recorded as a mutation (non-blocking item) ---
+
+def test_dry_run_edit_not_audited(audit_log):
+    server.vault_write("edit.md", "alpha beta")
+    before = len(_records(audit_log))
+    server.vault_edit("edit.md", [{"old_text": "alpha", "new_text": "ALPHA"}], dry_run=True)
+    assert len(_records(audit_log)) == before          # dry run wrote nothing, logged nothing
+    server.vault_edit("edit.md", [{"old_text": "alpha", "new_text": "ALPHA"}])
+    assert len(_records(audit_log)) == before + 1       # the real edit IS audited
+
+
+def test_daily_append_captures_before_snapshot(audit_log, monkeypatch):
+    monkeypatch.setattr(config, "VAULT_DAILY_NOTES_FOLDER", "")
+    server.vault_daily_note_append("first line")
+    server.vault_daily_note_append("second line")
+    recs = [r for r in _records(audit_log) if r["operation"] == "vault_daily_note_append"]
+    assert recs[-1]["size_before"] is not None          # before-snapshot now captured

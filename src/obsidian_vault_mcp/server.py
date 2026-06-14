@@ -30,10 +30,11 @@ from .config import (
 )
 from .frontmatter_index import FrontmatterIndex
 from .audit import (
+    BATCH_OPERATIONS,
     MUTATION_OPERATIONS,
     audit_enabled,
-    audit_health_payload,
     audit_log_path,
+    audit_path_inside_vault,
     audit_path_writable,
     before_target_path,
     build_audit_record,
@@ -149,6 +150,8 @@ from .tools.canvas import (
     vault_canvas_add_edge as _vault_canvas_add_edge,
 )
 from .tools.daily import (
+    _daily_note_path,
+    _today,
     vault_daily_note_path as _vault_daily_note_path,
     vault_daily_note_read as _vault_daily_note_read,
     vault_daily_note_append as _vault_daily_note_append,
@@ -172,17 +175,30 @@ from .models import (
 )
 
 
+def _parse_tool_result(result: str) -> dict:
+    """Parse a tool's JSON result into a dict, or {} when it is not a JSON object."""
+    try:
+        payload = json.loads(result)
+    except (ValueError, TypeError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
 def _run_audited(operation: str, func, **context) -> str:
-    """Run a tool and emit one audit record when auditing covers this operation.
+    """Run a tool and emit audit records when auditing covers this operation.
 
     A straight passthrough when auditing is off (no log path) or the operation is a read
     and read-audit is disabled, so there is no cost on the default path. For mutations the
     target is snapshotted (size + checksum) before and after; reads capture the target as
-    it is read. An audit-write failure is swallowed inside write_audit_record so the trail
-    can never break the tool result.
+    it is read. Batch mutations emit one record per file (see _run_audited_batch). An
+    audit-write failure is swallowed inside write_audit_record so the trail can never break
+    the tool result.
     """
     if not should_audit_operation(operation):
         return func()
+
+    if operation in BATCH_OPERATIONS:
+        return _run_audited_batch(operation, func, context)
 
     is_mutation = operation in MUTATION_OPERATIONS
     before = snapshot_path(before_target_path(operation, context)) if is_mutation else None
@@ -190,45 +206,77 @@ def _run_audited(operation: str, func, **context) -> str:
     try:
         result = func()
     except Exception:
-        record = build_audit_record(
+        write_audit_record(build_audit_record(
             operation=operation,
             target_path=infer_target_path(operation, context),
             before=before,
             operation_status="error",
             error="tool exception",
-        )
-        write_audit_record(record)
+        ))
         raise
 
-    parsed: dict = {}
-    try:
-        payload = json.loads(result)
-        if isinstance(payload, dict):
-            parsed = payload
-    except (ValueError, TypeError):
-        parsed = {}
-
+    parsed = _parse_tool_result(result)
     target_path = infer_target_path(operation, context, parsed)
     status = "error" if "error" in parsed else "success"
     error = parsed.get("error") if status == "error" else None
     if is_mutation:
         record = build_audit_record(
-            operation=operation,
-            target_path=target_path,
-            before=before,
-            after=snapshot_path(target_path),
-            operation_status=status,
-            error=error,
+            operation=operation, target_path=target_path, before=before,
+            after=snapshot_path(target_path), operation_status=status, error=error,
         )
     else:
         record = build_audit_record(
-            operation=operation,
-            target_path=target_path,
-            before=snapshot_path(target_path),
-            operation_status=status,
-            error=error,
+            operation=operation, target_path=target_path,
+            before=snapshot_path(target_path), operation_status=status, error=error,
         )
     write_audit_record(record)
+    return result
+
+
+def _run_audited_batch(operation: str, func, context: dict) -> str:
+    """Audit a batch mutation as one record per file with correct per-file status.
+
+    The batch tools report per-file outcomes inside ``results`` (some files can fail while
+    the call as a whole "succeeds"), so a single top-level record would both hide partial
+    failures and lose per-file snapshots. Each file gets its own before/after snapshot and
+    its own operation_status.
+    """
+    paths = [p for p in (context.get("paths") or []) if isinstance(p, str) and p]
+    before_map = {p: snapshot_path(p) for p in paths}
+
+    try:
+        result = func()
+    except Exception:
+        for p in paths:
+            write_audit_record(build_audit_record(
+                operation=operation, target_path=p, before=before_map.get(p),
+                operation_status="error", error="tool exception",
+            ))
+        raise
+
+    parsed = _parse_tool_result(result)
+    items = parsed.get("results")
+    if not isinstance(items, list) or not items:
+        # A tool-level failure (e.g. validation) before any per-file work ran.
+        write_audit_record(build_audit_record(
+            operation=operation, target_path=paths or None,
+            operation_status="error" if "error" in parsed else "success",
+            error=parsed.get("error"),
+        ))
+        return result
+
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        path = item.get("path")
+        item_error = item.get("error")
+        item_status = "error" if item_error else "success"
+        before = before_map.get(path) if isinstance(path, str) else None
+        after = snapshot_path(path) if (item_status == "success" and isinstance(path, str)) else None
+        write_audit_record(build_audit_record(
+            operation=operation, target_path=path, before=before, after=after,
+            operation_status=item_status, error=item_error,
+        ))
     return result
 
 
@@ -280,6 +328,9 @@ def vault_write(path: str, content: str, create_dirs: bool = True, merge_frontma
 def vault_edit(path: str, edits: list[dict], dry_run: bool = False) -> str:
     """Patch a file with exact text replacements."""
     inp = VaultEditInput(path=path, edits=edits, dry_run=dry_run)
+    if inp.dry_run:
+        # A dry run writes nothing; don't record it as a mutation.
+        return _vault_edit(inp.path, [edit.model_dump() for edit in inp.edits], inp.dry_run)
     return _run_audited(
         "vault_edit",
         lambda: _vault_edit(inp.path, [edit.model_dump() for edit in inp.edits], inp.dry_run),
@@ -316,6 +367,7 @@ def vault_batch_frontmatter_update(updates: list[dict]) -> str:
     return _run_audited(
         "vault_batch_frontmatter_update",
         lambda: _vault_batch_frontmatter_update(inp.updates),
+        paths=[u.get("path") for u in inp.updates if isinstance(u, dict) and u.get("path")],
     )
 
 
@@ -490,6 +542,7 @@ def vault_daily_note_append(content: str) -> str:
     return _run_audited(
         "vault_daily_note_append",
         lambda: _vault_daily_note_append(inp.content),
+        path=_daily_note_path(_today()),
     )
 
 
@@ -534,7 +587,10 @@ def build_app(extensions=()):
     # Health endpoint (bearer-exempt, see auth._AUTH_EXEMPT_PATHS). Surfaces audit status
     # so an operator can confirm the log is enabled and being written.
     async def health(_request):
-        return JSONResponse({"status": "ok", "audit": audit_health_payload()})
+        # Unauthenticated and reachable over the public tunnel, so keep it to liveness:
+        # report only whether auditing is on -- never the log path or write counters,
+        # which would leak the host filesystem layout and a vault-activity side-channel.
+        return JSONResponse({"status": "ok", "audit": {"enabled": audit_enabled()}})
 
     app.routes.insert(0, Route("/health", health, methods=["GET"]))
 
@@ -640,6 +696,14 @@ def serve(extensions=()):
     # is not writable, refuse to start rather than silently dropping mutation records.
     if audit_enabled() and not audit_path_writable():
         logger.error(f"VAULT_AUDIT_LOG_PATH is not writable: {audit_log_path()}")
+        sys.exit(1)
+    # Fail CLOSED on an audit log that resolves inside the vault: the vault tools could
+    # then overwrite or delete it, defeating the append-only integrity premise.
+    if audit_enabled() and audit_path_inside_vault():
+        logger.error(
+            f"VAULT_AUDIT_LOG_PATH resolves inside the vault ({audit_log_path()}); "
+            "the vault tools could rewrite it. Choose a path outside VAULT_PATH."
+        )
         sys.exit(1)
     if audit_enabled():
         logger.info(
