@@ -136,6 +136,22 @@ def validate_heartbeat() -> int | None:
         raise ValueError("VAULT_MCP_HEARTBEAT_INTERVAL must be a positive integer")
     return interval
 
+
+# Append-only JSONL audit log of vault mutations. When VAULT_AUDIT_LOG_PATH is set,
+# every mutation appends one JSON record (UTC timestamp, SHA-256 hash of the bearer
+# token, operation, target path, size + checksum before and after). Empty (the default)
+# disables auditing entirely. The raw bearer token is never written -- only its SHA-256
+# hash. The path is validated as writable at startup; an unwritable path fails the
+# server closed (see server.main) rather than dropping records silently.
+VAULT_AUDIT_LOG_PATH = os.environ.get("VAULT_AUDIT_LOG_PATH", "").strip()
+
+# Also record read/search operations (opt-in). Off by default because reads are
+# high-volume and may carry privacy weight; mutations are always logged once the audit
+# log is enabled. Accepts 1/true/yes/on (case-insensitive).
+VAULT_AUDIT_LOG_INCLUDE_READS = os.environ.get(
+    "VAULT_AUDIT_LOG_INCLUDE_READS", ""
+).strip().lower() in {"1", "true", "yes", "on"}
+
 # Safety limits
 MAX_CONTENT_SIZE = 1_000_000  # 1MB max write size
 MAX_BATCH_SIZE = 20           # Max files per batch operation

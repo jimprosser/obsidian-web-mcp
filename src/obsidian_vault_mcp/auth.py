@@ -1,6 +1,7 @@
 """Bearer token authentication middleware for the vault MCP server."""
 
 import hmac
+import uuid
 
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
@@ -8,6 +9,7 @@ from starlette.responses import JSONResponse
 
 from . import config
 from .config import VAULT_MCP_TOKEN
+from .context import reset_request_context, set_request_context
 
 # Paths that don't require bearer auth (OAuth flow + health)
 _AUTH_EXEMPT_PATHS = {
@@ -76,4 +78,14 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
                 headers={"WWW-Authenticate": _www_authenticate(request, "invalid_token")},
             )
 
-        return await call_next(request)
+        # Thread the authenticated principal (plus a request id and best-effort client
+        # hint) to the tool layer for the audit log. The raw token never leaves this
+        # context; audit.build_audit_record stores only its SHA-256 hash. client_id is a
+        # User-Agent-derived hint -- it becomes a true per-client id if the static bearer
+        # token is ever replaced with per-client tokens.
+        client = request.headers.get("user-agent", "").strip()[:200] or None
+        ctx_token = set_request_context(principal=token, request_id=uuid.uuid4().hex, client=client)
+        try:
+            return await call_next(request)
+        finally:
+            reset_request_context(ctx_token)

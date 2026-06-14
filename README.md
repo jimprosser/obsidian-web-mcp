@@ -131,8 +131,33 @@ All configuration is via environment variables:
 | `VAULT_DAILY_NOTES_TEMPLATE` | No | (none) | `strftime` template prepended when a daily note is first created |
 | `VAULT_MCP_HEARTBEAT_URL` | No | (none) | Optional push URL for an uptime monitor (Uptime Kuma, Healthchecks.io, ...). When set, a daemon thread GETs it on an interval. Must be `http(s)`; redirects are not followed and the URL is treated as a secret (never logged in full). Empty = disabled. |
 | `VAULT_MCP_HEARTBEAT_INTERVAL` | No | `60` | Seconds between heartbeat pings. Must be a positive integer; a bad value fails closed at startup. Only used when `VAULT_MCP_HEARTBEAT_URL` is set. |
+| `VAULT_AUDIT_LOG_PATH` | No | (none) | Append-only JSONL audit log of vault mutations. When set, every mutation appends one record; empty disables auditing. The raw bearer token is never written -- only its SHA-256 hash. Validated as writable at startup (an unwritable path **fails the server closed**). See [Audit logging](#audit-logging). |
+| `VAULT_AUDIT_LOG_INCLUDE_READS` | No | `false` | Also record read/search operations (`1`/`true`/`yes`/`on`). Off by default; mutations are always logged once the audit log is enabled. |
 
 Generate secrets with: `python -c "import secrets; print(secrets.token_hex(32))"`
+
+## Audit logging
+
+Set `VAULT_AUDIT_LOG_PATH` to a file path to record every vault mutation as an append-only
+JSON line. Auditing is **off by default**; with no path set there is no overhead. Reads and
+searches are logged too when `VAULT_AUDIT_LOG_INCLUDE_READS` is on (off by default, since
+reads are high-volume).
+
+Each record carries: `timestamp` (UTC), `token_id_hash` (SHA-256 of the bearer token -- the
+raw token is never written), `client_id` (a best-effort User-Agent hint), `operation`,
+`target_path`, `size_before`/`size_after`, `checksum_before`/`checksum_after` (SHA-256),
+`request_id`, `operation_status`, and `error`. Example line:
+
+```json
+{"checksum_after":"9f86d0…","checksum_before":null,"client_id":"claude","error":null,"operation":"vault_write","operation_status":"success","request_id":"a1b2…","size_after":42,"size_before":null,"target_path":"notes/today.md","timestamp":"2026-06-14T18:30:00+00:00","token_id_hash":"5e88…"}
+```
+
+The log path is validated at startup: if it is set but not writable, the server refuses to
+start rather than silently dropping records (fail-closed). A write failure at runtime is
+logged and counted but never alters the tool result -- the audit trail cannot break a write.
+The `GET /health` endpoint (no auth required) reports audit status under an `audit` key:
+whether it is enabled, the log path, whether reads are included, the last write time, and 24h
+write-error and byte counts.
 
 ## Connecting to Claude
 

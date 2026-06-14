@@ -18,6 +18,7 @@ from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 
 from .config import (
+    VAULT_AUDIT_LOG_INCLUDE_READS,
     VAULT_MCP_ALLOWED_HOSTS,
     VAULT_MCP_FORWARDED_ALLOW_IPS,
     VAULT_MCP_HEARTBEAT_URL,
@@ -28,6 +29,19 @@ from .config import (
     VAULT_PATH,
 )
 from .frontmatter_index import FrontmatterIndex
+from .audit import (
+    MUTATION_OPERATIONS,
+    audit_enabled,
+    audit_health_payload,
+    audit_log_path,
+    audit_path_writable,
+    before_target_path,
+    build_audit_record,
+    infer_target_path,
+    should_audit_operation,
+    snapshot_path,
+    write_audit_record,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -158,6 +172,66 @@ from .models import (
 )
 
 
+def _run_audited(operation: str, func, **context) -> str:
+    """Run a tool and emit one audit record when auditing covers this operation.
+
+    A straight passthrough when auditing is off (no log path) or the operation is a read
+    and read-audit is disabled, so there is no cost on the default path. For mutations the
+    target is snapshotted (size + checksum) before and after; reads capture the target as
+    it is read. An audit-write failure is swallowed inside write_audit_record so the trail
+    can never break the tool result.
+    """
+    if not should_audit_operation(operation):
+        return func()
+
+    is_mutation = operation in MUTATION_OPERATIONS
+    before = snapshot_path(before_target_path(operation, context)) if is_mutation else None
+
+    try:
+        result = func()
+    except Exception:
+        record = build_audit_record(
+            operation=operation,
+            target_path=infer_target_path(operation, context),
+            before=before,
+            operation_status="error",
+            error="tool exception",
+        )
+        write_audit_record(record)
+        raise
+
+    parsed: dict = {}
+    try:
+        payload = json.loads(result)
+        if isinstance(payload, dict):
+            parsed = payload
+    except (ValueError, TypeError):
+        parsed = {}
+
+    target_path = infer_target_path(operation, context, parsed)
+    status = "error" if "error" in parsed else "success"
+    error = parsed.get("error") if status == "error" else None
+    if is_mutation:
+        record = build_audit_record(
+            operation=operation,
+            target_path=target_path,
+            before=before,
+            after=snapshot_path(target_path),
+            operation_status=status,
+            error=error,
+        )
+    else:
+        record = build_audit_record(
+            operation=operation,
+            target_path=target_path,
+            before=snapshot_path(target_path),
+            operation_status=status,
+            error=error,
+        )
+    write_audit_record(record)
+    return result
+
+
 @mcp.tool(
     name="vault_read",
     description="Read a file from the Obsidian vault, returning content, metadata, and parsed YAML frontmatter.",
@@ -166,7 +240,7 @@ from .models import (
 def vault_read(path: str) -> str:
     """Read a file from the vault."""
     inp = VaultReadInput(path=path)
-    return _vault_read(inp.path)
+    return _run_audited("vault_read", lambda: _vault_read(inp.path), path=inp.path)
 
 
 @mcp.tool(
@@ -177,7 +251,7 @@ def vault_read(path: str) -> str:
 def vault_batch_read(paths: list[str], include_content: bool = True) -> str:
     """Read multiple files at once."""
     inp = VaultBatchReadInput(paths=paths, include_content=include_content)
-    return _vault_batch_read(inp.paths, inp.include_content)
+    return _run_audited("vault_batch_read", lambda: _vault_batch_read(inp.paths, inp.include_content))
 
 
 @mcp.tool(
@@ -188,7 +262,11 @@ def vault_batch_read(paths: list[str], include_content: bool = True) -> str:
 def vault_write(path: str, content: str, create_dirs: bool = True, merge_frontmatter: bool = False) -> str:
     """Write a file to the vault."""
     inp = VaultWriteInput(path=path, content=content, create_dirs=create_dirs, merge_frontmatter=merge_frontmatter)
-    return _vault_write(inp.path, inp.content, inp.create_dirs, inp.merge_frontmatter)
+    return _run_audited(
+        "vault_write",
+        lambda: _vault_write(inp.path, inp.content, inp.create_dirs, inp.merge_frontmatter),
+        path=inp.path,
+    )
 
 
 @mcp.tool(
@@ -202,10 +280,10 @@ def vault_write(path: str, content: str, create_dirs: bool = True, merge_frontma
 def vault_edit(path: str, edits: list[dict], dry_run: bool = False) -> str:
     """Patch a file with exact text replacements."""
     inp = VaultEditInput(path=path, edits=edits, dry_run=dry_run)
-    return _vault_edit(
-        inp.path,
-        [edit.model_dump() for edit in inp.edits],
-        inp.dry_run,
+    return _run_audited(
+        "vault_edit",
+        lambda: _vault_edit(inp.path, [edit.model_dump() for edit in inp.edits], inp.dry_run),
+        path=inp.path,
     )
 
 
@@ -220,7 +298,11 @@ def vault_edit(path: str, edits: list[dict], dry_run: bool = False) -> str:
 def vault_append(path: str, content: str, separator: str = "\n\n", create_dirs: bool = True) -> str:
     """Append content to a file."""
     inp = VaultAppendInput(path=path, content=content, separator=separator, create_dirs=create_dirs)
-    return _vault_append(inp.path, inp.content, inp.separator, inp.create_dirs)
+    return _run_audited(
+        "vault_append",
+        lambda: _vault_append(inp.path, inp.content, inp.separator, inp.create_dirs),
+        path=inp.path,
+    )
 
 
 @mcp.tool(
@@ -231,7 +313,10 @@ def vault_append(path: str, content: str, separator: str = "\n\n", create_dirs: 
 def vault_batch_frontmatter_update(updates: list[dict]) -> str:
     """Batch update frontmatter fields."""
     inp = VaultBatchFrontmatterUpdateInput(updates=updates)
-    return _vault_batch_frontmatter_update(inp.updates)
+    return _run_audited(
+        "vault_batch_frontmatter_update",
+        lambda: _vault_batch_frontmatter_update(inp.updates),
+    )
 
 
 @mcp.tool(
@@ -248,7 +333,10 @@ def vault_search(
 ) -> str:
     """Search vault file contents."""
     inp = VaultSearchInput(query=query, path_prefix=path_prefix, file_pattern=file_pattern, max_results=max_results, context_lines=context_lines)
-    return _vault_search(inp.query, inp.path_prefix, inp.file_pattern, inp.max_results, inp.context_lines)
+    return _run_audited(
+        "vault_search",
+        lambda: _vault_search(inp.query, inp.path_prefix, inp.file_pattern, inp.max_results, inp.context_lines),
+    )
 
 
 @mcp.tool(
@@ -265,7 +353,10 @@ def vault_search_frontmatter(
 ) -> str:
     """Search by frontmatter fields."""
     inp = VaultSearchFrontmatterInput(field=field, value=value, match_type=match_type, path_prefix=path_prefix, max_results=max_results)
-    return _vault_search_frontmatter(inp.field, inp.value, inp.match_type, inp.path_prefix, inp.max_results)
+    return _run_audited(
+        "vault_search_frontmatter",
+        lambda: _vault_search_frontmatter(inp.field, inp.value, inp.match_type, inp.path_prefix, inp.max_results),
+    )
 
 
 @mcp.tool(
@@ -282,7 +373,11 @@ def vault_list(
 ) -> str:
     """List vault directory contents."""
     inp = VaultListInput(path=path, depth=depth, include_files=include_files, include_dirs=include_dirs, pattern=pattern)
-    return _vault_list(inp.path, inp.depth, inp.include_files, inp.include_dirs, inp.pattern)
+    return _run_audited(
+        "vault_list",
+        lambda: _vault_list(inp.path, inp.depth, inp.include_files, inp.include_dirs, inp.pattern),
+        path=inp.path,
+    )
 
 
 @mcp.tool(
@@ -293,7 +388,12 @@ def vault_list(
 def vault_move(source: str, destination: str, create_dirs: bool = True) -> str:
     """Move a file or directory."""
     inp = VaultMoveInput(source=source, destination=destination, create_dirs=create_dirs)
-    return _vault_move(inp.source, inp.destination, inp.create_dirs)
+    return _run_audited(
+        "vault_move",
+        lambda: _vault_move(inp.source, inp.destination, inp.create_dirs),
+        source=inp.source,
+        destination=inp.destination,
+    )
 
 
 @mcp.tool(
@@ -304,7 +404,11 @@ def vault_move(source: str, destination: str, create_dirs: bool = True) -> str:
 def vault_delete(path: str, confirm: bool = False) -> str:
     """Delete a file (move to .trash/)."""
     inp = VaultDeleteInput(path=path, confirm=confirm)
-    return _vault_delete(inp.path, inp.confirm)
+    return _run_audited(
+        "vault_delete",
+        lambda: _vault_delete(inp.path, inp.confirm),
+        path=inp.path,
+    )
 
 
 @mcp.tool(
@@ -315,7 +419,7 @@ def vault_delete(path: str, confirm: bool = False) -> str:
 def vault_canvas_read(path: str) -> str:
     """Read an Obsidian Canvas file."""
     inp = VaultCanvasReadInput(path=path)
-    return _vault_canvas_read(inp.path)
+    return _run_audited("vault_canvas_read", lambda: _vault_canvas_read(inp.path), path=inp.path)
 
 
 @mcp.tool(
@@ -329,7 +433,11 @@ def vault_canvas_read(path: str) -> str:
 def vault_canvas_add_node(path: str, node: dict) -> str:
     """Append a node to a Canvas file."""
     inp = VaultCanvasAddNodeInput(path=path, node=node)
-    return _vault_canvas_add_node(inp.path, inp.node.model_dump(exclude_none=True, mode="json"))
+    return _run_audited(
+        "vault_canvas_add_node",
+        lambda: _vault_canvas_add_node(inp.path, inp.node.model_dump(exclude_none=True, mode="json")),
+        path=inp.path,
+    )
 
 
 @mcp.tool(
@@ -344,7 +452,11 @@ def vault_canvas_add_node(path: str, node: dict) -> str:
 def vault_canvas_add_edge(path: str, edge: dict) -> str:
     """Append an edge to a Canvas file."""
     inp = VaultCanvasAddEdgeInput(path=path, edge=edge)
-    return _vault_canvas_add_edge(inp.path, inp.edge.model_dump(exclude_none=True, mode="json"))
+    return _run_audited(
+        "vault_canvas_add_edge",
+        lambda: _vault_canvas_add_edge(inp.path, inp.edge.model_dump(exclude_none=True, mode="json")),
+        path=inp.path,
+    )
 
 
 @mcp.tool(
@@ -364,7 +476,7 @@ def vault_daily_note_path() -> str:
 )
 def vault_daily_note_read() -> str:
     """Read today's daily note."""
-    return _vault_daily_note_read()
+    return _run_audited("vault_daily_note_read", _vault_daily_note_read)
 
 
 @mcp.tool(
@@ -375,7 +487,10 @@ def vault_daily_note_read() -> str:
 def vault_daily_note_append(content: str) -> str:
     """Append to today's daily note."""
     inp = VaultDailyNoteAppendInput(content=content)
-    return _vault_daily_note_append(inp.content)
+    return _run_audited(
+        "vault_daily_note_append",
+        lambda: _vault_daily_note_append(inp.content),
+    )
 
 
 def build_app(extensions=()):
@@ -391,7 +506,7 @@ def build_app(extensions=()):
     routes are bearer-protected. A route that collides with an auth-exempt path is
     rejected (fail closed) so an extension cannot expose an unauthenticated endpoint.
     """
-    from starlette.responses import Response
+    from starlette.responses import JSONResponse, Response
     from starlette.routing import Route
 
     from .auth import BearerAuthMiddleware
@@ -415,6 +530,13 @@ def build_app(extensions=()):
     # Mount OAuth routes (these are excluded from bearer auth via the middleware)
     for route in oauth_routes:
         app.routes.insert(0, route)
+
+    # Health endpoint (bearer-exempt, see auth._AUTH_EXEMPT_PATHS). Surfaces audit status
+    # so an operator can confirm the log is enabled and being written.
+    async def health(_request):
+        return JSONResponse({"status": "ok", "audit": audit_health_payload()})
+
+    app.routes.insert(0, Route("/health", health, methods=["GET"]))
 
     # Extension routes (e.g. a localhost search endpoint), added before the auth
     # middleware so they are bearer-protected like the MCP transport.
@@ -475,7 +597,6 @@ def build_app(extensions=()):
                     f"extension route {getattr(r, 'path', r)!r} covers auth-exempt "
                     f"{m} {p!r}; it would be served without bearer authentication"
                 )
-
     app.add_middleware(BearerAuthMiddleware)
     return app
 
@@ -514,6 +635,18 @@ def serve(extensions=()):
 
     if not VAULT_MCP_TOKEN:
         logger.warning("VAULT_MCP_TOKEN is not set -- auth will reject all requests")
+
+    # Fail CLOSED on a misconfigured audit log: if auditing is requested but the log path
+    # is not writable, refuse to start rather than silently dropping mutation records.
+    if audit_enabled() and not audit_path_writable():
+        logger.error(f"VAULT_AUDIT_LOG_PATH is not writable: {audit_log_path()}")
+        sys.exit(1)
+    if audit_enabled():
+        logger.info(
+            "Audit log enabled: %s (reads included: %s)",
+            audit_log_path(),
+            VAULT_AUDIT_LOG_INCLUDE_READS,
+        )
 
     # Extension setup: register tools BEFORE the app/tool-schema is built, and let
     # each extension prepare before the frontmatter index starts (e.g. attach a
