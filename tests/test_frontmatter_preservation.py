@@ -39,7 +39,7 @@ def test_merge_aborts_on_malformed_existing_frontmatter(vault_dir):
     result = json.loads(vault_write(path, "---\nstatus: draft\n---\nbody\n",
                                     create_dirs=True, merge_frontmatter=True))
 
-    assert result["written"] is False
+    assert result["created"] is False
     assert "malformed" in result["error"].lower()
     # File is unchanged -- no silent data loss.
     assert (config.VAULT_PATH / path).read_text() == original
@@ -54,7 +54,7 @@ def test_merge_aborts_on_malformed_new_frontmatter(vault_dir):
     result = json.loads(vault_write(path, "---\nstatus: [unclosed\n---\nbody\n",
                                     create_dirs=True, merge_frontmatter=True))
 
-    assert result["written"] is False
+    assert result["created"] is False
     assert (config.VAULT_PATH / path).read_text() == original
 
 

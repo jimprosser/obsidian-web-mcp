@@ -40,7 +40,7 @@ def vault_write(path: str, content: str, create_dirs: bool = True, merge_frontma
                 return dumps({
                     "error": f"Frontmatter merge aborted: malformed YAML frontmatter ({e})",
                     "path": path,
-                    "written": False,
+                    "created": False,
                 })
 
         is_new, size = write_file_atomic(path, content, create_dirs=create_dirs)
