@@ -196,3 +196,63 @@ def test_loads_no_delimiters_still_returns_empty():
     metadata, body = frontmatter_io.loads(content)
     assert metadata == {}
     assert body == content
+
+
+def test_loads_inline_triple_dash_in_value_does_not_close_block():
+    """A scalar value containing '---' must not be read as the closing fence."""
+    content = "---\nsummary: alpha --- beta\nstatus: active\n---\nbody\n"
+    metadata, body = frontmatter_io.loads(content)
+    assert metadata["summary"] == "alpha --- beta"
+    assert metadata["status"] == "active"  # not dropped into the body
+    assert body == "body\n"
+
+
+def test_loads_literal_block_with_indented_triple_dash_not_truncated():
+    """An indented '---' inside a literal block is content, not the closing fence."""
+    content = (
+        "---\n"
+        "description: |\n"
+        "  line one\n"
+        "  ---\n"
+        "  line three\n"
+        "status: active\n"
+        "---\n"
+        "body\n"
+    )
+    metadata, body = frontmatter_io.loads(content)
+    assert "---" in metadata["description"]
+    assert "line three" in metadata["description"]
+    assert metadata["status"] == "active"  # key after the block survives
+    assert body == "body\n"
+
+
+def test_loads_strips_leading_bom_and_detects_frontmatter():
+    """A UTF-8 BOM before the opening '---' must not hide the frontmatter."""
+    content = "﻿---\ntitle: kept\n---\nbody\n"
+    metadata, body = frontmatter_io.loads(content)
+    assert metadata["title"] == "kept"  # frontmatter seen, not treated as absent
+    assert body == "body\n"
+
+
+def test_loads_opening_without_closing_delimiter_fails_closed():
+    """An opening '---' with no closing fence raises rather than silently misreading."""
+    content = "---\ntitle: no close\nstill: frontmatter\n"
+    with pytest.raises(YAMLError):
+        frontmatter_io.loads(content)
+
+
+def test_update_existing_quoted_value_keeps_quote_style():
+    """Overwriting an existing key's value retains that key's original quote style."""
+    metadata, body = frontmatter_io.loads("---\nstatus: 'active'\npriority: 1\n---\nx\n")
+    metadata["status"] = "draft"
+    out = frontmatter_io.dumps(metadata, body)
+    assert "status: 'draft'" in out   # value changed, single-quote slot kept
+    assert "priority: 1" in out
+
+
+def test_roundtrip_crlf_frontmatter_empty_body():
+    """CRLF frontmatter with no body round-trips byte-identically (newline from frontmatter)."""
+    content = "---\r\ntitle: hello\r\n---\r\n"
+    metadata, body = frontmatter_io.loads(content)
+    out = frontmatter_io.dumps(metadata, body)
+    assert out == content
