@@ -5,6 +5,7 @@ import logging
 
 import frontmatter
 
+from ..models import normalize_edit_aliases
 from ..serialization import dumps
 from ..vault import resolve_vault_path, read_file, write_file_atomic
 
@@ -53,15 +54,148 @@ def _unified_diff(path: str, before: str, after: str) -> str:
     ))
 
 
-def _normalize_edit_aliases(edit: dict) -> tuple[dict | None, str | None]:
-    normalized = dict(edit)
-    for canonical, alias in (("old_text", "old_str"), ("new_text", "new_str")):
-        if canonical in normalized and alias in normalized:
-            return None, f"Use either '{canonical}' or '{alias}', not both"
-        if alias in normalized:
-            normalized[canonical] = normalized.pop(alias)
+# A near-miss hint is only emitted when the closest line shares at least this
+# fraction of old_text. Below it the "hint" is noise (unrelated input, blank
+# lines) and would mislead more than help.
+_NEAR_MISS_MIN_SIMILARITY = 0.5
 
-    return normalized, None
+# A near-miss is a typo-scale hint, so an old_text larger than this is never a
+# plausible single-line match. It is also the input that pinned the CPU: the
+# per-line SequenceMatcher over a ~1 MB high-entropy old_text on a zero-match
+# edit did not return in minutes (an authenticated DoS, since old_text is bounded
+# only by the per-edit size limit). Skip the scan above this size.
+_NEAR_MISS_MAX_OLD_TEXT = 1024
+
+# The per-line SequenceMatcher cost grows with len(old_text) * len(line), so even
+# a capped old_text (e.g. 1 KB) against a large many-line file still pins the CPU
+# (~15 s for a 1 MB / 25k-line file, and the edited file's size is not otherwise
+# bounded). Stop scanning once the cumulative work crosses this budget; the
+# near-miss is a best-effort hint, so a partial scan is an acceptable trade for
+# the safety. len(old_text)*len(line) is an order-of-magnitude proxy, not exact
+# (difflib's constant factor is worse for low-alphabet, autojunk-disabled lines),
+# so the budget is sized to keep even an adversarial file under ~1 s, well below
+# the per-edit timeout. Typo-scale old_text (small) still scans thousands of
+# lines, so normal notes are covered in full.
+_NEAR_MISS_WORK_BUDGET = 10_000_000
+
+
+def _normalize_edit_aliases(edit: dict) -> tuple[dict | None, str | None]:
+    """Apply the shared alias normalization, returning (normalized, error).
+
+    This guards the direct-dict callers of vault_edit (tests, internal use).
+    The MCP path is already canonicalized: server.py validates each edit as a
+    VaultEditOperationInput and passes model_dump() output, so this is a no-op
+    there rather than dead code.
+    """
+    try:
+        return normalize_edit_aliases(edit), None
+    except ValueError as exc:
+        return None, str(exc)
+
+
+def _find_near_miss(content: str, old_text: str) -> dict | None:
+    """Return the document line closest to old_text for a zero-match edit.
+
+    Line-scoped: one SequenceMatcher pass per line, so work grows with file
+    size rather than quadratically across lines (for a fixed old_text). The
+    similarity is the fraction of old_text matched on the closest line, which
+    separates a one-character typo (high) from text that is simply absent
+    (low). Returns None when the best line is below the similarity floor, so
+    unrelated input produces no misleading hint, and skips the scan entirely
+    for an old_text larger than _NEAR_MISS_MAX_OLD_TEXT (not a plausible
+    single-line near-miss, and the input that made the scan a CPU DoS). A
+    cumulative work budget (_NEAR_MISS_WORK_BUDGET) bounds the scan on very
+    large files, so the hint is best-effort there rather than unbounded.
+    """
+    if not old_text or len(old_text) > _NEAR_MISS_MAX_OLD_TEXT:
+        return None
+
+    lines = content.splitlines()
+    if not lines:
+        return None
+
+    matcher = difflib.SequenceMatcher(a=old_text)
+    best_similarity, best_index = 0.0, 0
+    budget = _NEAR_MISS_WORK_BUDGET
+    for index, line in enumerate(lines):
+        budget -= len(old_text) * (len(line) + 1)
+        if budget < 0:
+            # Cumulative work budget spent (huge file / very many lines): stop
+            # scanning and report the best line found so far rather than pin CPU.
+            break
+        matcher.set_seq2(line)
+        matched = sum(block.size for block in matcher.get_matching_blocks())
+        similarity = matched / len(old_text)
+        if similarity > best_similarity:
+            best_similarity, best_index = similarity, index
+
+    if best_similarity < _NEAR_MISS_MIN_SIMILARITY:
+        return None
+
+    return {
+        "line_number": best_index + 1,
+        "line": lines[best_index],
+        "similarity": round(best_similarity, 2),
+    }
+
+
+def _dry_run_report(path: str, original_content: str, normalized_edits: list[dict]) -> str:
+    """Preview edits without writing, simulating the sequential apply.
+
+    Each old_text is counted against the running document the preceding edits
+    would have produced (not the original), so the preview predicts the
+    in-order apply exactly: a chained set whose first edit's new_text feeds or
+    duplicates a later edit's old_text is reported as it will actually apply.
+
+    Unlike the apply path this does not fail fast: every edit's match count
+    (0, 1, or many) is reported so one response surfaces all mismatches. An
+    edit that does not match exactly once is left unapplied in the simulation
+    and flips the result to not-applicable. When every edit matches exactly
+    once the running document is the applied result, so its diff is included.
+    """
+    match_counts = []
+    all_unique = True
+    preview = original_content
+    for index, edit in enumerate(normalized_edits):
+        old_text = edit.get("old_text", "")
+        entry = {"index": index}
+        if not old_text:
+            entry["count"] = 0
+            entry["error"] = "no old_text to match"
+            all_unique = False
+            match_counts.append(entry)
+            continue
+        count = preview.count(old_text)
+        entry["count"] = count
+        if count == 0:
+            near_miss = _find_near_miss(preview, old_text)
+            if near_miss:
+                entry["near_miss"] = near_miss
+        if count != 1:
+            all_unique = False
+            match_counts.append(entry)
+            continue
+        # Exactly one match: fold it into the running document so the next
+        # edit is validated against the same state the real apply would see.
+        preview = preview.replace(old_text, edit.get("new_text", ""), 1)
+        match_counts.append(entry)
+
+    if all_unique:
+        diff = _unified_diff(path, original_content, preview)
+        size = len(preview.encode("utf-8"))
+    else:
+        diff = ""
+        size = len(original_content.encode("utf-8"))
+
+    return dumps({
+        "path": path,
+        "changed": False,
+        "dry_run": True,
+        "diff": diff,
+        "match_counts": match_counts,
+        "edits_applied": len(normalized_edits) if all_unique else 0,
+        "size": size,
+    })
 
 
 def vault_edit(path: str, edits: list[dict], dry_run: bool = False) -> str:
@@ -70,6 +204,8 @@ def vault_edit(path: str, edits: list[dict], dry_run: bool = False) -> str:
         content, _ = read_file(path)
         original_content = content
 
+        # Normalize aliases up front; an alias conflict fails fast in either mode.
+        normalized_edits = []
         for index, edit in enumerate(edits):
             normalized_edit, alias_error = _normalize_edit_aliases(edit)
             if alias_error:
@@ -82,13 +218,32 @@ def vault_edit(path: str, edits: list[dict], dry_run: bool = False) -> str:
                     "edits_applied": 0,
                     "size": len(original_content.encode("utf-8")),
                 })
+            normalized_edits.append(normalized_edit)
 
+        if dry_run:
+            return _dry_run_report(path, original_content, normalized_edits)
+
+        for index, normalized_edit in enumerate(normalized_edits):
             old_text = normalized_edit.get("old_text", "")
             new_text = normalized_edit.get("new_text", "")
+
+            if not old_text:
+                # An empty old_text would make content.count() report a phantom
+                # match for every position; reject it as the malformed edit it is.
+                return dumps({
+                    "error": f"Edit {index} has no old_text to match",
+                    "path": path,
+                    "changed": False,
+                    "dry_run": dry_run,
+                    "diff": "",
+                    "edits_applied": 0,
+                    "size": len(original_content.encode("utf-8")),
+                })
+
             count = content.count(old_text)
 
             if count != 1:
-                return dumps({
+                payload = {
                     "error": (
                         f"Edit {index} old_text must match exactly once; "
                         f"found {count} matches"
@@ -99,22 +254,17 @@ def vault_edit(path: str, edits: list[dict], dry_run: bool = False) -> str:
                     "diff": "",
                     "edits_applied": 0,
                     "size": len(original_content.encode("utf-8")),
-                })
+                }
+                if count == 0:
+                    near_miss = _find_near_miss(content, old_text)
+                    if near_miss:
+                        payload["near_miss"] = near_miss
+                return dumps(payload)
 
             content = content.replace(old_text, new_text, 1)
 
         diff = _unified_diff(path, original_content, content)
         size = len(content.encode("utf-8"))
-
-        if dry_run:
-            return dumps({
-                "path": path,
-                "changed": False,
-                "dry_run": True,
-                "diff": diff,
-                "edits_applied": len(edits),
-                "size": size,
-            })
 
         changed = content != original_content
         if changed:
