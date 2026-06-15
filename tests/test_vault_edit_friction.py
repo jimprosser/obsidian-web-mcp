@@ -4,8 +4,8 @@ P0: expose the per-edit field schema (old_text/new_text) on the MCP tool,
     accept old/new aliases in addition to old_str/new_str, and share one
     alias-normalization implementation between the model and the tool.
 P1: near-miss diagnostics when old_text matches zero times.
-P2: dry_run reports each edit's match count against the original document
-    instead of failing fast at the first non-unique match.
+P2: dry_run reports each edit's match count against the running document the
+    in-order apply produces, surfacing all mismatches instead of failing fast.
 """
 
 import asyncio
@@ -16,8 +16,10 @@ import random
 import time
 
 import pytest
+from pydantic import ValidationError
 
 import obsidian_vault_mcp.tools.write as write_mod
+from obsidian_vault_mcp import server
 from obsidian_vault_mcp.models import VaultEditOperationInput
 from obsidian_vault_mcp.server import mcp
 from obsidian_vault_mcp.tools.write import vault_edit
@@ -156,7 +158,7 @@ def test_vault_edit_missing_old_text_reports_explicit_error(vault_dir):
     assert (vault_dir / "test-note.md").read_text() == before
 
 
-# --- P2: dry_run aggregates match counts against the original ----------------
+# --- P2: dry_run aggregates match counts, simulating the in-order apply ------
 
 def test_vault_edit_dry_run_aggregates_all_match_counts(vault_dir):
     """dry_run reports every edit's match count instead of failing at the first."""
@@ -213,25 +215,63 @@ def test_vault_edit_dry_run_accepts_old_new_aliases(vault_dir):
     assert "error" not in result
 
 
-def test_vault_edit_dry_run_counts_against_original_not_sequential(vault_dir):
-    """Each count is measured on the original document, independent of order."""
-    # Two edits whose old_text both exist in the original; first edit's
-    # replacement must not change the second edit's reported count.
+def test_vault_edit_dry_run_reflects_sequential_state_not_original(vault_dir):
+    """Each count is measured on the running doc the apply would see, in order.
+
+    After the first edit rewrites "beta" to "alpha", the second edit's old_text
+    "alpha beta alpha" no longer exists, so a real apply fails on it. dry_run
+    must report that (count 0), matching the sequential apply rather than the
+    original document.
+    """
     (vault_dir / "test-note.md").write_text(
         "---\nstatus: active\n---\n\nalpha beta alpha\n"
     )
-    result = json.loads(vault_edit(
-        "test-note.md",
-        [
-            {"old_text": "beta", "new_text": "alpha"},  # would add an alpha if applied
-            {"old_text": "alpha beta alpha", "new_text": "x"},  # 1 in original
-        ],
-        dry_run=True,
-    ))
+    edits = [
+        {"old_text": "beta", "new_text": "alpha"},          # consumes the "beta"
+        {"old_text": "alpha beta alpha", "new_text": "x"},  # gone after edit 0
+    ]
+    dry = json.loads(vault_edit("test-note.md", edits, dry_run=True))
 
-    matches = result["match_counts"]
+    matches = dry["match_counts"]
     assert matches[0]["count"] == 1
-    assert matches[1]["count"] == 1
+    assert matches[1]["count"] == 0  # the first edit removed it from the running doc
+    assert dry["edits_applied"] == 0
+    assert dry["diff"] == ""
+
+    # Parity: the real apply must fail and write nothing, exactly as predicted.
+    before = (vault_dir / "test-note.md").read_text()
+    applied = json.loads(vault_edit("test-note.md", edits, dry_run=False))
+    assert "error" in applied
+    assert applied["changed"] is False
+    assert (vault_dir / "test-note.md").read_text() == before
+
+
+def test_vault_edit_dry_run_predicts_chained_duplicate_apply_failure(vault_dir):
+    """A chained edit set that previews unique-against-original but fails on apply.
+
+    Counted against the original both old_texts are unique, so the buggy preview
+    reported success. Applied in order, the first edit's new_text introduces a
+    second occurrence of the second edit's old_text, so apply finds two matches
+    and fails. dry_run must predict the failure instead of previewing success.
+    """
+    (vault_dir / "test-note.md").write_text("one two\n")
+    edits = [
+        {"old_text": "one", "new_text": "one two"},  # introduces a 2nd "two"
+        {"old_text": "two", "new_text": "TWO"},       # now matches twice on apply
+    ]
+
+    dry = json.loads(vault_edit("test-note.md", edits, dry_run=True))
+    assert dry["match_counts"][0]["count"] == 1
+    assert dry["match_counts"][1]["count"] == 2  # the duplicate edit 0 creates
+    assert dry["edits_applied"] == 0
+    assert dry["diff"] == ""
+
+    # Parity: the real apply must fail and write nothing.
+    before = (vault_dir / "test-note.md").read_text()
+    applied = json.loads(vault_edit("test-note.md", edits, dry_run=False))
+    assert "error" in applied
+    assert applied["changed"] is False
+    assert (vault_dir / "test-note.md").read_text() == before
 
 
 def test_vault_edit_apply_still_fails_fast_on_non_unique(vault_dir):
@@ -299,3 +339,73 @@ def test_near_miss_low_alphabet_lines_stay_bounded():
     write_mod._find_near_miss(content, old)
     elapsed = time.monotonic() - start
     assert elapsed < 5.0, f"low-alphabet near-miss took {elapsed:.1f}s; budget too loose"
+
+
+# --- wrapper-level coverage through the registered server.vault_edit ----------
+# The MCP-facing entry point has a different failure contract from the direct
+# call: malformed edits (empty old_text, alias conflicts) are rejected by the
+# input model BEFORE the write tool runs, while a well-formed edit that simply
+# does not match returns a JSON error and writes nothing.
+
+def test_server_vault_edit_accepts_old_new_aliases(vault_dir):
+    """The registered tool normalizes old/new aliases and applies the edit."""
+    result = json.loads(server.vault_edit(
+        "test-note.md",
+        [{"old": "some content", "new": "more focused content"}],
+    ))
+    assert "error" not in result
+    assert result["changed"] is True
+    assert "more focused content" in (vault_dir / "test-note.md").read_text()
+
+
+def test_server_vault_edit_rejects_conflicting_aliases(vault_dir):
+    """A canonical field plus its alias is rejected by the input model; file untouched."""
+    before = (vault_dir / "test-note.md").read_text()
+    with pytest.raises(ValidationError):
+        server.vault_edit(
+            "test-note.md",
+            [{"old_text": "some content", "old": "some content", "new_text": "x"}],
+        )
+    assert (vault_dir / "test-note.md").read_text() == before
+
+
+def test_server_vault_edit_rejects_empty_old_text(vault_dir):
+    """Empty old_text is rejected by the model (min_length=1) before any write.
+
+    An empty old_text would otherwise count as a phantom match at every position;
+    the registered tool's schema refuses it outright so the data-loss path is
+    never reached through the MCP entry point.
+    """
+    before = (vault_dir / "test-note.md").read_text()
+    with pytest.raises(ValidationError):
+        server.vault_edit("test-note.md", [{"old_text": "", "new_text": "x"}])
+    assert (vault_dir / "test-note.md").read_text() == before
+
+
+def test_server_vault_edit_leaves_file_unchanged_on_non_matching_edit(vault_dir):
+    """A well-formed edit that matches zero times returns an error and writes nothing."""
+    before = (vault_dir / "test-note.md").read_text()
+    result = json.loads(server.vault_edit(
+        "test-note.md",
+        [{"old_text": "does-not-exist", "new_text": "x"}],
+    ))
+    assert "error" in result
+    assert result["changed"] is False
+    assert (vault_dir / "test-note.md").read_text() == before
+
+
+def test_server_vault_edit_is_atomic_when_a_later_edit_fails(vault_dir):
+    """If any edit in the set fails, an earlier matching edit is not partially written."""
+    before = (vault_dir / "test-note.md").read_text()
+    result = json.loads(server.vault_edit(
+        "test-note.md",
+        [
+            {"old_text": "some content", "new_text": "REPLACED"},  # matches once
+            {"old_text": "does-not-exist", "new_text": "x"},        # fails
+        ],
+    ))
+    assert "error" in result
+    assert result["changed"] is False
+    after = (vault_dir / "test-note.md").read_text()
+    assert after == before
+    assert "REPLACED" not in after

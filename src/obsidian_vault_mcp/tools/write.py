@@ -140,19 +140,22 @@ def _find_near_miss(content: str, old_text: str) -> dict | None:
 
 
 def _dry_run_report(path: str, original_content: str, normalized_edits: list[dict]) -> str:
-    """Preview edits without writing, counting each old_text against the original.
+    """Preview edits without writing, simulating the sequential apply.
+
+    Each old_text is counted against the running document the preceding edits
+    would have produced (not the original), so the preview predicts the
+    in-order apply exactly: a chained set whose first edit's new_text feeds or
+    duplicates a later edit's old_text is reported as it will actually apply.
 
     Unlike the apply path this does not fail fast: every edit's match count
-    (0, 1, or many) is reported so one response surfaces all mismatches. When
-    every edit matches exactly once the sequential diff preview is included too.
-
-    Counts are measured independently against the original document, so for
-    chained edits (one edit's new_text feeds another's old_text) this preview
-    will not predict the sequential apply outcome; the apply path's fail-fast
-    is the safety net there.
+    (0, 1, or many) is reported so one response surfaces all mismatches. An
+    edit that does not match exactly once is left unapplied in the simulation
+    and flips the result to not-applicable. When every edit matches exactly
+    once the running document is the applied result, so its diff is included.
     """
     match_counts = []
     all_unique = True
+    preview = original_content
     for index, edit in enumerate(normalized_edits):
         old_text = edit.get("old_text", "")
         entry = {"index": index}
@@ -162,20 +165,22 @@ def _dry_run_report(path: str, original_content: str, normalized_edits: list[dic
             all_unique = False
             match_counts.append(entry)
             continue
-        count = original_content.count(old_text)
+        count = preview.count(old_text)
         entry["count"] = count
         if count == 0:
-            near_miss = _find_near_miss(original_content, old_text)
+            near_miss = _find_near_miss(preview, old_text)
             if near_miss:
                 entry["near_miss"] = near_miss
         if count != 1:
             all_unique = False
+            match_counts.append(entry)
+            continue
+        # Exactly one match: fold it into the running document so the next
+        # edit is validated against the same state the real apply would see.
+        preview = preview.replace(old_text, edit.get("new_text", ""), 1)
         match_counts.append(entry)
 
     if all_unique:
-        preview = original_content
-        for edit in normalized_edits:
-            preview = preview.replace(edit.get("old_text", ""), edit.get("new_text", ""), 1)
         diff = _unified_diff(path, original_content, preview)
         size = len(preview.encode("utf-8"))
     else:
