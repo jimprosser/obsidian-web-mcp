@@ -52,6 +52,14 @@ def read_file(relative_path: str) -> tuple[str, dict]:
         raise FileNotFoundError(f"Not a file: {relative_path}")
 
     stat = path.stat()
+    # A hardlink inside the vault to a file outside it is a real directory entry
+    # that resolve_vault_path's containment check cannot catch (there is no link
+    # to follow), so reading it would leak outside content. Refuse any file with
+    # extra links, fail closed; legitimate in-vault hardlinks are unsupported.
+    if stat.st_nlink > 1:
+        raise ValueError(
+            "Refusing to read a hardlinked file; in-vault hardlinks are not supported"
+        )
     content = path.read_text(encoding="utf-8")
 
     metadata = {

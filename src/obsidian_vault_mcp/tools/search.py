@@ -8,6 +8,11 @@ import shutil
 import subprocess
 from pathlib import Path
 
+try:
+    import fcntl  # POSIX only; used for the fd->path re-validation below
+except ImportError:  # pragma: no cover - Windows
+    fcntl = None
+
 import frontmatter
 
 from .. import config
@@ -110,34 +115,68 @@ def _open_in_vault_nofollow(vault_root: Path, rel_path: str) -> int:
         os.close(dir_fd)
 
 
-def _read_vault_file_lines(rel_path: str) -> list[str] | None:
-    """Re-read a ripgrep-matched vault file for context, refusing unsafe reads.
+def _fd_resolves_inside_vault(fd: int, vault_root: Path) -> bool:
+    """Re-validate that an opened fd refers to a path inside the vault root.
 
-    rel_path is the match's path relative to the vault root (already validated as
-    lexically inside it by the caller). Returns the file's lines (per
-    _split_lines), or None if the file cannot be read safely, in which case the
-    caller degrades to ripgrep's matched line.
-
-    Two guards, because ripgrep reports the path from a separate process and we
-    open it later:
-      * Symlinks are never followed below the vault root (see
-        _open_in_vault_nofollow), so a matched note that is, or sits under, a
-        symlink pointing out of the vault cannot leak outside content, even if
-        the symlink is swapped in concurrently.
-      * The size cap bounds memory: the file is read in full to slice context, so
-        without a limit a few huge notes (or a broad query) could spike memory
-        despite the result cap. Oversized files degrade to the matched line.
-
-    Not caught here: a hardlink inside the vault to an outside file (a hardlink is
-    a real directory entry, indistinguishable from a normal file). That is a
-    pre-existing, vault-wide exposure shared with vault.read_file, not specific to
-    search.
+    Independent of the name used to open it, via the OS fd->path facility
+    (F_GETPATH on macOS, /proc/self/fd on Linux). This is defense in depth behind
+    the openat O_NOFOLLOW walk: if neither facility exists the openat chain and
+    the resolve_vault_path gate are already the guarantee, so this returns True
+    rather than failing closed where it cannot look the path up.
     """
+    real = None
+    if fcntl is not None and hasattr(fcntl, "F_GETPATH"):
+        try:
+            buf = fcntl.fcntl(fd, fcntl.F_GETPATH, b"\x00" * 1024)
+            real = os.fsdecode(buf.split(b"\x00", 1)[0])
+        except OSError:
+            real = None
+    if real is None:
+        try:
+            real = os.readlink(f"/proc/self/fd/{fd}")
+        except OSError:
+            return True  # no fd->path lookup on this platform; rely on openat + gate
+    real = os.path.realpath(real)
+    root = os.path.realpath(str(vault_root))
+    return real == root or real.startswith(root + os.sep)
+
+
+def _safe_read_vault_bytes(rel_path: str, *, max_bytes: int | None = None) -> bytes | None:
+    """Read a vault file's bytes, refusing unsafe reads (fail closed -> None).
+
+    Shared by every path that reads a vault file off a name reported elsewhere:
+    the ripgrep context re-read, the Python search fallback, and the per-result
+    frontmatter excerpt. Guards, in order:
+      * lexical: resolve_vault_path rejects null bytes, dotfile components, ".."
+        traversal, and any target that resolves outside the vault root. openat
+        with O_NOFOLLOW does NOT stop a ".." component (a real directory entry
+        that walks up out of the vault), so this gate is what closes that escape.
+      * symlink: each component below the root is opened O_NOFOLLOW via openat
+        (see _open_in_vault_nofollow), so a symlink anywhere (final or
+        intermediate, even swapped in concurrently) is refused, not followed.
+      * resolved target: the opened fd is re-validated as inside the vault via
+        the OS fd->path facility (see _fd_resolves_inside_vault), defense in
+        depth behind the openat walk.
+      * hardlink: a file with st_nlink > 1 is refused, because an in-vault
+        hardlink to an outside file is a real directory entry the path and
+        symlink checks cannot tell from a normal note (issue #53). Legitimate
+        in-vault hardlinks are unsupported as a result.
+      * size: when max_bytes is set, a larger file is refused to bound memory.
+    """
+    try:
+        resolve_vault_path(rel_path)
+    except ValueError:
+        return None
     try:
         fd = _open_in_vault_nofollow(config.VAULT_PATH, rel_path)
         try:
-            if os.fstat(fd).st_size > config.MAX_SEARCH_REREAD_BYTES:
-                raise OSError("matched file too large to re-read for context")
+            if not _fd_resolves_inside_vault(fd, config.VAULT_PATH):
+                raise OSError("opened file resolves outside the vault")
+            st = os.fstat(fd)
+            if st.st_nlink > 1:
+                raise OSError("refusing hardlinked file; in-vault hardlinks unsupported")
+            if max_bytes is not None and st.st_size > max_bytes:
+                raise OSError("file too large to read safely")
             chunks = []
             while True:
                 block = os.read(fd, 65536)
@@ -146,17 +185,29 @@ def _read_vault_file_lines(rel_path: str) -> list[str] | None:
                 chunks.append(block)
         finally:
             os.close(fd)
+        return b"".join(chunks)
+    except OSError as exc:
+        logger.warning("vault_search: refusing unsafe read of %s (%s)", rel_path, exc)
+        return None
 
+
+def _read_vault_file_lines(rel_path: str) -> list[str] | None:
+    """Re-read a ripgrep-matched vault file for context, refusing unsafe reads.
+
+    rel_path is the match's path relative to the vault root. Returns the file's
+    lines (per _split_lines), or None if the file cannot be read safely, in which
+    case the caller degrades to ripgrep's matched line. See _safe_read_vault_bytes
+    for the symlink / parent-traversal / hardlink guards; the size cap matters
+    here because the whole file is read to slice context.
+    """
+    raw = _safe_read_vault_bytes(rel_path, max_bytes=config.MAX_SEARCH_REREAD_BYTES)
+    if raw is None:
+        return None
+    try:
         # read_bytes-equivalent, not read_text: text mode translates lone "\r"
         # to "\n", which would desync _split_lines from rg's line count.
-        return _split_lines(b"".join(chunks).decode("utf-8"))
-    except (OSError, UnicodeDecodeError, ValueError) as exc:
-        logger.warning(
-            "vault_search: could not safely re-read %s for context, "
-            "falling back to matched line only (%s)",
-            rel_path,
-            exc,
-        )
+        return _split_lines(raw.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
         return None
 
 
@@ -266,20 +317,28 @@ def _search_python(
             continue
 
         try:
+            rel_path = str(file_path.relative_to(config.VAULT_PATH))
+        except ValueError:
+            continue
+
+        # Same safe-read as the ripgrep backend: refuse a symlink out of the
+        # vault and an in-vault hardlink to an outside file, so the fallback
+        # cannot leak content the ripgrep path would not. No size cap here:
+        # unlike the context re-read this read IS the search, and capping it
+        # would silently drop matches in large files.
+        raw = _safe_read_vault_bytes(rel_path)
+        if raw is None:
+            continue
+        try:
             # read_bytes, not read_text: avoid universal-newline translation so
             # _split_lines counts lines the same way as the ripgrep backend.
-            content = file_path.read_bytes().decode("utf-8")
-        except (OSError, UnicodeDecodeError):
+            content = raw.decode("utf-8")
+        except UnicodeDecodeError:
             continue
 
         lines = _split_lines(content)
         for i, line in enumerate(lines):
             if query_lower in line.lower():
-                try:
-                    rel_path = str(file_path.relative_to(config.VAULT_PATH))
-                except ValueError:
-                    continue
-
                 matches.append({
                     "path": rel_path,
                     "line_number": i + 1,
@@ -293,10 +352,21 @@ def _search_python(
 
 
 def _get_frontmatter_excerpt(file_path: Path, max_keys: int = 3) -> dict | None:
-    """Read frontmatter from a file, returning first N key-value pairs."""
+    """Read frontmatter from a vault file, returning first N key-value pairs.
+
+    Uses the same safe-read as the search backends (see _safe_read_vault_bytes)
+    so attaching an excerpt to a result cannot follow a symlink out of the vault
+    or read an in-vault hardlink to an outside file (issue #53).
+    """
     try:
-        content = file_path.read_text(encoding="utf-8")
-        post = frontmatter.loads(content)
+        rel_path = str(file_path.relative_to(config.VAULT_PATH))
+    except ValueError:
+        return None
+    raw = _safe_read_vault_bytes(rel_path, max_bytes=config.MAX_SEARCH_REREAD_BYTES)
+    if raw is None:
+        return None
+    try:
+        post = frontmatter.loads(raw.decode("utf-8"))
         if not post.metadata:
             return None
         keys = list(post.metadata.keys())[:max_keys]

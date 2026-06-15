@@ -431,3 +431,135 @@ def test_ripgrep_stale_line_number_degrades_to_matched_line(monkeypatch, vault_d
     )
     assert len(results) == 1
     assert results[0]["match_context"] == "the matched line"
+
+
+# --- context re-read: parent-traversal and hardlink refusal (#39 / #53) --------
+#
+# openat O_NOFOLLOW refuses symlinks but not ".." (a real directory entry that
+# walks up out of the vault), and it cannot distinguish an in-vault hardlink to
+# an outside file from a normal note. Both re-read targets must be refused; every
+# vault read path (ripgrep re-read, Python fallback, frontmatter excerpt) is
+# hardened the same way and degrades fail-closed.
+
+
+def test_reread_refuses_parent_directory_traversal(vault_dir, tmp_path):
+    """A re-read target that escapes via '..' is refused (gated through
+    resolve_vault_path), since O_NOFOLLOW does not stop a '..' component."""
+    secret = tmp_path / "secret.md"  # sibling of vault_dir (tmp_path/test-vault)
+    secret.write_text("SECRET x\nSECRET y\n")
+    assert search_mod._read_vault_file_lines("../secret.md") is None
+
+
+def test_reread_refuses_hardlink_to_outside_file(vault_dir, tmp_path):
+    """An in-vault hardlink to an outside file (st_nlink > 1) is refused fail-closed
+    so context cannot widen a hardlink leak. (issue #53)"""
+    secret = tmp_path / "secret.txt"
+    secret.write_text("SECRET 0\nSECRET 1\nSECRET 2\n")
+    os.link(secret, vault_dir / "evil.md")  # st_nlink == 2, same inode
+    assert search_mod._read_vault_file_lines("evil.md") is None
+
+
+def test_reread_reads_normal_single_link_file(vault_dir):
+    """A normal note (st_nlink == 1) is still read; the hardlink guard must not
+    refuse ordinary files."""
+    (vault_dir / "plain.md").write_text("a\nb\nc\n")
+    assert search_mod._read_vault_file_lines("plain.md") == ["a", "b", "c"]
+
+
+def test_ripgrep_reread_refuses_hardlinked_match(monkeypatch, vault_dir, tmp_path):
+    """End-to-end: a hardlinked match degrades to rg's matched line, no context leak."""
+    secret = tmp_path / "secret.txt"
+    secret.write_text("SECRET above\nSECRET hit\nSECRET below\n")
+    os.link(secret, vault_dir / "evil.md")
+    monkeypatch.setattr(
+        search_mod.subprocess,
+        "run",
+        lambda *a, **k: SimpleNamespace(
+            stdout=_rg_match_json(vault_dir / "evil.md", 2, "decoy match\n")
+        ),
+    )
+    results = search_mod._search_ripgrep(
+        "x", vault_dir, file_pattern="*.md", max_results=10, context_lines=2
+    )
+    assert len(results) == 1
+    ctx = results[0]["match_context"]
+    assert "SECRET" not in ctx, f"hardlink re-read leaked outside content: {ctx}"
+    assert ctx == "decoy match"
+
+
+def test_python_backend_does_not_follow_symlink_to_outside(monkeypatch, vault_dir, tmp_path):
+    """The Python fallback re-reads matched files too; it must not follow a symlink
+    out of the vault."""
+    secret = tmp_path / "secret.txt"
+    secret.write_text("SECRET alpha\n")
+    (vault_dir / "evil.md").symlink_to(secret)
+    _force_backend(monkeypatch, "python")
+    results = json.loads(vault_search("SECRET", file_pattern="*.md"))["results"]
+    assert all(r["path"] != "evil.md" for r in results)
+    assert all("SECRET" not in r["match_context"] for r in results)
+
+
+def test_python_backend_refuses_hardlink_to_outside(monkeypatch, vault_dir, tmp_path):
+    """The Python fallback refuses an in-vault hardlink to an outside file (#53)."""
+    secret = tmp_path / "secret.txt"
+    secret.write_text("SECRET beta\n")
+    os.link(secret, vault_dir / "evil.md")
+    _force_backend(monkeypatch, "python")
+    results = json.loads(vault_search("SECRET", file_pattern="*.md"))["results"]
+    assert all(r["path"] != "evil.md" for r in results)
+    assert all("SECRET" not in r["match_context"] for r in results)
+
+
+def test_frontmatter_excerpt_refuses_symlink_to_outside(vault_dir, tmp_path):
+    """The per-result frontmatter excerpt must not follow a symlink out of the vault."""
+    secret = tmp_path / "secret.md"
+    secret.write_text("---\nsecret_key: leaked\n---\nbody\n")
+    (vault_dir / "evil.md").symlink_to(secret)
+    assert search_mod._get_frontmatter_excerpt(vault_dir / "evil.md") is None
+
+
+def test_frontmatter_excerpt_refuses_hardlink_to_outside(vault_dir, tmp_path):
+    """The frontmatter excerpt refuses an in-vault hardlink to an outside file (#53)."""
+    secret = tmp_path / "secret.md"
+    secret.write_text("---\nsecret_key: leaked\n---\nbody\n")
+    os.link(secret, vault_dir / "evil.md")
+    assert search_mod._get_frontmatter_excerpt(vault_dir / "evil.md") is None
+
+
+def test_frontmatter_excerpt_reads_normal_file(vault_dir):
+    """A normal note's frontmatter is still returned; the guards must not refuse it."""
+    (vault_dir / "fm.md").write_text("---\ntitle: Hello\n---\nbody\n")
+    assert search_mod._get_frontmatter_excerpt(vault_dir / "fm.md") == {"title": "Hello"}
+
+
+# --- explicit resolved-target re-validation of the opened fd -------------------
+
+_HAS_FD_PATH = hasattr(__import__("fcntl"), "F_GETPATH") or os.path.exists("/proc/self/fd")
+requires_fd_path = pytest.mark.skipif(
+    not _HAS_FD_PATH, reason="no fd->path facility (F_GETPATH / /proc/self/fd)"
+)
+
+
+@requires_fd_path
+def test_fd_resolves_inside_vault_accepts_in_vault_file(vault_dir):
+    """An fd for a real in-vault file re-validates as inside the vault root."""
+    inside = vault_dir / "inside.md"
+    inside.write_text("x")
+    fd = os.open(str(inside), os.O_RDONLY)
+    try:
+        assert search_mod._fd_resolves_inside_vault(fd, vault_dir) is True
+    finally:
+        os.close(fd)
+
+
+@requires_fd_path
+def test_fd_resolves_inside_vault_rejects_outside_file(vault_dir, tmp_path):
+    """An fd for a file outside the vault re-validates as outside (defense in depth
+    behind the openat O_NOFOLLOW walk)."""
+    outside = tmp_path / "outside.txt"  # tmp_path is the parent of vault_dir
+    outside.write_text("y")
+    fd = os.open(str(outside), os.O_RDONLY)
+    try:
+        assert search_mod._fd_resolves_inside_vault(fd, vault_dir) is False
+    finally:
+        os.close(fd)
