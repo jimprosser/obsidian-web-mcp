@@ -157,6 +157,10 @@ from .tools.daily import (
     vault_daily_note_read as _vault_daily_note_read,
     vault_daily_note_append as _vault_daily_note_append,
 )
+from .tools.analytics import (
+    vault_analytics_summary as _vault_analytics_summary,
+    vault_analytics_findings as _vault_analytics_findings,
+)
 from .models import (
     VaultReadInput,
     VaultWriteInput,
@@ -174,6 +178,8 @@ from .models import (
     VaultCanvasAddNodeInput,
     VaultCanvasAddEdgeInput,
     VaultDailyNoteAppendInput,
+    VaultAnalyticsSummaryInput,
+    VaultAnalyticsFindingsInput,
 )
 
 
@@ -556,6 +562,58 @@ def vault_daily_note_append(content: str) -> str:
         "vault_daily_note_append",
         lambda: _vault_daily_note_append(inp.content),
         path=_daily_note_path(_today()),
+    )
+
+
+@mcp.tool(
+    name="vault_analytics_summary",
+    description=(
+        "Return a compact analytics summary for vault hygiene, including frontmatter, link, tag, and encoding "
+        "findings. Read-only; scoped to an optional folder prefix."
+    ),
+    annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False},
+)
+def vault_analytics_summary(
+    path_prefix: str | None = None,
+    required_frontmatter: list[str] | None = None,
+    max_examples: int = 3,
+) -> str:
+    """Return a compact analytics summary for vault hygiene."""
+    inp = VaultAnalyticsSummaryInput(
+        path_prefix=path_prefix,
+        required_frontmatter=required_frontmatter,
+        max_examples=max_examples,
+    )
+    return _vault_analytics_summary(inp.path_prefix or "", inp.required_frontmatter, inp.max_examples)
+
+
+@mcp.tool(
+    name="vault_analytics_findings",
+    description=(
+        "Return detailed findings for one vault analytics category: frontmatter_missing, "
+        "required_frontmatter_missing, broken_wikilinks, suspicious_tag_variants, encoding_issues, "
+        "or oversized_files. Read-only."
+    ),
+    annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False},
+)
+def vault_analytics_findings(
+    category: str,
+    path_prefix: str | None = None,
+    required_frontmatter: list[str] | None = None,
+    max_results: int = 50,
+) -> str:
+    """Return detailed findings for one analytics category."""
+    inp = VaultAnalyticsFindingsInput(
+        category=category,
+        path_prefix=path_prefix,
+        required_frontmatter=required_frontmatter,
+        max_results=max_results,
+    )
+    return _vault_analytics_findings(
+        inp.category,
+        inp.path_prefix or "",
+        inp.required_frontmatter,
+        inp.max_results,
     )
 
 

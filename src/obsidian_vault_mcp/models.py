@@ -446,3 +446,60 @@ class VaultDailyNoteAppendInput(BaseModel):
         description="Content to append to today's daily note (the note is created from the template if missing)",
         max_length=MAX_CONTENT_SIZE,
     )
+
+
+class VaultAnalyticsSummaryInput(BaseModel):
+    """Build a compact analytics summary for a vault path."""
+
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    path_prefix: str | None = Field(
+        default=None,
+        description="Optional folder prefix to restrict the analysis",
+        max_length=500,
+    )
+    required_frontmatter: list[str] | None = Field(
+        default=None,
+        description="Optional required frontmatter fields to validate",
+        max_length=20,
+    )
+    max_examples: int = Field(
+        default=3,
+        ge=1,
+        le=20,
+        description="Maximum example findings to include per category",
+    )
+
+
+class VaultAnalyticsFindingsInput(BaseModel):
+    """Return detailed findings for one analytics category."""
+
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    category: Literal[
+        "frontmatter_missing",
+        "required_frontmatter_missing",
+        "broken_wikilinks",
+        "suspicious_tag_variants",
+        "encoding_issues",
+        "oversized_files",
+    ] = Field(
+        ...,
+        description="Analytics finding category to return",
+    )
+    path_prefix: str | None = Field(
+        default=None,
+        description="Optional folder prefix to restrict the analysis",
+        max_length=500,
+    )
+    required_frontmatter: list[str] | None = Field(
+        default=None,
+        description="Optional required frontmatter fields to validate",
+        max_length=20,
+    )
+    max_results: int = Field(
+        default=50,
+        ge=1,
+        le=200,
+        description="Maximum number of findings to return",
+    )

@@ -73,6 +73,8 @@ Found a vulnerability? Please report it privately rather than opening a public i
 | `vault_daily_note_path` | Resolve today's daily-note path from the configured folder/format |
 | `vault_daily_note_read` | Read today's daily note; returns an error (does not create it) when missing |
 | `vault_daily_note_append` | Append to today's daily note, creating it from the template when missing |
+| `vault_analytics_summary` | Compact vault-hygiene summary: counts and examples of missing frontmatter, broken wikilinks, near-duplicate tag variants, and non-UTF-8 files |
+| `vault_analytics_findings` | Detailed findings for one analytics category (`frontmatter_missing`, `required_frontmatter_missing`, `broken_wikilinks`, `suspicious_tag_variants`, `encoding_issues`, `oversized_files`) |
 
 ## Prerequisites
 
