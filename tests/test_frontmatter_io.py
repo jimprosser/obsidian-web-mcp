@@ -104,6 +104,38 @@ def test_roundtrip_preserves_comments():
     assert "# current project state" in out
 
 
+def test_roundtrip_preserves_anchors_and_aliases():
+    """YAML anchors and aliases survive a round-trip (not expanded or dropped)."""
+    content = (
+        "---\n"
+        "base: &base shared\n"
+        "ref: *base\n"
+        "---\n"
+        "Body.\n"
+    )
+    metadata, body = frontmatter_io.loads(content)
+    out = frontmatter_io.dumps(metadata, body)
+    assert out == content
+    assert "&base" in out   # anchor kept
+    assert "*base" in out   # alias kept, not expanded to a second copy
+
+
+def test_roundtrip_preserves_standalone_and_inter_key_comments():
+    """Full-line comments above and between keys survive a round-trip."""
+    content = (
+        "---\n"
+        "# top-of-block note\n"
+        "title: hello\n"
+        "# note between keys\n"
+        "status: active\n"
+        "---\n"
+        "Body.\n"
+    )
+    metadata, body = frontmatter_io.loads(content)
+    out = frontmatter_io.dumps(metadata, body)
+    assert out == content
+
+
 def test_update_field_preserves_other_formatting():
     """Updating one field does not reformat unrelated fields."""
     content = (

@@ -129,3 +129,19 @@ def test_no_merge_writes_content_byte_identical(vault_dir):
     vault_write(path, content, create_dirs=True, merge_frontmatter=False)
 
     assert (config.VAULT_PATH / path).read_text() == content
+
+
+def test_merge_preserves_existing_key_order_and_appends_new(vault_dir):
+    """A merge keeps existing keys in their original order and appends new keys after."""
+    path = "fmt.md"
+    (config.VAULT_PATH / path).write_text(
+        "---\nalpha: 1\nbeta: 2\ngamma: 3\n---\nbody\n"
+    )
+
+    vault_write(path, "---\nbeta: 22\ndelta: 4\n---\nbody\n",
+                create_dirs=True, merge_frontmatter=True)
+
+    result = (config.VAULT_PATH / path).read_text()
+    positions = [result.index(f"{key}:") for key in ("alpha", "beta", "gamma", "delta")]
+    assert positions == sorted(positions)  # original order kept, new key appended last
+    assert "beta: 22" in result            # overridden value applied in place
