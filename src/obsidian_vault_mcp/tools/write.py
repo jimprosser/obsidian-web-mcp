@@ -1,14 +1,17 @@
 """Write tools for the Obsidian vault MCP server."""
 
+import base64
+import binascii
 import difflib
 import logging
+from pathlib import Path
 
 import frontmatter
 
 from .. import frontmatter_io
 from ..frontmatter_io import YAMLError
 from ..serialization import dumps
-from ..vault import resolve_vault_path, read_file, write_file_atomic
+from ..vault import resolve_vault_path, read_file, write_bytes_atomic, write_file_atomic
 from ..write_events import fire_write
 
 logger = logging.getLogger(__name__)
@@ -53,6 +56,81 @@ def vault_write(path: str, content: str, create_dirs: bool = True, merge_frontma
     except Exception as e:
         logger.error(f"vault_write error for {path}: {e}")
         return dumps({"error": str(e), "path": path})
+
+
+# Binary writes are restricted to an allowlist of media types, each mapped to the file
+# extensions permitted for it. The map is deliberately conservative and lists only inert
+# formats; the allowlist is the security boundary that keeps this from being an
+# arbitrary-file-write. SVG is intentionally excluded: it can carry <script>/onload, and
+# because validation is by declared media_type + extension (never by sniffing bytes),
+# allowing it would be an arbitrary-active-content write into a vault that may be synced or
+# rendered in a preview surface.
+DEFAULT_ALLOWED_BINARY_MEDIA_TYPES = {
+    "image/png": {".png"},
+    "image/jpeg": {".jpg", ".jpeg"},
+    "image/webp": {".webp"},
+    "image/gif": {".gif"},
+    "application/pdf": {".pdf"},
+}
+
+
+def _validate_binary_target(path: str, media_type: str) -> Path:
+    """Resolve a binary target path and enforce the media-type / extension allowlist."""
+    resolved = resolve_vault_path(path)
+    allowed_extensions = DEFAULT_ALLOWED_BINARY_MEDIA_TYPES.get(media_type.strip().lower())
+    if not allowed_extensions:
+        raise ValueError(f"Unsupported media_type: {media_type}")
+    extension = Path(path).suffix.lower()
+    if extension not in allowed_extensions:
+        raise ValueError(f"Extension '{extension}' is not allowed for media_type '{media_type}'")
+    return resolved
+
+
+def _decode_base64(data: str) -> bytes:
+    """Decode a strict base64 payload."""
+    try:
+        return base64.b64decode(data, validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise ValueError("Invalid base64 data") from exc
+
+
+def vault_write_binary(
+    path: str,
+    data: str,
+    media_type: str,
+    overwrite: bool = False,
+    create_dirs: bool = True,
+) -> str:
+    """Write an allowed binary file (image/PDF) to the vault from base64-encoded content.
+
+    The allowlist gates on the declared ``media_type`` and the file extension, not on the
+    bytes -- a caller can write arbitrary bytes under an allowed extension. That is
+    acceptable for a single-user vault (you only fool yourself), but the type is a
+    convention, not a guarantee. PDF in particular can carry active content; it is included
+    because it is a core attachment format, not because it is inert.
+    """
+    try:
+        resolved = _validate_binary_target(path, media_type)
+
+        try:
+            decoded = _decode_base64(data)
+        except ValueError as exc:
+            return dumps({"error": str(exc), "path": path, "media_type": media_type})
+
+        if resolved.exists() and not overwrite:
+            return dumps({
+                "error": f"File already exists: {path}. Set overwrite=true to replace it.",
+                "path": path,
+                "media_type": media_type,
+            })
+
+        is_new, size = write_bytes_atomic(path, decoded, create_dirs=create_dirs, overwrite=overwrite)
+        return dumps({"path": path, "created": is_new, "size": size, "media_type": media_type})
+    except ValueError as e:
+        return dumps({"error": str(e), "path": path, "media_type": media_type})
+    except Exception as e:
+        logger.error(f"vault_write_binary error for {path}: {e}")
+        return dumps({"error": str(e), "path": path, "media_type": media_type})
 
 
 def _unified_diff(path: str, before: str, after: str) -> str:

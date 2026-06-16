@@ -100,6 +100,60 @@ def write_file_atomic(
     return is_new, len(encoded)
 
 
+def write_bytes_atomic(
+    relative_path: str, content: bytes, create_dirs: bool = True, overwrite: bool = True
+) -> tuple[bool, int]:
+    """Write raw bytes to a file atomically.
+
+    The binary counterpart of write_file_atomic: writes to a tempfile in the same
+    directory then puts it in place, so readers never see a partial write.
+    Returns (is_new_file, bytes_written).
+
+    With overwrite=False the placement is a true no-clobber: it uses os.link, which fails
+    atomically if the target already exists, closing the check-then-write race that a plain
+    exists()-then-os.replace would leave open. With overwrite=True it os.replace()s.
+    """
+    if len(content) > config.MAX_BINARY_SIZE:
+        raise ValueError(
+            f"Content size {len(content)} bytes exceeds limit of {config.MAX_BINARY_SIZE} bytes"
+        )
+
+    path = resolve_vault_path(relative_path)
+    is_new = not path.exists()
+
+    if create_dirs:
+        path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Write to a temp file in the same directory, then put it in place atomically.
+    fd, tmp_path = tempfile.mkstemp(dir=path.parent, suffix=".tmp")
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(content)
+        if overwrite:
+            os.replace(tmp_path, path)
+        else:
+            # Atomic create: os.link fails if the target exists (no clobber, no race).
+            try:
+                os.link(tmp_path, path)
+            except FileExistsError:
+                raise FileExistsError(f"File already exists: {relative_path}")
+            finally:
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+            is_new = True
+    except BaseException:
+        # Clean up the temp file on any failure (os.replace consumes it on success).
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+
+    return is_new, len(content)
+
+
 def move_path(
     source: str, destination: str, create_dirs: bool = True
 ) -> bool:

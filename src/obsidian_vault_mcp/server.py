@@ -141,6 +141,7 @@ from .tools.write import (
     vault_batch_frontmatter_update as _vault_batch_frontmatter_update,
     vault_edit as _vault_edit,
     vault_write as _vault_write,
+    vault_write_binary as _vault_write_binary,
 )
 from .tools.search import vault_search as _vault_search, vault_search_frontmatter as _vault_search_frontmatter
 from .tools.manage import vault_list as _vault_list, vault_move as _vault_move, vault_delete as _vault_delete
@@ -159,6 +160,7 @@ from .tools.daily import (
 from .models import (
     VaultReadInput,
     VaultWriteInput,
+    VaultWriteBinaryInput,
     VaultEditInput,
     VaultAppendInput,
     VaultBatchReadInput,
@@ -315,6 +317,17 @@ def vault_write(path: str, content: str, create_dirs: bool = True, merge_frontma
         lambda: _vault_write(inp.path, inp.content, inp.create_dirs, inp.merge_frontmatter),
         path=inp.path,
     )
+
+
+@mcp.tool(
+    name="vault_write_binary",
+    description="Write an allowed binary file (image or PDF) to the Obsidian vault from base64-encoded content. Enforces a media-type/extension allowlist and a size cap; writes atomically.",
+    annotations={"readOnlyHint": False, "destructiveHint": True, "idempotentHint": False, "openWorldHint": False},
+)
+def vault_write_binary(path: str, data: str, media_type: str, overwrite: bool = False, create_dirs: bool = True) -> str:
+    """Write a base64-encoded binary file to the vault."""
+    inp = VaultWriteBinaryInput(path=path, data=data, media_type=media_type, overwrite=overwrite, create_dirs=create_dirs)
+    return _vault_write_binary(inp.path, inp.data, inp.media_type, inp.overwrite, inp.create_dirs)
 
 
 @mcp.tool(
