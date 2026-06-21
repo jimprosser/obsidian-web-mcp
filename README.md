@@ -280,6 +280,7 @@ you need) and run the server with `serve([YourExtension()])` from your own entry
 ```python
 from obsidian_vault_mcp.server import serve
 from obsidian_vault_mcp.extensions import Extension
+from obsidian_vault_mcp.write_events import register_write_listener
 
 
 class MyExtension(Extension):
@@ -290,6 +291,8 @@ class MyExtension(Extension):
     def before_indexes_start(self, frontmatter_index):
         # e.g. attach a change listener so no change is missed once the index starts
         frontmatter_index.add_change_listener(self._on_change)
+        # ...or react to a mutation as an operation (see write-event seam below)
+        register_write_listener(self._on_write)  # _on_write(operation, paths)
 
     def after_indexes_start(self, frontmatter_index):
         # e.g. start a periodic reconcile loop now that the index is live
@@ -326,7 +329,16 @@ Two things worth knowing:
   accidents; it is **not** a boundary against a hostile extension (which, running
   in-process, could bypass it anyway — see the trust model above).
 - **The stock server is unaffected.** With no extensions, `serve()` behaves exactly like
-  the previous `main()`; `FrontmatterIndex` change listeners are a no-op with none registered.
+  the previous `main()`; `FrontmatterIndex` change listeners and write listeners are a no-op
+  with none registered.
+- **Write listeners see mutations as operations.** Where `add_change_listener` is watcher-driven
+  (`(abs_path, exists)`, `.md` only, can't tell a tool write from an external edit),
+  `write_events.register_write_listener(cb)` fires `cb(operation, paths)` once per successful
+  mutation from the core write tools — `operation` is `"created"`/`"updated"`/`"moved"`/`"deleted"`,
+  a move passes `[source, destination]`, a batch passes only the paths it wrote. The publish
+  side, `fire_write(operation, paths)`, is public so an extension that writes on its own path
+  can join the same stream. Use it for a provenance-aware commit, an audit log, or a webhook;
+  a listener's exception is logged and swallowed.
 
 ## VPS Setup With Cloudflare Origin TLS + Caddy Reverse Proxy
 

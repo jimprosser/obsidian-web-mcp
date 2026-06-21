@@ -14,6 +14,11 @@ A custom deployment provides its own console entry point, e.g.:
 
 Override only the hooks you need; the rest stay no-ops.
 
+To react to vault mutations *as operations* (a provenance-aware commit, an audit
+log, a webhook), subscribe from `before_indexes_start` via the write-event seam in
+`write_events` (`register_write_listener` / `fire_write`) -- the write-side mirror of
+`FrontmatterIndex.add_change_listener`.
+
 TRUST MODEL
 -----------
 Extensions are FULLY-TRUSTED, in-process code that the operator chooses to load.

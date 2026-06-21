@@ -7,6 +7,7 @@ import frontmatter
 
 from ..serialization import dumps
 from ..vault import resolve_vault_path, read_file, write_file_atomic
+from ..write_events import fire_write
 
 logger = logging.getLogger(__name__)
 
@@ -34,6 +35,7 @@ def vault_write(path: str, content: str, create_dirs: bool = True, merge_frontma
 
         is_new, size = write_file_atomic(path, content, create_dirs=create_dirs)
 
+        fire_write("created" if is_new else "updated", [path])
         return dumps({"path": path, "created": is_new, "size": size})
     except ValueError as e:
         return dumps({"error": str(e), "path": path})
@@ -119,6 +121,7 @@ def vault_edit(path: str, edits: list[dict], dry_run: bool = False) -> str:
         changed = content != original_content
         if changed:
             write_file_atomic(path, content, create_dirs=False)
+            fire_write("updated", [path])
 
         return dumps({
             "path": path,
@@ -188,6 +191,7 @@ def vault_append(
         changed = new_content != existing_content
         if changed:
             _, size = write_file_atomic(path, new_content, create_dirs=create_dirs)
+            fire_write("created" if created else "updated", [path])
         else:
             size = len(existing_content.encode("utf-8"))
 
@@ -244,5 +248,10 @@ def vault_batch_frontmatter_update(updates: list[dict]) -> str:
             results.append({"path": file_path, "updated": False, "error": str(e)})
         except Exception as e:
             results.append({"path": file_path, "updated": False, "error": str(e)})
+
+    # One event per batch, carrying only the paths actually written.
+    written = [r["path"] for r in results if r.get("updated")]
+    if written:
+        fire_write("updated", written)
 
     return dumps({"results": results})
