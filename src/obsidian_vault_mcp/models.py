@@ -88,6 +88,34 @@ class VaultWriteBinaryInput(BaseModel):
     )
 
 
+class VaultRequestUploadUrlInput(BaseModel):
+    """Request a short-lived signed URL for a direct binary upload."""
+
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    path: str = Field(..., description="Relative path from vault root", min_length=1, max_length=500)
+    media_type: str = Field(
+        ...,
+        description="MIME type of the binary content; must be in the server's allowlist",
+        min_length=3,
+        max_length=200,
+    )
+    max_size_bytes: int = Field(
+        ...,
+        ge=1,
+        le=MAX_BINARY_SIZE,
+        description="Maximum byte size the signed URL will accept",
+    )
+    overwrite: bool = Field(default=False, description="Overwrite an existing file at the target path")
+    create_dirs: bool = Field(default=True, description="Create parent directories if they don't exist")
+    expected_sha256: str | None = Field(
+        default=None, description="Optional SHA-256 hex digest the uploaded bytes must match"
+    )
+    ttl_seconds: int | None = Field(
+        default=None, ge=1, description="Requested URL lifetime in seconds (clamped to the server max)"
+    )
+
+
 class VaultEditOperationInput(BaseModel):
     """Replace one exact text fragment inside a vault file."""
 

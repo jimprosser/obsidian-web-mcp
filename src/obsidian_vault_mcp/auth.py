@@ -29,6 +29,12 @@ _AUTH_EXEMPT_METHOD_PATHS = (
     {("GET", "/"), ("HEAD", "/")} if config.VAULT_MCP_PATH != "/" else set()
 )
 
+# Path PREFIXES exempt from bearer auth. The signed direct-upload endpoint
+# POST /upload/{id} carries its OWN authorization: an HMAC signature in the URL that
+# commit_direct_upload verifies (exact-expiry + single-use + constant-time compared). It is
+# therefore bearer-exempt by design. Kept narrow and explicit so it can't widen by accident.
+_AUTH_EXEMPT_PATH_PREFIXES = ("/upload/",)
+
 
 def _www_authenticate(request: Request, error: str) -> str:
     """RFC 9728 challenge header pointing clients at the protected-resource metadata.
@@ -53,6 +59,9 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
             return await call_next(request)
 
         if (request.method, request.url.path) in _AUTH_EXEMPT_METHOD_PATHS:
+            return await call_next(request)
+
+        if any(request.url.path.startswith(p) for p in _AUTH_EXEMPT_PATH_PREFIXES):
             return await call_next(request)
 
         if not VAULT_MCP_TOKEN:
