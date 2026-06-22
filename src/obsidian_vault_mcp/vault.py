@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from . import config
+from .content_extractors import apply_content_extractors
 
 
 def resolve_vault_path(relative_path: str) -> Path:
@@ -52,7 +53,22 @@ def read_file(relative_path: str) -> tuple[str, dict]:
         raise FileNotFoundError(f"Not a file: {relative_path}")
 
     stat = path.stat()
-    content = path.read_text(encoding="utf-8")
+    try:
+        content = path.read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        # Built-in extraction is unsupported for this file type. Offer it to a registered
+        # content extractor (OCR / transcript / preview); with none registered this
+        # re-raises -- byte-identical to the stock server.
+        extracted = apply_content_extractors(relative_path, "")
+        if extracted is None:
+            raise
+        content = extracted
+    else:
+        # Empty built-in result: a registered extractor may still produce content.
+        if not content:
+            extracted = apply_content_extractors(relative_path, content)
+            if extracted is not None:
+                content = extracted
 
     metadata = {
         "size": stat.st_size,

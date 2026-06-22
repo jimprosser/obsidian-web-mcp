@@ -372,6 +372,15 @@ Two things worth knowing:
   side, `fire_write(operation, paths)`, is public so an extension that writes on its own path
   can join the same stream. Use it for a provenance-aware commit, an audit log, or a webhook;
   a listener's exception is logged and swallowed.
+- **Content extractors fill the read side.** `content_extractors.register_content_extractor(cb)`
+  lets an extension supply text for a file the host can't read itself — OCR for a scanned PDF,
+  a transcript, a rendered preview. `cb(path, default_text) -> str | None` is consulted inside
+  `read_file` **only** when the built-in extraction is empty or unsupported; the first non-None
+  result wins, exceptions are logged and swallowed, and with none registered `read_file` is
+  byte-identical to stock. Note that a registered extractor changes what `read_file` returns for
+  that path, so a buggy one returns wrong text *for that one file* — bounded to the file the
+  caller already requested. The OCR/model/subprocess lives entirely in the extension; core only
+  gains a no-op callback list.
 
 ## VPS Setup With Cloudflare Origin TLS + Caddy Reverse Proxy
 
