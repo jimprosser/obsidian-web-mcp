@@ -155,6 +155,25 @@ VAULT_AUDIT_LOG_INCLUDE_READS = os.environ.get(
 # Safety limits
 MAX_CONTENT_SIZE = 1_000_000  # 1MB max write size
 MAX_BINARY_SIZE = 10_000_000  # 10MB max binary write size (images/PDFs run larger than text)
+
+# Signed direct binary upload. The POST /upload/{id} route is bearer-exempt because the HMAC
+# signature in the URL IS the authorization: single-use, short-lived, constant-time compared.
+# VAULT_UPLOAD_URL_SECRET is the HMAC key; it falls back to VAULT_MCP_TOKEN when unset. The
+# staging dir holds only per-upload metadata.json, OUTSIDE the vault so vault tools can't reach
+# it; the uploaded bytes are written into the vault atomically on commit.
+VAULT_UPLOAD_URL_SECRET = os.environ.get("VAULT_UPLOAD_URL_SECRET", "").strip()
+try:
+    VAULT_UPLOAD_URL_TTL_SECONDS = int(os.environ.get("VAULT_UPLOAD_URL_TTL_SECONDS", "900"))
+except ValueError:
+    VAULT_UPLOAD_URL_TTL_SECONDS = 900
+try:
+    VAULT_UPLOAD_URL_MAX_TTL_SECONDS = int(os.environ.get("VAULT_UPLOAD_URL_MAX_TTL_SECONDS", "3600"))
+except ValueError:
+    VAULT_UPLOAD_URL_MAX_TTL_SECONDS = 3600
+UPLOAD_STAGING_DIR = Path(os.environ.get(
+    "VAULT_UPLOAD_STAGING_DIR",
+    Path.home() / ".local" / "share" / "vault-mcp" / "uploads",
+))
 MAX_BATCH_SIZE = 20           # Max files per batch operation
 MAX_SEARCH_RESULTS = 50       # Max results per search
 DEFAULT_SEARCH_RESULTS = 20

@@ -157,10 +157,15 @@ from .tools.daily import (
     vault_daily_note_read as _vault_daily_note_read,
     vault_daily_note_append as _vault_daily_note_append,
 )
+from .tools.upload import (
+    vault_request_upload_url as _vault_request_upload_url,
+    commit_direct_upload,
+)
 from .models import (
     VaultReadInput,
     VaultWriteInput,
     VaultWriteBinaryInput,
+    VaultRequestUploadUrlInput,
     VaultEditInput,
     VaultAppendInput,
     VaultBatchReadInput,
@@ -328,6 +333,36 @@ def vault_write_binary(path: str, data: str, media_type: str, overwrite: bool = 
     """Write a base64-encoded binary file to the vault."""
     inp = VaultWriteBinaryInput(path=path, data=data, media_type=media_type, overwrite=overwrite, create_dirs=create_dirs)
     return _vault_write_binary(inp.path, inp.data, inp.media_type, inp.overwrite, inp.create_dirs)
+
+
+@mcp.tool(
+    name="vault_request_upload_url",
+    description="Create a short-lived, HMAC-signed URL for a direct binary upload (image/PDF). The client then POSTs the bytes to the returned URL; the server fetches nothing. Use for files too large for vault_write_binary's base64 path. Enforces the media-type allowlist and a size cap.",
+    annotations={"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False, "openWorldHint": False},
+)
+def vault_request_upload_url(
+    path: str,
+    media_type: str,
+    max_size_bytes: int,
+    overwrite: bool = False,
+    create_dirs: bool = True,
+    expected_sha256: str | None = None,
+    ttl_seconds: int | None = None,
+) -> str:
+    """Return a short-lived signed direct-upload URL."""
+    inp = VaultRequestUploadUrlInput(
+        path=path,
+        media_type=media_type,
+        max_size_bytes=max_size_bytes,
+        overwrite=overwrite,
+        create_dirs=create_dirs,
+        expected_sha256=expected_sha256,
+        ttl_seconds=ttl_seconds,
+    )
+    return _vault_request_upload_url(
+        inp.path, inp.media_type, inp.max_size_bytes, inp.overwrite,
+        inp.create_dirs, inp.expected_sha256, inp.ttl_seconds,
+    )
 
 
 @mcp.tool(
@@ -607,6 +642,51 @@ def build_app(extensions=()):
 
     app.routes.insert(0, Route("/health", health, methods=["GET"]))
 
+    # Signed direct binary upload (bearer-exempt, see auth._AUTH_EXEMPT_PATH_PREFIXES): the
+    # HMAC signature in the URL IS the authorization. commit_direct_upload re-validates
+    # everything server-side (exact expiry, single-use, constant-time signature, size caps,
+    # media-type, target allowlist) before any byte is written.
+    async def direct_upload(request):
+        upload_id = request.path_params["upload_id"]
+        content_length = request.headers.get("content-length")
+        if content_length:
+            try:
+                if int(content_length) > config.MAX_BINARY_SIZE:
+                    return JSONResponse(
+                        {"error": f"Uploaded content exceeds server limit of {config.MAX_BINARY_SIZE} bytes", "upload_id": upload_id},
+                        status_code=413,
+                    )
+            except ValueError:
+                return JSONResponse({"error": "Invalid Content-Length", "upload_id": upload_id}, status_code=400)
+
+        content_type = request.headers.get("content-type", "")
+        if content_type.split(";", 1)[0].strip().lower() == "multipart/form-data":
+            try:
+                form = await request.form()
+            except Exception as exc:
+                logger.warning("Direct upload multipart parse failed for %s: %s", upload_id, exc)
+                return JSONResponse({"error": "Could not parse multipart upload; send field 'file' or use --data-binary", "upload_id": upload_id}, status_code=400)
+            uploaded = form.get("file")
+            if uploaded is None:
+                return JSONResponse({"error": "Multipart upload must include a 'file' field", "upload_id": upload_id}, status_code=400)
+            content_type = getattr(uploaded, "content_type", "") or content_type
+            body = await uploaded.read()
+        else:
+            body = await request.body()
+
+        result, status_code = commit_direct_upload(
+            upload_id=upload_id,
+            content=body,
+            content_type=content_type,
+            expires=request.query_params.get("expires", ""),
+            signature=request.query_params.get("signature", ""),
+        )
+        if "error" in result:
+            logger.warning("Direct upload rejected: %s (%s)", upload_id, result["error"])
+        return JSONResponse(result, status_code=status_code)
+
+    app.routes.insert(0, Route("/upload/{upload_id}", direct_upload, methods=["POST"]))
+
     # Extension routes (e.g. a localhost search endpoint), added before the auth
     # middleware so they are bearer-protected like the MCP transport.
     #
@@ -620,7 +700,7 @@ def build_app(extensions=()):
     # mutates an existing route in place, opens a raw socket, etc.
     from starlette.routing import Match, Mount, WebSocketRoute
 
-    from .auth import _AUTH_EXEMPT_METHOD_PATHS, _AUTH_EXEMPT_PATHS
+    from .auth import _AUTH_EXEMPT_METHOD_PATHS, _AUTH_EXEMPT_PATHS, _AUTH_EXEMPT_PATH_PREFIXES
 
     extensions = tuple(extensions)
     before_ids = {id(r) for r in app.routes}
@@ -665,6 +745,14 @@ def build_app(extensions=()):
                 raise ValueError(
                     f"extension route {getattr(r, 'path', r)!r} covers auth-exempt "
                     f"{m} {p!r}; it would be served without bearer authentication"
+                )
+        # Method-AGNOSTIC exempt PREFIXES (e.g. /upload/): any route covering a path under
+        # the prefix would be served unauthenticated. Probe with a representative sub-path.
+        for prefix in _AUTH_EXEMPT_PATH_PREFIXES:
+            if _covers(r, "POST", prefix + "probe") is not Match.NONE:
+                raise ValueError(
+                    f"extension route {getattr(r, 'path', r)!r} covers auth-exempt prefix "
+                    f"{prefix!r}; it would be served without bearer authentication"
                 )
     app.add_middleware(BearerAuthMiddleware)
     return app
