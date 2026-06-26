@@ -1,5 +1,7 @@
 """Tests for vault.py -- path resolution, file operations, and safety checks."""
 
+import os
+
 import pytest
 from pathlib import Path
 
@@ -52,6 +54,25 @@ def test_read_missing_file(vault_dir):
     """Reading a nonexistent file raises FileNotFoundError."""
     with pytest.raises(FileNotFoundError):
         read_file("nonexistent.md")
+
+
+def test_read_file_refuses_hardlink_to_outside_file(vault_dir, tmp_path):
+    """An in-vault hardlink to a file outside the vault is a real directory entry
+    that resolve_vault_path's containment check cannot catch (there is no link to
+    follow). read_file refuses any file with st_nlink > 1 (fail closed); in-vault
+    hardlinks are unsupported as a result. (issue #53)"""
+    secret = tmp_path / "secret.txt"
+    secret.write_text("TOP SECRET CONTENT")
+    os.link(secret, vault_dir / "evil.md")  # st_nlink == 2, same inode
+    with pytest.raises(ValueError):
+        read_file("evil.md")
+
+
+def test_read_file_reads_normal_single_link_file(vault_dir):
+    """A normal note (st_nlink == 1) is still read; the hardlink guard must not
+    refuse ordinary files."""
+    content, _ = read_file("test-note.md")
+    assert "test note" in content
 
 
 def test_write_atomic_new_file(vault_dir):

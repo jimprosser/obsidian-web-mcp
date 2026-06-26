@@ -160,6 +160,7 @@ MAX_SEARCH_RESULTS = 50       # Max results per search
 DEFAULT_SEARCH_RESULTS = 20
 MAX_LIST_DEPTH = 5            # Max directory recursion depth
 CONTEXT_LINES = 2             # Default lines of context in search results
+MAX_SEARCH_REREAD_BYTES = MAX_CONTENT_SIZE  # Cap per-file context re-read in vault_search
 
 # Directories to never expose or modify
 EXCLUDED_DIRS = {".obsidian", ".trash", ".git", ".DS_Store"}
