@@ -13,6 +13,13 @@ dependencies = [
     "google-auth>=2.0",
     "requests>=2.0",
     "cryptography>=48.0.1,<49",
+    # pydantic-settings: tranzytywna (mcp[cli]→pydantic-settings), przypięta JAWNIE
+    # dla alertu Dependabota (06.07.2026):
+    #   GHSA-4xgf-cpjx-pc3j (MEDIUM) — pydantic-settings: NestedSecretsSettingsSource
+    #     podąża za symlinkami poza secrets_dir (odczyt lokalnych plików); patch 2.14.2.
+    #     Nie używamy secrets_dir ani BaseSettings w kodzie repo — blast radius zerowy.
+    # Podłoga bez sufitu (wzorzec jarvis-infra #231) — górną granicę trzyma mcp.
+    "pydantic-settings>=2.14.2",
 ]
 
 [project.optional-dependencies]
