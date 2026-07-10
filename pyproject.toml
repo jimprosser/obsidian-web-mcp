@@ -17,6 +17,10 @@ dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
 ]
+cloudflare-access = [
+    "pyjwt>=2.8",
+    "cryptography>=42",
+]
 
 [project.scripts]
 vault-mcp = "obsidian_vault_mcp.server:main"

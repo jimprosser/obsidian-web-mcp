@@ -41,6 +41,104 @@ This is a server that provides network access to your personal notes. Security i
 
 **Your vault is never exposed directly to the internet.** The recommended deployment uses a Cloudflare Tunnel -- an outbound-only encrypted connection. Your machine opens no inbound ports, and the server itself binds to loopback (`127.0.0.1`) by default. The login above is the authentication boundary; you can additionally layer Cloudflare Access (SSO, device posture, IP restrictions) on top for defense in depth.
 
+### Cloudflare Access mode (opt-in)
+
+Instead of the built-in password login + static bearer token, you can hand
+authentication entirely to **Cloudflare Access**. Cloudflare authenticates the user at
+its edge (per-identity SSO / one-time-PIN) and, on every request it forwards through the
+tunnel, injects a signed `Cf-Access-Jwt-Assertion` header carrying the caller's identity.
+The server's only job is to verify that header.
+
+**Enable it** by setting **both** of these (both-or-neither — if either is unset the mode
+is off and the server behaves exactly as it does by default):
+
+| Setting | Description |
+|---------|-------------|
+| `VAULT_MCP_CF_ACCESS_TEAM_DOMAIN` | Your Cloudflare team domain, e.g. `myteam.cloudflareaccess.com` (a bare `myteam` or a full URL is accepted). |
+| `VAULT_MCP_CF_ACCESS_AUD` | The Access application **audience (AUD)** tag from the Cloudflare dashboard. |
+
+Install the extra dependencies (PyJWT + cryptography):
+
+```bash
+pip install 'obsidian-web-mcp[cloudflare-access]'
+```
+
+#### Setting up Cloudflare (Managed OAuth)
+
+This walkthrough exposes the server through a Cloudflare Tunnel and puts Cloudflare
+Access + Managed OAuth in front of it, so an MCP client (e.g. Claude) authenticates
+against Cloudflare and Cloudflare injects the `Cf-Access-Jwt-Assertion` header the server
+verifies. It also shows where the two settings above come from.
+
+1. **Create the Access application.** In the Cloudflare dashboard go to
+   **Access → Access Controls → Create new application → Self-hosted and private →
+   Private destinations**. Set the **subdomain** (e.g. `my-vault-mcp`), the **domain** to
+   one you own (`domain-you-own.com`), and leave the **path** empty. This is the public
+   hostname (`my-vault-mcp.domain-you-own.com`) that your Cloudflare Tunnel forwards to the
+   server on loopback.
+2. **Enable an identity provider.** For the simplest setup, use the built-in
+   **`onetimepin`** provider, which emails a one-time code — enable it under
+   **Access → Identity providers**. (Any other SSO provider works too.)
+3. **Restrict who can get in.** Add an Access **policy** that allows only your own email
+   address (an *Allow* rule with an `Emails` / `Include` condition). This is your
+   per-identity, revocable gate — kill it in the dashboard to cut off access, no redeploy.
+4. **Enable Managed OAuth.** On the application's **Advanced settings** tab, turn on
+   **Managed OAuth** (it is opt-in for self-hosted applications). In **Allowed redirect
+   URIs** — the allowlist for dynamically-registered OAuth clients; entries must use
+   `https` and may end in `/*` — add the Claude client callbacks:
+   - `https://claude.ai/api/mcp/auth_callback`
+   - `https://claude.com/api/mcp/auth_callback`
+5. **Set sensible token lifetimes** (also on **Advanced settings**). Cloudflare uses two
+   durations: **Access token lifetime** (how long each token authenticates a request;
+   default is short, 5–15 min) and **Grant session duration** (how long the refresh token
+   lives; Cloudflare suggests 1–2 weeks for agent/CLI use). Raise the **Grant session
+   duration** so clients are not forced to re-authenticate too often — the refresh happens
+   silently while Cloudflare re-evaluates your policy on each new token.
+6. **Copy the two server settings.** Take the **AUD** from the application's **AUD tag**
+   tab → `VAULT_MCP_CF_ACCESS_AUD`. Find your **team domain** under **Access → Settings**
+   (it looks like `something.cloudflareaccess.com`) → `VAULT_MCP_CF_ACCESS_TEAM_DOMAIN`.
+
+Cloudflare's own guidance confirms the origin's role here: for MCP applications, "the MCP
+server must validate the Access JWT sent in the `Cf-Access-Jwt-Assertion` header" — which
+is exactly what this mode does (RS256 signature against the team's rotating keys at
+`/cdn-cgi/access/certs`, plus `iss`/`aud`/`exp`). See Cloudflare's
+[Managed OAuth](https://developers.cloudflare.com/cloudflare-one/access-controls/applications/http-apps/managed-oauth/)
+and [Validate JWTs](https://developers.cloudflare.com/cloudflare-one/access-controls/applications/http-apps/authorization-cookie/validating-json/)
+docs for the authoritative reference.
+
+Also set `VAULT_MCP_ALLOWED_HOSTS` to that public hostname (e.g.
+`my-vault-mcp.domain-you-own.com`) — the transport's host-allowlist is still enforced in
+this mode. In Claude, add the MCP server using the public URL; Cloudflare's Managed OAuth
+handles the login and forwards authenticated requests to the origin.
+
+When the mode is **on**:
+
+- Every request (except the `/health` liveness probe) must carry a valid
+  `Cf-Access-Jwt-Assertion`. The server verifies its **signature, expiry, audience, and
+  issuer** against Cloudflare's published keys (`https://<team-domain>/cdn-cgi/access/certs`).
+  Anything missing, malformed, expired, wrong-signature, or wrong-audience is rejected
+  with `401`. It **fails closed** — there is no fallback to unauthenticated access or to
+  the static bearer.
+- The app's **own OAuth flow is not served**: the `/oauth/*` routes and the
+  `/.well-known/oauth-*` discovery endpoints are not mounted, and `VAULT_MCP_TOKEN` is not
+  accepted. Cloudflare is the sole auth authority, so there is no public password endpoint
+  to brute-force.
+- The audit log records the caller's **identity** (the token's `email` claim, or its `sub`
+  for service tokens) instead of a shared-token hash.
+
+> **Run it behind Cloudflare — keep the origin unreachable directly.** The signature
+> proves the token is *authentic* (Cloudflare minted it for your team + AUD, and the
+> server rejects anything else); it does **not** prove the *request* transited Cloudflare.
+> An attacker cannot forge a token — they lack Cloudflare's signing key — but a valid,
+> unexpired assertion is just a bearer string. If one leaks (logs, a proxy, a compromised
+> client) or is replayed by a lower-trust user, hitting the origin directly would validate
+> it while bypassing Cloudflare's **Access policy** (per-identity allow-list, device
+> posture, IP rules), its **rate-limiting / bot protection**, and the containment of the
+> token's replay window. The edge is what enforces the policy; the origin only checks
+> authenticity. So keep the server on loopback behind the Cloudflare Tunnel (the default),
+> with `VAULT_MCP_FORWARDED_ALLOW_IPS` trusting only the local proxy — that, not the
+> signature check, is what makes the policy binding.
+
 **Path traversal is blocked at the filesystem layer.** Every file operation resolves paths against the vault root directory and rejects any attempt to escape it -- `..` traversal, symlink following, null byte injection, and dotfile access (`.obsidian`, `.git`, `.trash`) are all caught before they reach the filesystem. The server will never read or write outside your vault directory.
 
 **Writes are atomic.** Every file write goes to a temporary file first, then atomically replaces the target via `os.replace()`. This guarantees that neither Obsidian nor Obsidian Sync ever sees a partially-written file -- the operation either completes fully or doesn't happen at all.
@@ -117,8 +215,8 @@ All configuration is via environment variables:
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
 | `VAULT_PATH` | Yes | `~/Obsidian/MyVault` | Absolute path to your Obsidian vault directory |
-| `VAULT_MCP_TOKEN` | Yes | (none) | 256-bit bearer token validated on every MCP request |
-| `VAULT_OAUTH_PASSWORD` | **Yes** | (none) | Password for the interactive login at `/oauth/authorize`. **If unset, the server refuses to authorize any client (fail-closed).** |
+| `VAULT_MCP_TOKEN` | Yes¹ | (none) | 256-bit bearer token validated on every MCP request. ¹Not used (and not required) in [Cloudflare Access mode](#cloudflare-access-mode-opt-in). |
+| `VAULT_OAUTH_PASSWORD` | **Yes**¹ | (none) | Password for the interactive login at `/oauth/authorize`. **If unset, the server refuses to authorize any client (fail-closed).** ¹Not used in [Cloudflare Access mode](#cloudflare-access-mode-opt-in), where the app's own OAuth is not served. |
 | `VAULT_OAUTH_USERNAME` | No | `obsidian` | Username for the interactive login |
 | `VAULT_MCP_HOST` | No | `127.0.0.1` | Bind address. Loopback by default; set `0.0.0.0` only for deliberate LAN exposure |
 | `VAULT_MCP_PORT` | No | `8420` | Port the HTTP server listens on |
@@ -129,6 +227,8 @@ All configuration is via environment variables:
 | `VAULT_OAUTH_CLIENT_ID` | No | `vault-mcp-client` | Client ID for the headless `client_credentials` grant |
 | `VAULT_OAUTH_CLIENT_SECRET` | No | (none) | Only required for the headless `client_credentials` grant. The Claude/ChatGPT browser flow uses dynamic client registration and does **not** need this. |
 | `VAULT_OAUTH_REDIRECT_URIS` | No | (none) | Comma-separated allowlist of redirect URIs for the static `VAULT_OAUTH_CLIENT_ID` when using the browser flow. Dynamically-registered clients (Claude/ChatGPT) carry their own; leave unset unless you connect a static client through `/oauth/authorize`. |
+| `VAULT_MCP_CF_ACCESS_TEAM_DOMAIN` | No | (none) | Cloudflare team domain, e.g. `myteam.cloudflareaccess.com` (a bare `myteam` or a full URL is accepted). Set **together with** `VAULT_MCP_CF_ACCESS_AUD` to enable [Cloudflare Access mode](#cloudflare-access-mode-opt-in) (both-or-neither; if either is unset the mode is off). When on, the app's own OAuth routes are not served and `VAULT_MCP_TOKEN` / `VAULT_OAUTH_*` are unused — Cloudflare is the sole auth authority. **Validated at startup:** a malformed domain fails the server closed with a clear message. Requires the `cloudflare-access` extra (missing → fail closed at startup). |
+| `VAULT_MCP_CF_ACCESS_AUD` | No | (none) | Cloudflare Access application **audience (AUD)** tag (from the application's *AUD tag* tab). The second half of Cloudflare Access mode; see `VAULT_MCP_CF_ACCESS_TEAM_DOMAIN` above. |
 | `VAULT_DAILY_NOTES_FOLDER` | No | (none) | Folder for the daily-note tools; empty means the vault root |
 | `VAULT_DAILY_NOTES_FORMAT` | No | `%Y-%m-%d` | `strftime` pattern for the daily-note filename |
 | `VAULT_DAILY_NOTES_TEMPLATE` | No | (none) | `strftime` template prepended when a daily note is first created |

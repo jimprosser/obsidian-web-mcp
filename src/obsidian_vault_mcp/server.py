@@ -634,7 +634,10 @@ def build_app(extensions=()):
     from starlette.routing import Route
 
     from .auth import BearerAuthMiddleware
+    from .cf_access import CloudflareAccessMiddleware, cf_access_enabled
     from .oauth import oauth_routes
+
+    cf_on = cf_access_enabled()
 
     app = mcp.streamable_http_app()
 
@@ -651,9 +654,13 @@ def build_app(extensions=()):
 
         app.routes.insert(0, Route("/", mcp_root_probe, methods=["GET", "HEAD"]))
 
-    # Mount OAuth routes (these are excluded from bearer auth via the middleware)
-    for route in oauth_routes:
-        app.routes.insert(0, route)
+    # Mount OAuth routes (excluded from bearer auth via the middleware) -- but NOT in
+    # Cloudflare Access mode: there, Cloudflare is the sole auth authority, so serving
+    # the app's own OAuth + /.well-known discovery would advertise a second, competing
+    # (unauthenticated-login) surface. Skip them entirely.
+    if not cf_on:
+        for route in oauth_routes:
+            app.routes.insert(0, route)
 
     # Health endpoint (bearer-exempt, see auth._AUTH_EXEMPT_PATHS). Surfaces audit status
     # so an operator can confirm the log is enabled and being written.
@@ -724,7 +731,12 @@ def build_app(extensions=()):
                     f"extension route {getattr(r, 'path', r)!r} covers auth-exempt "
                     f"{m} {p!r}; it would be served without bearer authentication"
                 )
-    app.add_middleware(BearerAuthMiddleware)
+    # Cloudflare Access mode swaps the static-bearer middleware for CF JWT verification;
+    # the static bearer is never checked in that mode.
+    if cf_on:
+        app.add_middleware(CloudflareAccessMiddleware)
+    else:
+        app.add_middleware(BearerAuthMiddleware)
     return app
 
 
@@ -760,7 +772,34 @@ def serve(extensions=()):
         logger.error(f"Invalid configuration: {e}")
         sys.exit(1)
 
-    if not VAULT_MCP_TOKEN:
+    # Cloudflare Access mode: fail CLOSED on missing deps, warm the key set, and (below)
+    # suppress the static-token warning that is irrelevant when Cloudflare is the auth
+    # authority. A half-configured pair (exactly one of the two settings) means mode OFF;
+    # warn so it is not silently insecure-by-omission.
+    from .cf_access import (
+        cf_access_enabled,
+        require_dependencies,
+        team_domain,
+        warm_jwks,
+    )
+    from .config import VAULT_MCP_CF_ACCESS_AUD, VAULT_MCP_CF_ACCESS_TEAM_DOMAIN
+
+    cf_on = cf_access_enabled()
+    if cf_on:
+        try:
+            require_dependencies()
+        except Exception as e:
+            logger.error(str(e))
+            sys.exit(1)
+        logger.info("Cloudflare Access mode ENABLED (team: %s)", team_domain())
+        warm_jwks()
+    elif bool(VAULT_MCP_CF_ACCESS_TEAM_DOMAIN) != bool(VAULT_MCP_CF_ACCESS_AUD):
+        logger.warning(
+            "Only one of VAULT_MCP_CF_ACCESS_TEAM_DOMAIN / VAULT_MCP_CF_ACCESS_AUD is "
+            "set; Cloudflare Access mode requires BOTH and is therefore OFF."
+        )
+
+    if not cf_on and not VAULT_MCP_TOKEN:
         logger.warning("VAULT_MCP_TOKEN is not set -- auth will reject all requests")
 
     # Fail CLOSED on a misconfigured audit log: if auditing is requested but the log path
@@ -824,7 +863,10 @@ def serve(extensions=()):
     # Build the Starlette app with auth middleware and OAuth endpoints
     try:
         app = build_app(extensions)
-        logger.info(f"Starting server on {VAULT_MCP_HOST}:{VAULT_MCP_PORT} with bearer auth + OAuth")
+        _auth_mode = "Cloudflare Access" if cf_on else "bearer auth + OAuth"
+        logger.info(
+            f"Starting server on {VAULT_MCP_HOST}:{VAULT_MCP_PORT} with {_auth_mode}"
+        )
     except Exception as e:
         # Fail CLOSED: never fall back to an unauthenticated server.
         logger.error(f"Could not build the authenticated app: {e}")

@@ -80,6 +80,19 @@ VAULT_MCP_FORWARDED_ALLOW_IPS = os.environ.get("VAULT_MCP_FORWARDED_ALLOW_IPS", 
 # the server falls back to the per-request base_url. A trailing slash is ignored.
 VAULT_MCP_PUBLIC_URL = os.environ.get("VAULT_MCP_PUBLIC_URL", "").strip()
 
+# --- Cloudflare Access (optional, opt-in) ------------------------------------------
+# When BOTH of these are set, the server runs in "Cloudflare Access" mode: it trusts
+# Cloudflare to authenticate the caller at its edge (per-identity SSO / one-time-PIN)
+# and verifies the signed Cf-Access-Jwt-Assertion header Cloudflare injects on every
+# request forwarded through the tunnel. When either is empty the mode is OFF and
+# behaviour is identical to today (the app's own OAuth + static bearer). Both-or-neither,
+# mirroring the sibling telegram-catcher deployment.
+#   TEAM_DOMAIN: the Cloudflare team domain, e.g. "myteam.cloudflareaccess.com" (a bare
+#     "myteam" or a full URL is normalized in cf_access.team_domain()).
+#   AUD: the Access application audience (AUD) tag from the Cloudflare dashboard.
+VAULT_MCP_CF_ACCESS_TEAM_DOMAIN = os.environ.get("VAULT_MCP_CF_ACCESS_TEAM_DOMAIN", "").strip()
+VAULT_MCP_CF_ACCESS_AUD = os.environ.get("VAULT_MCP_CF_ACCESS_AUD", "").strip()
+
 
 def advertised_base_url(request_base_url: str) -> str:
     """Return the canonical origin to advertise, with no trailing slash.
@@ -226,3 +239,7 @@ def validate_config() -> None:
     CLOSED with a clear message instead of booting a broken or insecure server.
     """
     _validate_mcp_path(VAULT_MCP_PATH)
+    # Imported lazily: cf_access imports config, so a top-level import here would cycle.
+    # A no-op unless Cloudflare Access mode is on (both settings set).
+    from .cf_access import validate_cf_access_config
+    validate_cf_access_config()
