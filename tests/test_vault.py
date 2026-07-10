@@ -1,5 +1,8 @@
 """Tests for vault.py -- path resolution, file operations, and safety checks."""
 
+import os
+import stat
+
 import pytest
 from pathlib import Path
 
@@ -7,10 +10,16 @@ from obsidian_vault_mcp.vault import (
     resolve_vault_path,
     read_file,
     write_file_atomic,
+    write_bytes_atomic,
     delete_path,
     move_path,
     list_directory,
 )
+
+
+def _mode(path: Path) -> int:
+    """Permission bits (e.g. 0o640) of path."""
+    return stat.S_IMODE(path.stat().st_mode)
 
 
 def test_resolve_valid_path(vault_dir):
@@ -113,3 +122,73 @@ def test_move_file(vault_dir):
     assert not (vault_dir / "source.md").exists()
     assert (vault_dir / "destination.md").exists()
     assert (vault_dir / "destination.md").read_text() == "Move me."
+
+
+# --- File mode: atomic writes honor umask and preserve existing permissions ---
+# mkstemp forces 0600, which ignores the operator's umask and silently downgrades
+# an existing file's mode on every edit. These lock in the fix. (POSIX-only: on
+# Windows fchmod is absent and mode bits are meaningless.)
+
+pytestmark_posix = pytest.mark.skipif(
+    not hasattr(os, "fchmod"), reason="fchmod/umask semantics are POSIX-only"
+)
+
+
+@pytestmark_posix
+def test_write_new_file_honors_umask(vault_dir):
+    """A newly written note gets 0666 & ~umask (0o640 under umask 0o027), not 0600."""
+    old = os.umask(0o027)
+    try:
+        write_file_atomic("umask-new.md", "content")
+        assert _mode(vault_dir / "umask-new.md") == 0o640
+    finally:
+        os.umask(old)
+
+
+@pytestmark_posix
+def test_write_overwrite_preserves_existing_mode(vault_dir):
+    """Overwriting a 0664 file keeps 0664 -- editing must not clobber permissions."""
+    target = vault_dir / "test-note.md"
+    os.chmod(target, 0o664)
+    write_file_atomic("test-note.md", "Overwritten content.")
+    assert _mode(target) == 0o664
+    assert target.read_text() == "Overwritten content."
+
+
+@pytestmark_posix
+def test_write_bytes_new_file_honors_umask(vault_dir):
+    """The binary writer honors umask too (shared _publish_mode reaches both helpers)."""
+    old = os.umask(0o022)
+    try:
+        write_bytes_atomic("attachment.bin", b"\x00\x01\x02")
+        assert _mode(vault_dir / "attachment.bin") == 0o644
+    finally:
+        os.umask(old)
+
+
+@pytestmark_posix
+def test_write_bytes_no_clobber_honors_umask(vault_dir):
+    """The no-clobber (os.link) create path also honors umask for the new file."""
+    old = os.umask(0o022)
+    try:
+        write_bytes_atomic("new-attachment.bin", b"data", overwrite=False)
+        assert _mode(vault_dir / "new-attachment.bin") == 0o644
+    finally:
+        os.umask(old)
+
+
+def test_write_failure_leaves_no_temp_and_original_intact(vault_dir, monkeypatch):
+    """If the atomic replace fails, no .tmp leaks and the original is untouched."""
+    target = vault_dir / "test-note.md"
+    original = target.read_text()
+
+    def boom(*args, **kwargs):
+        raise OSError("simulated replace failure")
+
+    monkeypatch.setattr(os, "replace", boom)
+    with pytest.raises(OSError):
+        write_file_atomic("test-note.md", "should not land")
+
+    assert target.read_text() == original
+    leftover = [p.name for p in vault_dir.iterdir() if p.name.endswith(".tmp")]
+    assert leftover == []

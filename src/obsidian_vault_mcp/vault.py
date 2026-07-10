@@ -3,11 +3,36 @@
 import fnmatch
 import os
 import shutil
+import stat
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 
 from . import config
+
+
+def _publish_mode(target: Path, tmp_fd: int) -> None:
+    """Give the about-to-be-published temp file the mode a normal write would produce.
+
+    tempfile.mkstemp() always creates its file 0600 (a temp-file security default),
+    ignoring the process umask; that mode would otherwise survive the os.replace and
+    silently downgrade every file the server writes -- breaking sync daemons / other
+    readers and clobbering an existing note's permissions on each edit.
+
+    Overwriting an existing file: keep that file's current mode (a write must not change
+    permissions). New file: reproduce open()'s default, 0666 & ~umask. We fchmod the fd,
+    not the path, so this can't be raced onto a symlinked target between here and replace.
+    A no-op on platforms without fchmod (Windows), where mode bits are meaningless.
+    """
+    if not hasattr(os, "fchmod"):
+        return
+    try:
+        mode = stat.S_IMODE(os.stat(target).st_mode)
+    except FileNotFoundError:
+        umask = os.umask(0)
+        os.umask(umask)
+        mode = 0o666 & ~umask
+    os.fchmod(tmp_fd, mode)
 
 
 def resolve_vault_path(relative_path: str) -> Path:
@@ -88,6 +113,7 @@ def write_file_atomic(
     try:
         with os.fdopen(fd, "wb") as f:
             f.write(encoded)
+            _publish_mode(path, f.fileno())
         os.replace(tmp_path, path)
     except BaseException:
         # Clean up the temp file on any failure
@@ -129,6 +155,7 @@ def write_bytes_atomic(
     try:
         with os.fdopen(fd, "wb") as f:
             f.write(content)
+            _publish_mode(path, f.fileno())
         if overwrite:
             os.replace(tmp_path, path)
         else:
