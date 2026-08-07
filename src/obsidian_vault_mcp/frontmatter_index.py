@@ -25,7 +25,16 @@ class FrontmatterIndex:
         self._pending_paths: set[str] = set()
 
     def start(self) -> None:
-        """Walk all .md files, parse frontmatter, and start watching for changes."""
+        """Walk all .md files, parse frontmatter, and start watching for changes.
+
+        Idempotent: a second call is a no-op if already running, so that an
+        accidental repeat call (e.g. from a future code path) can never
+        orphan a previous Observer/inotify watch instead of replacing it.
+        """
+        if self._observer is not None:
+            logger.warning("FrontmatterIndex.start() called while already running; ignoring")
+            return
+
         t0 = time.monotonic()
         count = 0
 
