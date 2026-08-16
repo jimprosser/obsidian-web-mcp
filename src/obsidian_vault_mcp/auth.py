@@ -16,9 +16,13 @@ _AUTH_EXEMPT_PATHS = {
     "/health",
     "/.well-known/oauth-authorization-server",
     "/.well-known/oauth-protected-resource",
+    "/.well-known/openid-configuration",
     "/oauth/authorize",
     "/oauth/token",
     "/oauth/register",
+    "/register",
+    "/authorize",
+    "/token",
 }
 
 # (method, path) pairs exempt from auth. The MCP spec 2025-06-18 probe on / must

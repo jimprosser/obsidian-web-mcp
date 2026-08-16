@@ -458,8 +458,17 @@ async def oauth_register(request: Request) -> JSONResponse:
 # Starlette routes to mount on the app
 oauth_routes = [
     Route("/.well-known/oauth-authorization-server", oauth_metadata, methods=["GET"]),
+    # Alias: some clients (claude.ai, 2026-08) probe the OIDC discovery path and treat
+    # a non-2xx as fatal instead of falling back to oauth-authorization-server.
+    Route("/.well-known/openid-configuration", oauth_metadata, methods=["GET"]),
     Route("/.well-known/oauth-protected-resource", oauth_protected_resource, methods=["GET"]),
     Route("/oauth/authorize", oauth_authorize, methods=["GET", "POST"]),
     Route("/oauth/token", oauth_token, methods=["POST"]),
     Route("/oauth/register", oauth_register, methods=["POST"]),
+    # Alias: RFC-default registration path clients fall back to when OIDC discovery fails.
+    Route("/register", oauth_register, methods=["POST"]),
+    # Aliases: clients that registered via the fallback path also assume root-level
+    # authorize/token endpoints instead of reading them from AS metadata.
+    Route("/authorize", oauth_authorize, methods=["GET", "POST"]),
+    Route("/token", oauth_token, methods=["POST"]),
 ]

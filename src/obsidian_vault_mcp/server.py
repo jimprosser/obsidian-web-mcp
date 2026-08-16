@@ -841,6 +841,10 @@ def serve(extensions=()):
         # caller spoof the advertised OAuth origin via X-Forwarded-Host.
         proxy_headers=True,
         forwarded_allow_ips=VAULT_MCP_FORWARDED_ALLOW_IPS,
+        # Default 5s closes idle keep-alive sockets faster than remote clients
+        # (claude.ai's connection pool, via the Funnel relay) notice, so they
+        # reuse dead connections and see 502s. 75s matches nginx's default.
+        timeout_keep_alive=75,
     )
 
 
