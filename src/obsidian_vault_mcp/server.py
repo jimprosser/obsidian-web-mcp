@@ -821,12 +821,20 @@ def serve(extensions=()):
         ).start()
         logger.info("Heartbeat enabled (interval: %ds)", heartbeat_interval)
 
-    # Build the Starlette app with auth middleware and OAuth endpoints
+    # Open and validate OAuth state before accepting any request. Filesystem,
+    # migration, and schema failures are fatal; never fall back to ephemeral state.
     try:
+        from .oauth import close_oauth_state, initialize_oauth_state
+
+        initialize_oauth_state()
+        atexit.register(close_oauth_state)
         app = build_app(extensions)
-        logger.info(f"Starting server on {VAULT_MCP_HOST}:{VAULT_MCP_PORT} with bearer auth + OAuth")
+        logger.info(
+            f"Starting server on {VAULT_MCP_HOST}:{VAULT_MCP_PORT} "
+            "with bearer auth + OAuth"
+        )
     except Exception as e:
-        # Fail CLOSED: never fall back to an unauthenticated server.
+        # Fail CLOSED: never fall back to an unauthenticated or ephemeral server.
         logger.error(f"Could not build the authenticated app: {e}")
         sys.exit(1)
 

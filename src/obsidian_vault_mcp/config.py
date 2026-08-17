@@ -40,15 +40,51 @@ VAULT_OAUTH_PASSWORD = os.environ.get("VAULT_OAUTH_PASSWORD", "")
 # browser authorization-code flow (it can still use the client_credentials grant).
 VAULT_OAUTH_REDIRECT_URIS = [u.strip() for u in os.environ.get("VAULT_OAUTH_REDIRECT_URIS", "").split(",") if u.strip()]
 
-# Where the dynamically-registered OAuth client registry is persisted. The registry is
-# otherwise in-memory and wiped on every restart, which breaks already-connected MCP
-# clients (they replay a client_id the restarted server no longer knows). Persisting it
-# keeps connectors working across restarts. It holds per-client secrets, so it is written
-# with 0600 perms (see oauth._save_clients). Override with OAUTH_CLIENTS_PATH.
-OAUTH_CLIENTS_PATH = Path(os.environ.get(
-    "OAUTH_CLIENTS_PATH",
-    Path.home() / ".local" / "share" / "vault-mcp" / "oauth_clients.json",
-))
+# Legacy plaintext dynamic-client registry. Read once by the versioned SQLite
+# migration, then removed only after a durable commit. Override only to locate
+# an existing deployment's source file.
+OAUTH_CLIENTS_PATH = Path(
+    os.environ.get(
+        "OAUTH_CLIENTS_PATH",
+        Path.home() / ".local" / "share" / "vault-mcp" / "oauth_clients.json",
+    )
+)
+
+# Versioned OAuth lifecycle state. Kept outside the vault so credentials and
+# authorization metadata can never be synchronized with note content.
+VAULT_OAUTH_STATE_PATH = Path(
+    os.environ.get(
+        "VAULT_OAUTH_STATE_PATH",
+        Path.home() / ".local/share/vault-mcp/oauth_state.sqlite3",
+    )
+).expanduser()
+VAULT_OAUTH_APPROVED_LEGACY_CLIENT_IDS = frozenset(
+    item.strip()
+    for item in os.environ.get(
+        "VAULT_OAUTH_APPROVED_LEGACY_CLIENT_IDS", ""
+    ).split(",")
+    if item.strip()
+)
+_OAUTH_ACCESS_TOKEN_TTL_RAW = os.environ.get(
+    "VAULT_OAUTH_ACCESS_TOKEN_TTL_SECONDS", "86400"
+)
+
+
+def oauth_access_token_ttl_seconds() -> int:
+    """Return the configured access-token TTL, bounded to 30 days."""
+    try:
+        ttl = int(_OAUTH_ACCESS_TOKEN_TTL_RAW)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "VAULT_OAUTH_ACCESS_TOKEN_TTL_SECONDS must be an integer "
+            "between 1 and 2592000"
+        ) from exc
+    if not 1 <= ttl <= 2_592_000:
+        raise ValueError(
+            "VAULT_OAUTH_ACCESS_TOKEN_TTL_SECONDS must be between "
+            "1 and 2592000"
+        )
+    return ttl
 
 # Network bind address. Defaults to loopback so the server is NOT exposed on the LAN;
 # Cloudflare Tunnel reaches it over localhost. Set to 0.0.0.0 only if you deliberately
@@ -226,3 +262,4 @@ def validate_config() -> None:
     CLOSED with a clear message instead of booting a broken or insecure server.
     """
     _validate_mcp_path(VAULT_MCP_PATH)
+    oauth_access_token_ttl_seconds()
