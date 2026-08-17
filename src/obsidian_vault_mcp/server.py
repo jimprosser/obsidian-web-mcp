@@ -672,11 +672,11 @@ def build_app(extensions=()):
     # TRUST MODEL: extensions are fully-trusted, in-process code the operator passes
     # to serve(). They can do anything the server can (read VAULT_MCP_TOKEN, touch the
     # vault, mutate any route). This is NOT a sandbox and CANNOT stop a hostile
-    # extension. The check below is a best-effort FOOTGUN guard for honest authors: it
-    # fails closed when a newly-added route would land on an auth-exempt path (which
-    # the bearer middleware skips before routing) and would thus be served
-    # unauthenticated. It does not (and cannot) defend against an extension that
-    # mutates an existing route in place, opens a raw socket, etc.
+    # extension. The check below is a startup FOOTGUN guard for honest authors: it
+    # fails closed when a newly-added route cannot be inspected or would land on an
+    # auth-exempt path (which the bearer middleware skips before routing) and would
+    # thus be served unauthenticated. It does not (and cannot) defend against an
+    # extension that mutates an existing route in place, opens a raw socket, etc.
     from starlette.routing import Match, Mount, WebSocketRoute
 
     from .auth import _AUTH_EXEMPT_METHOD_PATHS, _AUTH_EXEMPT_PATHS
@@ -688,18 +688,17 @@ def build_app(extensions=()):
     ext_routes = [r for r in app.routes if id(r) not in before_ids]
 
     def _covers(route, method, path):
-        """Match enum for route vs (method, path); NONE if the probe can't run."""
+        """Return how a route covers a method/path probe, rejecting unknown behavior."""
         try:
             match, _ = route.matches(
                 {"type": "http", "method": method, "path": path, "headers": []}
             )
-            return match
-        except Exception:
-            logger.warning(
-                "extension route %r could not be auth-checked; allowing "
-                "(trusted-extension model)", getattr(route, "path", route)
-            )
-            return Match.NONE
+        except Exception as exc:
+            route_path = getattr(route, "path", route)
+            raise ValueError(
+                f"extension route {route_path!r} could not be safely inspected"
+            ) from exc
+        return match
 
     for r in ext_routes:
         # Footguns: a Mount can shadow an exempt prefix; a WebSocketRoute isn't covered

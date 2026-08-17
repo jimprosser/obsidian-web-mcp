@@ -60,7 +60,7 @@ def _state(
 ) -> OAuthState:
     vault, state_path, legacy_path = state_paths
     clock = (lambda: now[0]) if now is not None else None
-    return OAuthState(
+    state = OAuthState(
         state_path,
         vault_path=vault,
         legacy_path=legacy_path,
@@ -71,6 +71,8 @@ def _state(
             client_id == "static-client" and secrets_equal(secret, static_secret)
         ),
     )
+    state.migrate_legacy()
+    return state
 
 
 def secrets_equal(left: str, right: str) -> bool:

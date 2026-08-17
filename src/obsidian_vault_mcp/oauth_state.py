@@ -202,12 +202,16 @@ class OAuthState:
         try:
             self._configure_connection()
             self._initialize_schema()
-            self._migrate_legacy_once()
             self._secure_state_files()
         except BaseException:
             self._connection.close()
             self._closed = True
             raise
+
+    def migrate_legacy(self) -> None:
+        """Import and remove the configured legacy JSON source exactly once."""
+        self._migrate_legacy_once()
+
 
     @property
     def schema_version(self) -> int:

@@ -164,6 +164,20 @@ def test_extension_wildcard_route_covering_exempt_path_is_rejected(vault_dir):
         server.build_app([_ext_adding(Route("/{rest:path}", _leak, methods=["GET"]))])
 
 
+def test_extension_route_that_cannot_be_inspected_is_rejected(vault_dir):
+    """Inspection failure must not let an extension shadow an exempt route."""
+
+    class DeferredRoute(Route):
+        def matches(self, scope):
+            if "query_string" not in scope:
+                raise RuntimeError("route requires a complete request scope")
+            return super().matches(scope)
+
+    route = DeferredRoute("/health", _leak, methods=["GET"])
+    with pytest.raises(ValueError, match="inspect"):
+        server.build_app([_ext_adding(route)])
+
+
 def test_extension_mount_is_rejected(vault_dir):
     """Mounts are too broad to reason about — rejected outright."""
     from starlette.routing import Mount

@@ -362,6 +362,36 @@ def test_client_credentials_rejects_wrong_secret_and_resource(client):
     assert wrong_resource.json()["error"] == "invalid_target"
 
 
+def test_client_credentials_accepts_configured_unicode_secret(client, monkeypatch):
+    monkeypatch.setattr(config, "VAULT_OAUTH_CLIENT_SECRET", "секрет")
+    with TestClient(client.app, raise_server_exceptions=False) as tolerant_client:
+        response = tolerant_client.post(
+            "/oauth/token",
+            data={
+                "grant_type": "client_credentials",
+                "client_id": STATIC_CLIENT_ID,
+                "client_secret": "секрет",
+                "resource": RESOURCE,
+            },
+        )
+
+    assert response.status_code == 200
+
+
+def test_authorize_rejects_wrong_unicode_credentials_without_server_error(client):
+    client_id, _, redirect_uri = _register(client)
+    params = _authz_params(client_id, redirect_uri)
+    with TestClient(client.app, raise_server_exceptions=False) as tolerant_client:
+        response = tolerant_client.post(
+            "/oauth/authorize",
+            data={**params, "username": "пользователь", "password": "пароль"},
+            follow_redirects=False,
+        )
+
+    assert response.status_code == 401
+    assert "Invalid username or password" in response.text
+
+
 def test_authorize_requires_interactive_login(client):
     client_id, _, redirect_uri = _register(client)
     params = _authz_params(client_id, redirect_uri)
@@ -377,6 +407,33 @@ def test_authorize_requires_interactive_login(client):
     assert "<form" in get_response.text
     assert wrong_response.status_code == 401
     assert "location" not in wrong_response.headers
+
+
+def test_consent_form_identifies_client_and_redirect_without_rendering_markup(client):
+    redirect_uri = (
+        "https://client.example.test/callback?next=<unsafe>&mode=consent"
+    )
+    registration = client.post(
+        "/oauth/register",
+        json={
+            "client_name": "<img src=x onerror=alert(1)>",
+            "redirect_uris": [redirect_uri],
+        },
+    )
+    assert registration.status_code == 201
+
+    response = client.get(
+        "/oauth/authorize",
+        params=_authz_params(registration.json()["client_id"], redirect_uri),
+    )
+
+    assert response.status_code == 200
+    assert "<img src=x" not in response.text
+    assert "&lt;img src=x onerror=alert(1)&gt;" in response.text
+    assert (
+        "<code>https://client.example.test/callback?"
+        "next=&lt;unsafe&gt;&amp;mode=consent</code>"
+    ) in response.text
 
 
 def test_missing_login_configuration_fails_closed(client, monkeypatch):
@@ -477,33 +534,33 @@ def test_authorization_request_validation(client, changes, error):
     assert response.json()["error"] == error
 
 
-def test_registration_filters_unsafe_redirects(client):
+@pytest.mark.parametrize(
+    "redirect_uris",
+    [
+        [],
+        [123],
+        ["http://evil.example.test/callback"],
+        [
+            "https://safe.example.test/callback",
+            "http://evil.example.test/callback",
+        ],
+    ],
+)
+def test_registration_rejects_empty_or_invalid_redirect_metadata(
+    client,
+    redirect_uris,
+):
+    state = oauth.get_oauth_state()
+    clients_before = state.list_clients()
+
     response = client.post(
         "/oauth/register",
-        json={
-            "redirect_uris": [
-                "http://evil.example.test/callback",
-                "http://localhost:1234/callback",
-                "https://safe.example.test/callback",
-            ]
-        },
+        json={"redirect_uris": redirect_uris},
     )
 
-    assert response.status_code == 201
-    assert response.json()["redirect_uris"] == [
-        "http://localhost:1234/callback",
-        "https://safe.example.test/callback",
-    ]
-
-
-def test_registration_with_no_safe_redirect_cannot_authorize(client):
-    client_id, _, _ = _register(client, "http://evil.example.test/callback")
-    params = _authz_params(client_id, "http://evil.example.test/callback")
-
-    response = client.get("/oauth/authorize", params=params)
-
     assert response.status_code == 400
-    assert response.json()["error"] == "invalid_request"
+    assert response.json()["error"] == "invalid_redirect_uri"
+    assert state.list_clients() == clients_before
 
 
 def test_oauth_metadata_advertises_confidential_code_flow(client):

@@ -481,6 +481,38 @@ def test_read_only_token_gets_403_on_protected_non_mcp_route(policy_client):
     assert 'error="insufficient_scope"' in response.headers["WWW-Authenticate"]
 
 
+def test_dynamic_bearer_authentication_does_not_mutate_static_client(
+    policy_client,
+    monkeypatch,
+):
+    monkeypatch.setattr(config, "VAULT_OAUTH_CLIENT_ID", "configured-static")
+    monkeypatch.setattr(config, "VAULT_OAUTH_CLIENT_SECRET", "configured-secret")
+    monkeypatch.setattr(
+        config,
+        "VAULT_OAUTH_REDIRECT_URIS",
+        ["https://static.example.test/callback"],
+    )
+    _client_id, token = _issue_dynamic_token(policy_client, "read-only-auth")
+    state = oauth.get_oauth_state()
+    statements: list[str] = []
+    state._connection.set_trace_callback(statements.append)
+    try:
+        response = policy_client.get(
+            "/__private",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+    finally:
+        state._connection.set_trace_callback(None)
+
+    assert response.status_code == 403
+    mutations = [
+        statement
+        for statement in statements
+        if statement.lstrip().partition(" ")[0].upper() in {"DELETE", "INSERT", "UPDATE"}
+    ]
+    assert mutations == []
+
+
 def test_master_can_reach_protected_non_mcp_route(policy_client):
     response = policy_client.get(
         "/__private",

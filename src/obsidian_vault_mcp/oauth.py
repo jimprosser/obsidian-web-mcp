@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import hmac
 import html
 import logging
@@ -28,12 +29,19 @@ logger = logging.getLogger(__name__)
 _oauth_state: OAuthState | None = None
 
 
+def _text_matches(candidate: str, expected: str) -> bool:
+    """Compare arbitrary Unicode text through fixed-length byte digests."""
+    candidate_digest = hashlib.sha256(candidate.encode("utf-8")).digest()
+    expected_digest = hashlib.sha256(expected.encode("utf-8")).digest()
+    return hmac.compare_digest(candidate_digest, expected_digest)
+
+
 def _static_client_authenticator(client_id: str, client_secret: str) -> bool:
     return bool(
         config.VAULT_OAUTH_CLIENT_ID
         and config.VAULT_OAUTH_CLIENT_SECRET
-        and hmac.compare_digest(client_id, config.VAULT_OAUTH_CLIENT_ID)
-        and hmac.compare_digest(client_secret, config.VAULT_OAUTH_CLIENT_SECRET)
+        and _text_matches(client_id, config.VAULT_OAUTH_CLIENT_ID)
+        and _text_matches(client_secret, config.VAULT_OAUTH_CLIENT_SECRET)
     )
 
 
@@ -44,7 +52,7 @@ def initialize_oauth_state() -> OAuthState:
     if _oauth_state is not None and _oauth_state.path != configured_path:
         close_oauth_state()
     if _oauth_state is None:
-        _oauth_state = OAuthState(
+        state = OAuthState(
             configured_path,
             vault_path=config.VAULT_PATH,
             legacy_path=config.OAUTH_CLIENTS_PATH,
@@ -52,13 +60,19 @@ def initialize_oauth_state() -> OAuthState:
             access_token_ttl_seconds=(config.oauth_access_token_ttl_seconds()),
             static_client_authenticator=_static_client_authenticator,
         )
-    if config.VAULT_OAUTH_CLIENT_ID:
-        _oauth_state.ensure_static_client(
-            config.VAULT_OAUTH_CLIENT_ID,
-            config.VAULT_OAUTH_REDIRECT_URIS,
-            policy=LEGACY_FULL,
-            capabilities=(),
-        )
+        try:
+            state.migrate_legacy()
+            if config.VAULT_OAUTH_CLIENT_ID:
+                state.ensure_static_client(
+                    config.VAULT_OAUTH_CLIENT_ID,
+                    config.VAULT_OAUTH_REDIRECT_URIS,
+                    policy=LEGACY_FULL,
+                    capabilities=(),
+                )
+        except BaseException:
+            state.close()
+            raise
+        _oauth_state = state
     return _oauth_state
 
 
@@ -175,14 +189,15 @@ def _check_credentials(username: str, password: str) -> bool:
     expected_username = config.VAULT_OAUTH_USERNAME or "obsidian"
     return bool(
         _login_configured()
-        and hmac.compare_digest(username, expected_username)
-        and hmac.compare_digest(password, config.VAULT_OAUTH_PASSWORD)
+        and _text_matches(username, expected_username)
+        and _text_matches(password, config.VAULT_OAUTH_PASSWORD)
     )
 
 
 def _login_form(
     params: Mapping[str, str],
     *,
+    client_name: str,
     error: str | None = None,
     status_code: int = 200,
 ) -> HTMLResponse:
@@ -192,12 +207,16 @@ def _login_form(
         for name, value in params.items()
     )
     error_html = f'<p role="alert">{html.escape(error)}</p>' if error else ""
+    client_name_html = html.escape(client_name)
+    redirect_uri_html = html.escape(params["redirect_uri"])
     content = f"""<!doctype html>
 <html lang="en">
 <head><meta charset="utf-8"><title>Authorize Obsidian Vault MCP</title></head>
 <body>
   <main>
     <h1>Authorize Obsidian Vault MCP</h1>
+    <p>Client: <strong>{client_name_html}</strong></p>
+    <p>Redirect URI: <code>{redirect_uri_html}</code></p>
     {error_html}
     <form method="post" action="/oauth/authorize">
       {hidden}
@@ -228,8 +247,11 @@ async def oauth_authorize(request: Request):
     if not _login_configured():
         logger.error("OAuth authorization refused: login is not configured")
         return _login_misconfigured()
+    state = get_oauth_state()
+    client = state.get_client(params["client_id"])
+    assert client is not None
     if request.method == "GET":
-        return _login_form(params)
+        return _login_form(params, client_name=client.client_name)
 
     assert form is not None
     username = str(form.get("username", "") or "")
@@ -237,12 +259,12 @@ async def oauth_authorize(request: Request):
     if not _check_credentials(username, password):
         logger.warning("OAuth login failed")
         return _login_form(
-            params, error="Invalid username or password", status_code=401
+            params,
+            client_name=client.client_name,
+            error="Invalid username or password",
+            status_code=401,
         )
 
-    state = get_oauth_state()
-    client = state.get_client(params["client_id"])
-    assert client is not None
     requires_reauthorization = client.policy == REAUTHORIZATION_REQUIRED
     code = state.issue_authorization_code(
         client_id=client.client_id,
@@ -383,13 +405,15 @@ async def oauth_register(request: Request) -> JSONResponse:
     raw_redirects = body.get("redirect_uris", [])
     if not isinstance(raw_redirects, list):
         return _oauth_error("invalid_client_metadata", "redirect_uris must be an array")
-    redirect_uris = list(
-        dict.fromkeys(
-            uri
-            for uri in raw_redirects
-            if isinstance(uri, str) and _valid_redirect_uri(uri)
+    if not raw_redirects or any(
+        not isinstance(uri, str) or not _valid_redirect_uri(uri)
+        for uri in raw_redirects
+    ):
+        return _oauth_error(
+            "invalid_redirect_uri",
+            "redirect_uris must contain only HTTPS or loopback HTTP URIs",
         )
-    )
+    redirect_uris = list(dict.fromkeys(raw_redirects))
     client_name = body.get("client_name", "Obsidian Vault MCP Client")
     if not isinstance(client_name, str):
         return _oauth_error("invalid_client_metadata", "client_name must be a string")

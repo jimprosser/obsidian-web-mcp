@@ -149,3 +149,32 @@ def test_backup_is_online_reopenable_and_secret_free(tmp_path):
     backup_bytes = backup.read_bytes()
     assert registered.client_secret.encode() not in backup_bytes
     assert issued.access_token.encode() not in backup_bytes
+
+
+def test_metadata_command_does_not_consume_pending_legacy_migration(tmp_path):
+    vault = tmp_path / "vault"
+    vault.mkdir(mode=0o700)
+    legacy_path = tmp_path / "legacy" / "clients.json"
+    legacy_path.parent.mkdir(mode=0o700)
+    legacy_path.write_text(
+        json.dumps(
+            {
+                "pending-client": {
+                    "client_secret": "pending-secret",
+                    "redirect_uris": [REDIRECT],
+                }
+            }
+        )
+    )
+    legacy_path.chmod(0o600)
+
+    result, payload, stderr = _run(tmp_path, "clients", "list")
+
+    assert result == 0
+    assert stderr == ""
+    assert payload == []
+    assert legacy_path.exists()
+    with sqlite3.connect(tmp_path / "state" / "oauth.sqlite3") as connection:
+        assert connection.execute(
+            "SELECT count(*) FROM migration_metadata"
+        ).fetchone() == (0,)
