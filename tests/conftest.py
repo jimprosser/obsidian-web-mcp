@@ -1,7 +1,5 @@
 """Test fixtures for the Obsidian vault MCP server."""
 
-import os
-import tempfile
 from pathlib import Path
 
 import pytest
@@ -39,6 +37,13 @@ def vault_dir(tmp_path, monkeypatch):
 
     # Reload config to pick up new env var
     import obsidian_vault_mcp.config as config
+    from obsidian_vault_mcp import oauth
+
+    oauth.close_oauth_state()
     config.VAULT_PATH = Path(str(vault))
+    config.VAULT_OAUTH_STATE_PATH = tmp_path / "oauth-state" / "oauth.sqlite3"
+    config.OAUTH_CLIENTS_PATH = tmp_path / "legacy" / "oauth_clients.json"
+    config.VAULT_OAUTH_APPROVED_LEGACY_CLIENT_IDS = frozenset()
 
     yield vault
+    oauth.close_oauth_state()

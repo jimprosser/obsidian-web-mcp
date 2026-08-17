@@ -127,12 +127,6 @@ def _now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def _hash_value(value: str | None) -> str | None:
-    if not value:
-        return None
-    return hashlib.sha256(value.encode("utf-8")).hexdigest()
-
-
 def _sha256_file(path: Path) -> str | None:
     if not path.is_file():
         return None
@@ -168,7 +162,9 @@ def before_target_path(operation: str, context: dict[str, Any]) -> Any:
     return context.get("path") or context.get("source")
 
 
-def infer_target_path(operation: str, context: dict[str, Any], result: dict[str, Any] | None = None) -> Any:
+def infer_target_path(
+    operation: str, context: dict[str, Any], result: dict[str, Any] | None = None
+) -> Any:
     """Best-effort target path from the call context and the parsed result payload."""
     result = result or {}
     if operation == "vault_move":
@@ -176,7 +172,11 @@ def infer_target_path(operation: str, context: dict[str, Any], result: dict[str,
     if operation == "vault_batch_frontmatter_update":
         results = result.get("results")
         if isinstance(results, list):
-            paths = [item.get("path") for item in results if isinstance(item, dict) and item.get("path")]
+            paths = [
+                item.get("path")
+                for item in results
+                if isinstance(item, dict) and item.get("path")
+            ]
             if paths:
                 return paths
     return result.get("path") or context.get("path") or context.get("source")
@@ -193,19 +193,22 @@ def build_audit_record(
 ) -> dict[str, Any]:
     """Build one normalized audit record from the current request context."""
     ctx = current_request_context()
+    principal = ctx.principal if ctx is not None else None
     before = before or {"size": None, "checksum": None}
     after = after or {"size": None, "checksum": None}
     return {
         "timestamp": _now_utc().isoformat(),
-        "token_id_hash": _hash_value(ctx.get("principal")),
-        "client_id": ctx.get("client"),
+        "token_id_hash": (principal.credential_id if principal is not None else None),
+        "principal_id": (principal.principal_id if principal is not None else None),
+        "client_id": principal.client_id if principal is not None else None,
+        "auth_policy": principal.policy if principal is not None else None,
+        "request_id": ctx.request_id if ctx is not None else uuid.uuid4().hex,
         "operation": operation,
         "target_path": target_path,
         "size_before": before.get("size"),
         "size_after": after.get("size"),
         "checksum_before": before.get("checksum"),
         "checksum_after": after.get("checksum"),
-        "request_id": ctx.get("request_id") or uuid.uuid4().hex,
         "operation_status": operation_status,
         "error": error,
     }

@@ -117,7 +117,7 @@ All configuration is via environment variables:
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
 | `VAULT_PATH` | Yes | `~/Obsidian/MyVault` | Absolute path to your Obsidian vault directory |
-| `VAULT_MCP_TOKEN` | Yes | (none) | 256-bit bearer token validated on every MCP request |
+| `VAULT_MCP_TOKEN` | Yes | (none) | 256-bit master bearer. Protected requests also accept validated durable OAuth access tokens under their stored policy. |
 | `VAULT_OAUTH_PASSWORD` | **Yes** | (none) | Password for the interactive login at `/oauth/authorize`. **If unset, the server refuses to authorize any client (fail-closed).** |
 | `VAULT_OAUTH_USERNAME` | No | `obsidian` | Username for the interactive login |
 | `VAULT_MCP_HOST` | No | `127.0.0.1` | Bind address. Loopback by default; set `0.0.0.0` only for deliberate LAN exposure |
@@ -129,6 +129,10 @@ All configuration is via environment variables:
 | `VAULT_OAUTH_CLIENT_ID` | No | `vault-mcp-client` | Client ID for the headless `client_credentials` grant |
 | `VAULT_OAUTH_CLIENT_SECRET` | No | (none) | Only required for the headless `client_credentials` grant. The Claude/ChatGPT browser flow uses dynamic client registration and does **not** need this. |
 | `VAULT_OAUTH_REDIRECT_URIS` | No | (none) | Comma-separated allowlist of redirect URIs for the static `VAULT_OAUTH_CLIENT_ID` when using the browser flow. Dynamically-registered clients (Claude/ChatGPT) carry their own; leave unset unless you connect a static client through `/oauth/authorize`. |
+| `VAULT_OAUTH_STATE_PATH` | No | `~/.local/share/vault-mcp/oauth_state.sqlite3` | Versioned SQLite lifecycle store. Must remain outside `VAULT_PATH`; its final directory must be owner-only (`0700`). The database and SQLite sidecars must be owner-only (`0600`). Unsafe paths, ownership, modes, or symlinks fail startup before SQLite opens. |
+| `VAULT_OAUTH_ACCESS_TOKEN_TTL_SECONDS` | No | `86400` | Lifetime of newly issued per-client access tokens. Must be an integer from 1 second through 30 days (`2592000`); invalid values fail startup. |
+| `VAULT_OAUTH_APPROVED_LEGACY_CLIENT_IDS` | No | (none) | Comma-separated IDs from the legacy JSON registry that may retain temporary `legacy_full` policy during the one-way import. Every other imported client requires fresh interactive authorization and receives `vault_readonly_v1`. An allowlisted ID absent from the source aborts migration. |
+| `OAUTH_CLIENTS_PATH` | No | `~/.local/share/vault-mcp/oauth_clients.json` | Legacy plaintext client registry read once for migration. The source must be an owner-only regular file outside the vault. It is removed only after the SQLite import commits durably. |
 | `VAULT_DAILY_NOTES_FOLDER` | No | (none) | Folder for the daily-note tools; empty means the vault root |
 | `VAULT_DAILY_NOTES_FORMAT` | No | `%Y-%m-%d` | `strftime` pattern for the daily-note filename |
 | `VAULT_DAILY_NOTES_TEMPLATE` | No | (none) | `strftime` template prepended when a daily note is first created |
@@ -139,6 +143,31 @@ All configuration is via environment variables:
 
 Generate secrets with: `python -c "import secrets; print(secrets.token_hex(32))"`
 
+### OAuth lifecycle state
+
+Dynamic client secrets, authorization codes, and access tokens are never stored
+in plaintext. SQLite contains domain-separated verifiers plus metadata. Codes
+expire after exactly five minutes and are consumed atomically; access tokens use
+the versioned `v1.<identifier>.<secret>` wire format, bounded expiry, independent
+revocation, canonical resource binding, and a capability snapshot.
+
+Local operator commands expose metadata only:
+
+```bash
+vault-mcp-oauth clients list
+vault-mcp-oauth clients revoke <client-id>
+vault-mcp-oauth tokens list [--client-id <client-id>] [--active-only]
+vault-mcp-oauth tokens revoke <token-id>
+vault-mcp-oauth backup /secure/path/oauth_state.sqlite3
+```
+
+The backup command uses SQLite's online backup API and applies the same
+outside-vault, ownership, mode, and symlink checks as the live state. Neither
+inventory nor revoke output includes client secrets, authorization codes, or
+complete bearer tokens.
+
+Every protected request accepts either the configured `VAULT_MCP_TOKEN` master credential or a durable `v1.*` OAuth access token. Dynamic and freshly reauthorized clients receive the fail-closed `vault_readonly_v1` policy: discovery and dispatch expose exactly `vault_batch_read`, `vault_list`, `vault_read`, `vault_search`, and `vault_search_frontmatter`; resources and prompts remain unavailable. Approved imported clients temporarily retain `legacy_full`, matching master access. Invalid, expired, revoked, wrong-resource, and unknown-policy credentials are rejected before MCP dispatch. Non-MCP extension routes require full access.
+
 ## Audit logging
 
 Set `VAULT_AUDIT_LOG_PATH` to a file path to record every vault mutation as an append-only
@@ -146,13 +175,10 @@ JSON line. Auditing is **off by default**; with no path set there is no overhead
 searches are logged too when `VAULT_AUDIT_LOG_INCLUDE_READS` is on (off by default, since
 reads are high-volume).
 
-Each record carries: `timestamp` (UTC), `token_id_hash` (SHA-256 of the bearer token -- the
-raw token is never written), `client_id` (a best-effort User-Agent hint), `operation`,
-`target_path`, `size_before`/`size_after`, `checksum_before`/`checksum_after` (SHA-256),
-`request_id`, `operation_status`, and `error`. Example line:
+Each record carries: `timestamp` (UTC), `token_id_hash` (the validated credential's stable SHA-256 identifier; the raw bearer is never retained), `principal_id` (`master` or `oauth:<client-id>`), `client_id` (the durable OAuth client ID, or `null` for master), `auth_policy`, `operation`, `target_path`, `size_before`/`size_after`, `checksum_before`/`checksum_after` (SHA-256), `request_id`, `operation_status`, and `error`. Example line:
 
 ```json
-{"checksum_after":"9f86d0…","checksum_before":null,"client_id":"claude","error":null,"operation":"vault_write","operation_status":"success","request_id":"a1b2…","size_after":42,"size_before":null,"target_path":"notes/today.md","timestamp":"2026-06-14T18:30:00+00:00","token_id_hash":"5e88…"}
+{"auth_policy":"legacy_full","checksum_after":"9f86d0…","checksum_before":null,"client_id":"vault-mcp-a1b2…","error":null,"operation":"vault_write","operation_status":"success","principal_id":"oauth:vault-mcp-a1b2…","request_id":"a1b2…","size_after":42,"size_before":null,"target_path":"notes/today.md","timestamp":"2026-08-17T18:30:00+00:00","token_id_hash":"5e88…"}
 ```
 
 **Put the log outside the vault.** `VAULT_AUDIT_LOG_PATH` must resolve outside `VAULT_PATH`.
@@ -180,7 +206,7 @@ The Claude desktop and mobile apps can connect to remote MCP servers via OAuth.
 4. Claude registers automatically (dynamic client registration) and discovers the OAuth endpoints
 5. Claude opens a browser window at the server's `/oauth/authorize`
 6. **Sign in** with your `VAULT_OAUTH_USERNAME` / `VAULT_OAUTH_PASSWORD`; the server then issues the authorization and redirects back
-7. Claude now has access to all nine vault tools -- on desktop and mobile
+7. Claude now has read-only access to the five authorized vault tools on desktop and mobile
 
 For local-only use (no tunnel), point Claude at `http://localhost:8420`.
 
@@ -284,7 +310,9 @@ src/obsidian_vault_mcp/
     extensions.py           # Extension seam: base class for adding tools/routes/hooks
     frontmatter_index.py    # In-memory YAML frontmatter index with filesystem watcher
     models.py               # Pydantic input validation models
-    oauth.py                # OAuth 2.0 authorization code flow with PKCE
+    oauth.py                # OAuth routes and confidential-client exchange
+    oauth_admin.py          # Metadata-only lifecycle inventory/revoke/backup CLI
+    oauth_state.py          # Transactional SQLite OAuth lifecycle store
     serialization.py        # JSON encoder for tool responses (dates, etc.)
     server.py               # FastMCP server setup, tool registration, entry point
     vault.py                # Core filesystem operations (path security, atomic writes)
@@ -300,6 +328,8 @@ tests/
     test_frontmatter.py     # Frontmatter index and query tests
     test_issues_5_28.py     # Regression tests for date serialization + index rebuild
     test_oauth.py           # OAuth flow, PKCE, and auth-bypass regression tests
+    test_oauth_admin.py     # Metadata-only local operator operations
+    test_oauth_state.py     # Persistence, migration, expiry, and concurrency
     test_tools.py           # Integration tests for tool functions
     test_vault.py           # Path resolution and file operation tests
 scripts/
@@ -320,9 +350,12 @@ from obsidian_vault_mcp.write_events import register_write_listener
 
 
 class MyExtension(Extension):
-    def register_tools(self, mcp):
-        # add @mcp.tool tools BEFORE the app/tool schema is built
-        ...
+    def register_tools(self, registrar):
+        # tools registered here are denied to restricted clients by default;
+        # set required_capability only when intentionally reusing a capability
+        @registrar.tool(name="my_tool")
+        def my_tool():
+            return "ok"
 
     def before_indexes_start(self, frontmatter_index):
         # e.g. attach a change listener so no change is missed once the index starts
@@ -335,7 +368,7 @@ class MyExtension(Extension):
         ...
 
     def register_routes(self, app):
-        # add Starlette routes (bearer-protected like the rest of the surface)
+        # add a protected non-MCP route; never shadow the MCP transport path
         ...
 
     def shutdown(self):
@@ -359,11 +392,12 @@ Two things worth knowing:
 - **Extension routes are authenticated, with a footgun guard.** Routes are registered
   before the bearer-auth middleware, so they require the bearer token like every other
   route. As a guardrail against honest mistakes, `build_app()` **fails closed** if an
-  extension adds a route that would cover an auth-exempt path (`/health`, `/oauth/*`,
-  `/.well-known/*`, or the off-root `GET/HEAD /` probe) — including via a wildcard
-  pattern — and rejects extension `Mount`s and `WebSocketRoute`s outright. This catches
-  accidents; it is **not** a boundary against a hostile extension (which, running
-  in-process, could bypass it anyway — see the trust model above).
+  extension route covers the MCP transport path (which would bypass per-client MCP policy)
+  or an auth-exempt path (`/health`, `/oauth/*`, `/.well-known/*`, or the off-root
+  `GET/HEAD /` probe), including via a wildcard pattern. Extension `Mount`s and
+  `WebSocketRoute`s are rejected outright. This catches accidents; it is **not** a
+  boundary against a hostile extension (which, running in-process, could bypass it anyway
+  — see the trust model above).
 - **The stock server is unaffected.** With no extensions, `serve()` behaves exactly like
   the previous `main()`; `FrontmatterIndex` change listeners and write listeners are a no-op
   with none registered.

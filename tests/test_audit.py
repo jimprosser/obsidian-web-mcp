@@ -12,8 +12,16 @@ import pytest
 
 from obsidian_vault_mcp import audit, config, context, server
 
-PRINCIPAL = "test-bearer-token-abc123"
-EXPECTED_HASH = __import__("hashlib").sha256(PRINCIPAL.encode("utf-8")).hexdigest()
+RAW_TOKEN = "test-bearer-token-abc123"
+EXPECTED_HASH = __import__("hashlib").sha256(RAW_TOKEN.encode("utf-8")).hexdigest()
+PRINCIPAL = context.AuthenticatedPrincipal(
+    principal_id="oauth:pytest",
+    credential_id=EXPECTED_HASH,
+    client_id="pytest",
+    policy="vault_readonly_v1",
+    capabilities=frozenset({"vault_read"}),
+    full_access=False,
+)
 
 
 @pytest.fixture
@@ -22,7 +30,7 @@ def audit_log(vault_dir, tmp_path, monkeypatch):
     log_path = tmp_path / "audit" / "mutations.jsonl"
     monkeypatch.setattr(config, "VAULT_AUDIT_LOG_PATH", str(log_path))
     monkeypatch.setattr(config, "VAULT_AUDIT_LOG_INCLUDE_READS", False)
-    token = context.set_request_context(principal=PRINCIPAL, request_id="req-1", client="pytest")
+    token = context.set_request_context(principal=PRINCIPAL, request_id="req-1")
     yield log_path
     context.reset_request_context(token)
 
@@ -44,6 +52,14 @@ def test_audit_off_by_default(vault_dir, monkeypatch, tmp_path):
     assert audit.should_audit_operation("vault_write") is False
 
 
+def test_audit_record_without_authenticated_request_has_no_identity():
+    record = audit.build_audit_record(operation="test", target_path=None)
+    assert record["token_id_hash"] is None
+    assert record["principal_id"] is None
+    assert record["client_id"] is None
+    assert record["auth_policy"] is None
+
+
 # --- mutations ---
 
 def test_mutation_writes_record_with_required_fields(audit_log):
@@ -52,9 +68,9 @@ def test_mutation_writes_record_with_required_fields(audit_log):
     assert len(records) == 1
     rec = records[0]
     for field in (
-        "timestamp", "token_id_hash", "client_id", "operation", "target_path",
-        "size_before", "size_after", "checksum_before", "checksum_after",
-        "request_id", "operation_status", "error",
+        "timestamp", "token_id_hash", "principal_id", "client_id", "auth_policy",
+        "operation", "target_path", "size_before", "size_after", "checksum_before",
+        "checksum_after", "request_id", "operation_status", "error",
     ):
         assert field in rec
     assert rec["operation"] == "vault_write"
@@ -68,9 +84,11 @@ def test_mutation_writes_record_with_required_fields(audit_log):
 def test_raw_token_never_written_only_hash(audit_log):
     server.vault_write("audited.md", "secret content")
     raw = audit_log.read_text(encoding="utf-8")
-    assert PRINCIPAL not in raw
+    assert RAW_TOKEN not in raw
     assert _records(audit_log)[0]["token_id_hash"] == EXPECTED_HASH
     assert _records(audit_log)[0]["client_id"] == "pytest"
+    assert _records(audit_log)[0]["principal_id"] == "oauth:pytest"
+    assert _records(audit_log)[0]["auth_policy"] == "vault_readonly_v1"
 
 
 def test_overwrite_captures_before_and_after(audit_log):
@@ -125,7 +143,7 @@ def test_audit_write_failure_does_not_break_tool(vault_dir, monkeypatch):
     bad = vault_dir / "test-note.md" / "audit.jsonl"
     monkeypatch.setattr(config, "VAULT_AUDIT_LOG_PATH", str(bad))
     assert audit.audit_path_writable() is False
-    token = context.set_request_context(principal=PRINCIPAL, request_id="r", client="c")
+    token = context.set_request_context(principal=PRINCIPAL, request_id="r")
     try:
         result = json.loads(server.vault_write("still-works.md", "body"))
         assert result["created"] is True        # the write itself succeeded despite audit failing

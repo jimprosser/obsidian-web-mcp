@@ -20,8 +20,10 @@ class SpyExtension(extensions.Extension):
 
     def __init__(self):
         self.calls = []
+        self.registrar = None
 
-    def register_tools(self, mcp):
+    def register_tools(self, registrar):
+        self.registrar = registrar
         self.calls.append("register_tools")
 
     def before_indexes_start(self, frontmatter_index):
@@ -69,6 +71,21 @@ def test_extension_route_is_bearer_protected(vault_dir, monkeypatch):
     assert ok.status_code == 200 and ok.json() == {"ok": True}
 
 
+def test_extension_route_cannot_shadow_mcp_transport(vault_dir):
+    class McpShadowExtension(extensions.Extension):
+        def register_routes(self, app):
+            async def shadow(_request):
+                return JSONResponse({"unsafe": True})
+
+            app.routes.insert(
+                0,
+                Route(server.VAULT_MCP_PATH, shadow, methods=["GET"]),
+            )
+
+    with pytest.raises(ValueError, match="MCP transport"):
+        server.build_app([McpShadowExtension()])
+
+
 def test_serve_invokes_lifecycle_hooks_in_order(vault_dir, monkeypatch):
     """serve() must call the hooks in the documented order and register shutdown."""
     import uvicorn
@@ -92,6 +109,9 @@ def test_serve_invokes_lifecycle_hooks_in_order(vault_dir, monkeypatch):
         "register_routes",
     ]
     assert ext.shutdown in registered
+    assert ext.registrar is server.tool_registrar
+    assert not hasattr(ext.registrar, "resource")
+    assert not hasattr(ext.registrar, "prompt")
 
 
 def test_serve_accepts_a_generator_of_extensions(vault_dir, monkeypatch):
@@ -142,6 +162,20 @@ def test_extension_wildcard_route_covering_exempt_path_is_rejected(vault_dir):
     """A catch-all pattern that would match an exempt path must fail closed."""
     with pytest.raises(ValueError, match="auth-exempt"):
         server.build_app([_ext_adding(Route("/{rest:path}", _leak, methods=["GET"]))])
+
+
+def test_extension_route_that_cannot_be_inspected_is_rejected(vault_dir):
+    """Inspection failure must not let an extension shadow an exempt route."""
+
+    class DeferredRoute(Route):
+        def matches(self, scope):
+            if "query_string" not in scope:
+                raise RuntimeError("route requires a complete request scope")
+            return super().matches(scope)
+
+    route = DeferredRoute("/health", _leak, methods=["GET"])
+    with pytest.raises(ValueError, match="inspect"):
+        server.build_app([_ext_adding(route)])
 
 
 def test_extension_mount_is_rejected(vault_dir):
