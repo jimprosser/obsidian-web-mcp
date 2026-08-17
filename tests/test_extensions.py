@@ -20,8 +20,10 @@ class SpyExtension(extensions.Extension):
 
     def __init__(self):
         self.calls = []
+        self.registrar = None
 
-    def register_tools(self, mcp):
+    def register_tools(self, registrar):
+        self.registrar = registrar
         self.calls.append("register_tools")
 
     def before_indexes_start(self, frontmatter_index):
@@ -69,6 +71,21 @@ def test_extension_route_is_bearer_protected(vault_dir, monkeypatch):
     assert ok.status_code == 200 and ok.json() == {"ok": True}
 
 
+def test_extension_route_cannot_shadow_mcp_transport(vault_dir):
+    class McpShadowExtension(extensions.Extension):
+        def register_routes(self, app):
+            async def shadow(_request):
+                return JSONResponse({"unsafe": True})
+
+            app.routes.insert(
+                0,
+                Route(server.VAULT_MCP_PATH, shadow, methods=["GET"]),
+            )
+
+    with pytest.raises(ValueError, match="MCP transport"):
+        server.build_app([McpShadowExtension()])
+
+
 def test_serve_invokes_lifecycle_hooks_in_order(vault_dir, monkeypatch):
     """serve() must call the hooks in the documented order and register shutdown."""
     import uvicorn
@@ -92,6 +109,9 @@ def test_serve_invokes_lifecycle_hooks_in_order(vault_dir, monkeypatch):
         "register_routes",
     ]
     assert ext.shutdown in registered
+    assert ext.registrar is server.tool_registrar
+    assert not hasattr(ext.registrar, "resource")
+    assert not hasattr(ext.registrar, "prompt")
 
 
 def test_serve_accepts_a_generator_of_extensions(vault_dir, monkeypatch):

@@ -1,5 +1,8 @@
-"""Bearer token authentication middleware for the vault MCP server."""
+"""Bearer authentication and principal binding for the vault MCP server."""
 
+from __future__ import annotations
+
+import hashlib
 import hmac
 import uuid
 
@@ -9,9 +12,17 @@ from starlette.responses import JSONResponse
 
 from . import config
 from .config import VAULT_MCP_TOKEN
-from .context import reset_request_context, set_request_context
+from .context import (
+    AuthenticatedPrincipal,
+    reset_request_context,
+    set_request_context,
+)
+from .oauth_state import (
+    LEGACY_FULL,
+    VAULT_READONLY_CAPABILITIES,
+    VAULT_READONLY_V1,
+)
 
-# Paths that don't require bearer auth (OAuth flow + health)
 _AUTH_EXEMPT_PATHS = {
     "/health",
     "/.well-known/oauth-authorization-server",
@@ -21,32 +32,100 @@ _AUTH_EXEMPT_PATHS = {
     "/oauth/register",
 }
 
-# (method, path) pairs exempt from auth. The MCP spec 2025-06-18 probe on / must
-# answer GET/HEAD without credentials. This is ONLY active when MCP is mounted off
-# root (VAULT_MCP_PATH != "/"); when MCP is at root the transport owns GET/HEAD /
-# and must stay fully authenticated, so the set is empty and behaviour is unchanged.
 _AUTH_EXEMPT_METHOD_PATHS = (
     {("GET", "/"), ("HEAD", "/")} if config.VAULT_MCP_PATH != "/" else set()
 )
 
 
 def _www_authenticate(request: Request, error: str) -> str:
-    """RFC 9728 challenge header pointing clients at the protected-resource metadata.
-
-    Without it a 401 just looks like a failed request; with it, a spec-compliant MCP
-    client (e.g. Claude Code, ChatGPT) knows to fetch the metadata and start the OAuth
-    flow -- "Needs authentication" instead of "Failed to connect". The resource URL is
-    derived from VAULT_MCP_PUBLIC_URL when set (otherwise request.base_url), matching the
-    oauth_metadata / oauth_protected_resource endpoints. Pinning the public URL keeps a
-    spoofed Host/X-Forwarded-Host header from pointing clients at an attacker's server.
-    """
+    """Build an RFC 9728 challenge pinned to the advertised resource."""
     base_url = config.advertised_base_url(str(request.base_url))
     resource_metadata = f"{base_url}/.well-known/oauth-protected-resource"
-    return f'Bearer realm="mcp", resource_metadata="{resource_metadata}", error="{error}"'
+    return (
+        f'Bearer realm="mcp", resource_metadata="{resource_metadata}", error="{error}"'
+    )
+
+
+def _credential_digest(token: str) -> str:
+    """Return a stable audit identifier without retaining the bearer."""
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def _master_matches(token: str) -> bool:
+    """Compare fixed-length digests so token length does not affect comparison."""
+    if not VAULT_MCP_TOKEN:
+        return False
+    candidate = hashlib.sha256(token.encode("utf-8")).digest()
+    configured = hashlib.sha256(VAULT_MCP_TOKEN.encode("utf-8")).digest()
+    return hmac.compare_digest(candidate, configured)
+
+
+def _canonical_resource(request: Request) -> str:
+    return config.advertised_base_url(str(request.base_url)).rstrip("/")
+
+
+def _authenticate_bearer(
+    request: Request,
+    token: str,
+) -> AuthenticatedPrincipal | None:
+    credential_id = _credential_digest(token)
+    if _master_matches(token):
+        return AuthenticatedPrincipal(
+            principal_id="master",
+            credential_id=credential_id,
+            client_id=None,
+            policy=LEGACY_FULL,
+            capabilities=frozenset(),
+            full_access=True,
+        )
+
+    if not token.startswith("v1."):
+        return None
+
+    from .oauth import get_oauth_state
+
+    metadata = get_oauth_state().lookup_access_token(token)
+    if metadata is None or metadata.resource != _canonical_resource(request):
+        return None
+
+    capabilities = frozenset(metadata.capabilities)
+    if metadata.policy == LEGACY_FULL:
+        if capabilities:
+            return None
+        full_access = True
+    elif metadata.policy == VAULT_READONLY_V1:
+        if capabilities != frozenset(VAULT_READONLY_CAPABILITIES):
+            return None
+        full_access = False
+    else:
+        return None
+
+    return AuthenticatedPrincipal(
+        principal_id=f"oauth:{metadata.client_id}",
+        credential_id=credential_id,
+        client_id=metadata.client_id,
+        policy=metadata.policy,
+        capabilities=capabilities,
+        full_access=full_access,
+    )
+
+
+def _auth_error(
+    request: Request,
+    *,
+    message: str,
+    status_code: int,
+    error: str,
+) -> JSONResponse:
+    return JSONResponse(
+        {"error": message},
+        status_code=status_code,
+        headers={"WWW-Authenticate": _www_authenticate(request, error)},
+    )
 
 
 class BearerAuthMiddleware(BaseHTTPMiddleware):
-    """Validates Bearer tokens on all requests except OAuth and health endpoints."""
+    """Authenticate master and OAuth bearers through one fail-closed path."""
 
     async def dispatch(self, request: Request, call_next):
         if request.url.path in _AUTH_EXEMPT_PATHS:
@@ -62,29 +141,35 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
             )
 
         auth_header = request.headers.get("Authorization", "")
-        if not auth_header.startswith("Bearer "):
-            return JSONResponse(
-                {"error": "Missing or malformed Authorization header"},
+        if not auth_header.startswith("Bearer ") or not auth_header[7:]:
+            return _auth_error(
+                request,
+                message="Missing or malformed Authorization header",
                 status_code=401,
-                headers={"WWW-Authenticate": _www_authenticate(request, "invalid_request")},
+                error="invalid_request",
             )
 
-        token = auth_header[7:]
-        # Constant-time compare: avoid leaking the token via response timing (#2).
-        if not hmac.compare_digest(token, VAULT_MCP_TOKEN):
-            return JSONResponse(
-                {"error": "Invalid token"},
+        principal = _authenticate_bearer(request, auth_header[7:])
+        if principal is None:
+            return _auth_error(
+                request,
+                message="Invalid token",
                 status_code=401,
-                headers={"WWW-Authenticate": _www_authenticate(request, "invalid_token")},
+                error="invalid_token",
             )
 
-        # Thread the authenticated principal (plus a request id and best-effort client
-        # hint) to the tool layer for the audit log. The raw token never leaves this
-        # context; audit.build_audit_record stores only its SHA-256 hash. client_id is a
-        # User-Agent-derived hint -- it becomes a true per-client id if the static bearer
-        # token is ever replaced with per-client tokens.
-        client = request.headers.get("user-agent", "").strip()[:200] or None
-        ctx_token = set_request_context(principal=token, request_id=uuid.uuid4().hex, client=client)
+        if not principal.full_access and request.url.path != config.VAULT_MCP_PATH:
+            return _auth_error(
+                request,
+                message="Insufficient scope",
+                status_code=403,
+                error="insufficient_scope",
+            )
+
+        ctx_token = set_request_context(
+            principal=principal,
+            request_id=uuid.uuid4().hex,
+        )
         try:
             return await call_next(request)
         finally:

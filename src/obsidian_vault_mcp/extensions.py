@@ -39,6 +39,7 @@ if TYPE_CHECKING:  # imported lazily / only for typing to avoid import cycles
     from starlette.applications import Starlette
 
     from .frontmatter_index import FrontmatterIndex
+    from .authorization import ToolRegistrar
 
 
 class Extension:
@@ -46,8 +47,8 @@ class Extension:
 
     Lifecycle, in the order `server.serve()` invokes them:
 
-      1. register_tools(mcp)          add @mcp.tool tools BEFORE the ASGI app /
-                                      tool schema is built, so they're advertised.
+      1. register_tools(registrar)    add tools through the policy-aware registrar
+                                      before the ASGI app / schema is built.
       2. before_indexes_start(index)  runs before the frontmatter index starts --
                                       e.g. attach a change listener so no change is
                                       missed between build and listener attach.
@@ -56,19 +57,17 @@ class Extension:
       4. register_routes(app)         add Starlette routes BEFORE the bearer-auth
                                       middleware is attached, so the routes are
                                       bearer-protected. Do NOT register a route on
-                                      an auth-exempt path (/health, /oauth/*,
-                                      /.well-known/*, or the off-root GET/HEAD /
-                                      probe) -- the middleware skips those before
-                                      routing, so such a route would be served
-                                      UNAUTHENTICATED. build_app() rejects a
-                                      collision with an exempt *path* at startup
-                                      (fail closed); the method-only / probe is
-                                      your responsibility to avoid.
+                                      the MCP transport path or an auth-exempt path
+                                      (/health, /oauth/*, /.well-known/*, or the
+                                      off-root GET/HEAD / probe). A transport
+                                      collision could bypass per-client MCP policy;
+                                      an exempt collision would be unauthenticated.
+                                      build_app() rejects both at startup.
       5. shutdown()                   registered with atexit; runs at process exit.
     """
 
-    def register_tools(self, mcp) -> None:  # noqa: D401
-        """Register additional MCP tools on the FastMCP instance."""
+    def register_tools(self, registrar: "ToolRegistrar") -> None:  # noqa: D401
+        """Register MCP tools through the policy-aware registrar."""
 
     def before_indexes_start(self, frontmatter_index: "FrontmatterIndex") -> None:
         """Prepare before the frontmatter index is built and starts watching."""

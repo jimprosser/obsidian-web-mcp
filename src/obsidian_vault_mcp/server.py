@@ -14,7 +14,7 @@ import urllib.parse
 import urllib.request
 from contextlib import asynccontextmanager
 
-from mcp.server.fastmcp import FastMCP
+from .authorization import PolicyFastMCP, ToolRegistrar
 from mcp.server.transport_security import TransportSecuritySettings
 
 from .config import (
@@ -110,7 +110,7 @@ async def lifespan(server):
 
 
 # Create the MCP server
-mcp = FastMCP(
+mcp = PolicyFastMCP(
     "obsidian_web_mcp",
     stateless_http=True,
     json_response=True,
@@ -131,6 +131,7 @@ mcp = FastMCP(
         ],
     ),
 )
+tool_registrar = ToolRegistrar(mcp)
 
 
 # --- Register all tools ---
@@ -288,7 +289,7 @@ def _run_audited_batch(operation: str, func, context: dict) -> str:
     return result
 
 
-@mcp.tool(
+@tool_registrar.tool(
     name="vault_read",
     description="Read a file from the Obsidian vault, returning content, metadata, and parsed YAML frontmatter.",
     annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False},
@@ -299,7 +300,7 @@ def vault_read(path: str) -> str:
     return _run_audited("vault_read", lambda: _vault_read(inp.path), path=inp.path)
 
 
-@mcp.tool(
+@tool_registrar.tool(
     name="vault_batch_read",
     description="Read multiple files from the vault in one call. Handles missing files gracefully.",
     annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False},
@@ -310,7 +311,7 @@ def vault_batch_read(paths: list[str], include_content: bool = True) -> str:
     return _run_audited("vault_batch_read", lambda: _vault_batch_read(inp.paths, inp.include_content))
 
 
-@mcp.tool(
+@tool_registrar.tool(
     name="vault_write",
     description="Write a file to the Obsidian vault. Supports frontmatter merging with existing files. Creates parent directories by default.",
     annotations={"readOnlyHint": False, "destructiveHint": True, "idempotentHint": False, "openWorldHint": False},
@@ -325,7 +326,7 @@ def vault_write(path: str, content: str, create_dirs: bool = True, merge_frontma
     )
 
 
-@mcp.tool(
+@tool_registrar.tool(
     name="vault_write_binary",
     description="Write an allowed binary file (image or PDF) to the Obsidian vault from base64-encoded content. Enforces a media-type/extension allowlist and a size cap; writes atomically.",
     annotations={"readOnlyHint": False, "destructiveHint": True, "idempotentHint": False, "openWorldHint": False},
@@ -336,7 +337,7 @@ def vault_write_binary(path: str, data: str, media_type: str, overwrite: bool = 
     return _vault_write_binary(inp.path, inp.data, inp.media_type, inp.overwrite, inp.create_dirs)
 
 
-@mcp.tool(
+@tool_registrar.tool(
     name="vault_edit",
     description=(
         "Patch an existing vault file with exact text replacements. Use this for token-efficient partial edits "
@@ -357,7 +358,7 @@ def vault_edit(path: str, edits: list[dict], dry_run: bool = False) -> str:
     )
 
 
-@mcp.tool(
+@tool_registrar.tool(
     name="vault_append",
     description=(
         "Append content to a vault file without sending the existing file body. Use this for token-efficient "
@@ -375,7 +376,7 @@ def vault_append(path: str, content: str, separator: str = "\n\n", create_dirs: 
     )
 
 
-@mcp.tool(
+@tool_registrar.tool(
     name="vault_batch_frontmatter_update",
     description="Update YAML frontmatter fields on multiple files without changing body content. Each update merges new fields into existing frontmatter.",
     annotations={"readOnlyHint": False, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False},
@@ -390,7 +391,7 @@ def vault_batch_frontmatter_update(updates: list[dict]) -> str:
     )
 
 
-@mcp.tool(
+@tool_registrar.tool(
     name="vault_search",
     description="Search for text across vault files. Uses ripgrep if available, falls back to Python. Returns matching lines with context and frontmatter excerpts.",
     annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False},
@@ -410,7 +411,7 @@ def vault_search(
     )
 
 
-@mcp.tool(
+@tool_registrar.tool(
     name="vault_search_frontmatter",
     description="Search vault files by YAML frontmatter field values. Queries an in-memory index for fast results. Supports exact match, contains, and field-exists queries.",
     annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False},
@@ -430,7 +431,7 @@ def vault_search_frontmatter(
     )
 
 
-@mcp.tool(
+@tool_registrar.tool(
     name="vault_list",
     description="List directory contents in the vault. Supports recursion depth, file/dir filtering, and glob patterns. Excludes .obsidian, .trash, .git directories.",
     annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False},
@@ -451,7 +452,7 @@ def vault_list(
     )
 
 
-@mcp.tool(
+@tool_registrar.tool(
     name="vault_move",
     description="Move a file or directory within the vault. Validates both source and destination paths.",
     annotations={"readOnlyHint": False, "destructiveHint": True, "idempotentHint": False, "openWorldHint": False},
@@ -467,7 +468,7 @@ def vault_move(source: str, destination: str, create_dirs: bool = True) -> str:
     )
 
 
-@mcp.tool(
+@tool_registrar.tool(
     name="vault_delete",
     description="Delete a file by moving it to .trash/ in the vault root. Requires confirm=true as a safety gate. Does NOT hard delete.",
     annotations={"readOnlyHint": False, "destructiveHint": True, "idempotentHint": False, "openWorldHint": False},
@@ -482,7 +483,7 @@ def vault_delete(path: str, confirm: bool = False) -> str:
     )
 
 
-@mcp.tool(
+@tool_registrar.tool(
     name="vault_canvas_read",
     description="Read an Obsidian .canvas file and return its parsed nodes and edges.",
     annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False},
@@ -493,7 +494,7 @@ def vault_canvas_read(path: str) -> str:
     return _run_audited("vault_canvas_read", lambda: _vault_canvas_read(inp.path), path=inp.path)
 
 
-@mcp.tool(
+@tool_registrar.tool(
     name="vault_canvas_add_node",
     description=(
         "Append a node to an Obsidian .canvas file, creating the file if it does not exist. Requires type, x, y, "
@@ -511,7 +512,7 @@ def vault_canvas_add_node(path: str, node: dict) -> str:
     )
 
 
-@mcp.tool(
+@tool_registrar.tool(
     name="vault_canvas_add_edge",
     description=(
         "Append an edge to an existing Obsidian .canvas file. Requires fromNode, toNode, and fromSide/toSide "
@@ -530,7 +531,7 @@ def vault_canvas_add_edge(path: str, edge: dict) -> str:
     )
 
 
-@mcp.tool(
+@tool_registrar.tool(
     name="vault_daily_note_path",
     description="Return today's daily-note path (server local date), derived from VAULT_DAILY_NOTES_FOLDER and VAULT_DAILY_NOTES_FORMAT. Does not read or create the file.",
     annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False},
@@ -540,7 +541,7 @@ def vault_daily_note_path() -> str:
     return _vault_daily_note_path()
 
 
-@mcp.tool(
+@tool_registrar.tool(
     name="vault_daily_note_read",
     description="Read today's daily note. Returns an error payload (does not create the note) when it does not exist.",
     annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False},
@@ -550,7 +551,7 @@ def vault_daily_note_read() -> str:
     return _run_audited("vault_daily_note_read", _vault_daily_note_read)
 
 
-@mcp.tool(
+@tool_registrar.tool(
     name="vault_daily_note_append",
     description="Append content to today's daily note, creating it from VAULT_DAILY_NOTES_TEMPLATE when missing. Token-efficient daily logging without resending the note body.",
     annotations={"readOnlyHint": False, "destructiveHint": True, "idempotentHint": False, "openWorldHint": False},
@@ -565,7 +566,7 @@ def vault_daily_note_append(content: str) -> str:
     )
 
 
-@mcp.tool(
+@tool_registrar.tool(
     name="vault_analytics_summary",
     description=(
         "Return a compact analytics summary for vault hygiene, including frontmatter, link, tag, and encoding "
@@ -587,7 +588,7 @@ def vault_analytics_summary(
     return _vault_analytics_summary(inp.path_prefix or "", inp.required_frontmatter, inp.max_examples)
 
 
-@mcp.tool(
+@tool_registrar.tool(
     name="vault_analytics_findings",
     description=(
         "Return detailed findings for one vault analytics category: frontmatter_missing, "
@@ -724,6 +725,14 @@ def build_app(extensions=()):
                     f"extension route {getattr(r, 'path', r)!r} covers auth-exempt "
                     f"{m} {p!r}; it would be served without bearer authentication"
                 )
+        # Restricted principals are allowed through the middleware only at the MCP
+        # transport path. An earlier extension route there would inherit that
+        # allowance without passing through PolicyFastMCP.
+        if _covers(r, "POST", VAULT_MCP_PATH) is not Match.NONE:
+            raise ValueError(
+                f"extension route {getattr(r, 'path', r)!r} covers MCP transport "
+                f"path {VAULT_MCP_PATH!r}; it would bypass MCP authorization"
+            )
     app.add_middleware(BearerAuthMiddleware)
     return app
 
@@ -787,7 +796,7 @@ def serve(extensions=()):
     # each extension prepare before the frontmatter index starts (e.g. attach a
     # change listener so no change is missed between build and listener attach).
     for ext in extensions:
-        ext.register_tools(mcp)
+        ext.register_tools(tool_registrar)
         ext.before_indexes_start(frontmatter_index)
 
     # Build the frontmatter index ONCE, before serving. With stateless_http the

@@ -117,7 +117,7 @@ All configuration is via environment variables:
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
 | `VAULT_PATH` | Yes | `~/Obsidian/MyVault` | Absolute path to your Obsidian vault directory |
-| `VAULT_MCP_TOKEN` | Yes | (none) | 256-bit bearer token validated on every MCP request |
+| `VAULT_MCP_TOKEN` | Yes | (none) | 256-bit master bearer. Protected requests also accept validated durable OAuth access tokens under their stored policy. |
 | `VAULT_OAUTH_PASSWORD` | **Yes** | (none) | Password for the interactive login at `/oauth/authorize`. **If unset, the server refuses to authorize any client (fail-closed).** |
 | `VAULT_OAUTH_USERNAME` | No | `obsidian` | Username for the interactive login |
 | `VAULT_MCP_HOST` | No | `127.0.0.1` | Bind address. Loopback by default; set `0.0.0.0` only for deliberate LAN exposure |
@@ -166,11 +166,7 @@ outside-vault, ownership, mode, and symlink checks as the live state. Neither
 inventory nor revoke output includes client secrets, authorization codes, or
 complete bearer tokens.
 
-**Deployment boundary:** the OAuth endpoints now issue durable per-client
-tokens, while MCP request dispatch still recognizes the existing
-`VAULT_MCP_TOKEN`. Per-client bearer validation and capability enforcement are
-a separate server-boundary change. Do not deploy this revision alone as a
-connector cutover.
+Every protected request accepts either the configured `VAULT_MCP_TOKEN` master credential or a durable `v1.*` OAuth access token. Dynamic and freshly reauthorized clients receive the fail-closed `vault_readonly_v1` policy: discovery and dispatch expose exactly `vault_batch_read`, `vault_list`, `vault_read`, `vault_search`, and `vault_search_frontmatter`; resources and prompts remain unavailable. Approved imported clients temporarily retain `legacy_full`, matching master access. Invalid, expired, revoked, wrong-resource, and unknown-policy credentials are rejected before MCP dispatch. Non-MCP extension routes require full access.
 
 ## Audit logging
 
@@ -179,13 +175,10 @@ JSON line. Auditing is **off by default**; with no path set there is no overhead
 searches are logged too when `VAULT_AUDIT_LOG_INCLUDE_READS` is on (off by default, since
 reads are high-volume).
 
-Each record carries: `timestamp` (UTC), `token_id_hash` (SHA-256 of the bearer token -- the
-raw token is never written), `client_id` (a best-effort User-Agent hint), `operation`,
-`target_path`, `size_before`/`size_after`, `checksum_before`/`checksum_after` (SHA-256),
-`request_id`, `operation_status`, and `error`. Example line:
+Each record carries: `timestamp` (UTC), `token_id_hash` (the validated credential's stable SHA-256 identifier; the raw bearer is never retained), `principal_id` (`master` or `oauth:<client-id>`), `client_id` (the durable OAuth client ID, or `null` for master), `auth_policy`, `operation`, `target_path`, `size_before`/`size_after`, `checksum_before`/`checksum_after` (SHA-256), `request_id`, `operation_status`, and `error`. Example line:
 
 ```json
-{"checksum_after":"9f86d0…","checksum_before":null,"client_id":"claude","error":null,"operation":"vault_write","operation_status":"success","request_id":"a1b2…","size_after":42,"size_before":null,"target_path":"notes/today.md","timestamp":"2026-06-14T18:30:00+00:00","token_id_hash":"5e88…"}
+{"auth_policy":"legacy_full","checksum_after":"9f86d0…","checksum_before":null,"client_id":"vault-mcp-a1b2…","error":null,"operation":"vault_write","operation_status":"success","principal_id":"oauth:vault-mcp-a1b2…","request_id":"a1b2…","size_after":42,"size_before":null,"target_path":"notes/today.md","timestamp":"2026-08-17T18:30:00+00:00","token_id_hash":"5e88…"}
 ```
 
 **Put the log outside the vault.** `VAULT_AUDIT_LOG_PATH` must resolve outside `VAULT_PATH`.
@@ -213,7 +206,7 @@ The Claude desktop and mobile apps can connect to remote MCP servers via OAuth.
 4. Claude registers automatically (dynamic client registration) and discovers the OAuth endpoints
 5. Claude opens a browser window at the server's `/oauth/authorize`
 6. **Sign in** with your `VAULT_OAUTH_USERNAME` / `VAULT_OAUTH_PASSWORD`; the server then issues the authorization and redirects back
-7. Claude now has access to all nine vault tools -- on desktop and mobile
+7. Claude now has read-only access to the five authorized vault tools on desktop and mobile
 
 For local-only use (no tunnel), point Claude at `http://localhost:8420`.
 
@@ -357,9 +350,12 @@ from obsidian_vault_mcp.write_events import register_write_listener
 
 
 class MyExtension(Extension):
-    def register_tools(self, mcp):
-        # add @mcp.tool tools BEFORE the app/tool schema is built
-        ...
+    def register_tools(self, registrar):
+        # tools registered here are denied to restricted clients by default;
+        # set required_capability only when intentionally reusing a capability
+        @registrar.tool(name="my_tool")
+        def my_tool():
+            return "ok"
 
     def before_indexes_start(self, frontmatter_index):
         # e.g. attach a change listener so no change is missed once the index starts
@@ -372,7 +368,7 @@ class MyExtension(Extension):
         ...
 
     def register_routes(self, app):
-        # add Starlette routes (bearer-protected like the rest of the surface)
+        # add a protected non-MCP route; never shadow the MCP transport path
         ...
 
     def shutdown(self):
@@ -396,11 +392,12 @@ Two things worth knowing:
 - **Extension routes are authenticated, with a footgun guard.** Routes are registered
   before the bearer-auth middleware, so they require the bearer token like every other
   route. As a guardrail against honest mistakes, `build_app()` **fails closed** if an
-  extension adds a route that would cover an auth-exempt path (`/health`, `/oauth/*`,
-  `/.well-known/*`, or the off-root `GET/HEAD /` probe) — including via a wildcard
-  pattern — and rejects extension `Mount`s and `WebSocketRoute`s outright. This catches
-  accidents; it is **not** a boundary against a hostile extension (which, running
-  in-process, could bypass it anyway — see the trust model above).
+  extension route covers the MCP transport path (which would bypass per-client MCP policy)
+  or an auth-exempt path (`/health`, `/oauth/*`, `/.well-known/*`, or the off-root
+  `GET/HEAD /` probe), including via a wildcard pattern. Extension `Mount`s and
+  `WebSocketRoute`s are rejected outright. This catches accidents; it is **not** a
+  boundary against a hostile extension (which, running in-process, could bypass it anyway
+  — see the trust model above).
 - **The stock server is unaffected.** With no extensions, `serve()` behaves exactly like
   the previous `main()`; `FrontmatterIndex` change listeners and write listeners are a no-op
   with none registered.
