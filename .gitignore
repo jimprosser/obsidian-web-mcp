@@ -7,4 +7,3 @@ wheels/
 *.egg-info
 .venv/
 .env
-uv.lock
