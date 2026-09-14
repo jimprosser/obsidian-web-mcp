@@ -409,3 +409,30 @@ def test_server_vault_edit_is_atomic_when_a_later_edit_fails(vault_dir):
     after = (vault_dir / "test-note.md").read_text()
     assert after == before
     assert "REPLACED" not in after
+
+
+def test_vault_edit_dry_run_predicts_content_size_cap(vault_dir, monkeypatch):
+    """dry_run must predict the MAX_CONTENT_SIZE refusal, not preview an unlandable write.
+
+    The size cap is enforced only in write_file_atomic. A replacement that pushes
+    the note over the cap previewed as applicable (edits_applied 1, a diff) while
+    the real apply raised and wrote nothing. The cap is lowered to keep the test fast.
+    """
+    import obsidian_vault_mcp.config as config
+
+    (vault_dir / "test-note.md").write_text("small\n")
+    monkeypatch.setattr(config, "MAX_CONTENT_SIZE", 64)
+    edits = [{"old_text": "small", "new_text": "x" * 100}]
+
+    dry = json.loads(vault_edit("test-note.md", edits, dry_run=True))
+    assert dry["match_counts"][0]["count"] == 1
+    assert dry["edits_applied"] == 0
+    assert dry["diff"] == ""
+    assert "exceeds limit" in dry["error"]
+
+    # Parity: the real apply must fail on the same cap and write nothing.
+    before = (vault_dir / "test-note.md").read_text()
+    applied = json.loads(vault_edit("test-note.md", edits, dry_run=False))
+    assert "error" in applied
+    assert applied["changed"] is False
+    assert (vault_dir / "test-note.md").read_text() == before

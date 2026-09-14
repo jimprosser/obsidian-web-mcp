@@ -8,7 +8,7 @@ from pathlib import Path
 
 import frontmatter
 
-from .. import frontmatter_io
+from .. import config, frontmatter_io
 from ..frontmatter_io import YAMLError
 
 from ..models import normalize_edit_aliases
@@ -272,14 +272,24 @@ def _dry_run_report(path: str, original_content: str, normalized_edits: list[dic
         preview = preview.replace(old_text, edit.get("new_text", ""), 1)
         match_counts.append(entry)
 
+    size_error = None
     if all_unique:
         diff = _unified_diff(path, original_content, preview)
         size = len(preview.encode("utf-8"))
+        if size > config.MAX_CONTENT_SIZE:
+            # write_file_atomic refuses content over MAX_CONTENT_SIZE, so the real
+            # apply would fail. Predict that rather than preview an unlandable write.
+            size_error = (
+                f"Resulting content size {size} bytes exceeds limit of "
+                f"{config.MAX_CONTENT_SIZE} bytes; apply would fail"
+            )
+            diff = ""
+            all_unique = False
     else:
         diff = ""
         size = len(original_content.encode("utf-8"))
 
-    return dumps({
+    report = {
         "path": path,
         "changed": False,
         "dry_run": True,
@@ -287,7 +297,10 @@ def _dry_run_report(path: str, original_content: str, normalized_edits: list[dic
         "match_counts": match_counts,
         "edits_applied": len(normalized_edits) if all_unique else 0,
         "size": size,
-    })
+    }
+    if size_error:
+        report["error"] = size_error
+    return dumps(report)
 
 
 def vault_edit(path: str, edits: list[dict], dry_run: bool = False) -> str:
