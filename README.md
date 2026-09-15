@@ -47,6 +47,8 @@ This is a server that provides network access to your personal notes. Security i
 
 **Safety limits prevent abuse.** Writes are capped at 1MB per file, batch operations at 20 files per request, and search results at 50 matches. Deletions are soft -- files move to `.trash/` rather than being permanently removed, matching Obsidian's own behavior. The delete tool also requires an explicit `confirm=true` parameter as a safety gate.
 
+**Hardlinked files are refused on read.** Files with more than one hardlink (`st_nlink > 1`) cannot be read or returned by text search, including frontmatter excerpts. Legitimate in-vault hardlinks are not supported.
+
 ## Reporting Security Issues
 
 Found a vulnerability? Please report it privately rather than opening a public issue or pull request. This repository has [private vulnerability reporting](https://github.com/jimprosser/obsidian-web-mcp/security/advisories) enabled: open the repo's **Security** tab and click **Report a vulnerability**. I'll acknowledge the report, coordinate a fix, and credit you in the resulting advisory. Please hold public disclosure until a patch is available.

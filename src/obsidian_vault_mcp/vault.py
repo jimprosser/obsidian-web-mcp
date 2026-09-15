@@ -61,6 +61,17 @@ def resolve_vault_path(relative_path: str) -> Path:
     return resolved
 
 
+def resolve_vault_read_path(relative_path: str) -> Path:
+    """Resolve a readable vault path; even legitimate in-vault hardlinks are unsupported.
+
+    Raise ValueError on a security refusal, never a benign empty-read sentinel.
+    """
+    path = resolve_vault_path(relative_path)
+    if path.stat().st_nlink > 1:
+        raise ValueError(f"Refusing hardlinked file: {relative_path}")
+    return path
+
+
 def _iso_timestamp(ts: float) -> str:
     """Convert a Unix timestamp to an ISO 8601 string in UTC."""
     return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
@@ -71,7 +82,7 @@ def read_file(relative_path: str) -> tuple[str, dict]:
 
     Metadata keys: size (int), modified (ISO str), created (ISO str).
     """
-    path = resolve_vault_path(relative_path)
+    path = resolve_vault_read_path(relative_path)
 
     if not path.is_file():
         raise FileNotFoundError(f"Not a file: {relative_path}")
