@@ -96,3 +96,19 @@ def test_registered_search_excerpt_rechecks_file(vault_dir, tmp_path, backend, m
     result = json.loads(server.vault_search("public match"))
     assert result["results"][0]["frontmatter_excerpt"] is None
     assert SECRET not in json.dumps(result)
+
+
+def test_missing_file_error_does_not_leak_absolute_path(vault_dir):
+    """The refusal must not turn a missing note into a disclosure of the server's layout."""
+    with pytest.raises(FileNotFoundError) as exc:
+        vault.read_file("nope.md")
+    assert str(exc.value) == "Not a file: nope.md"
+    assert str(vault_dir) not in str(exc.value)
+
+
+def test_directory_read_is_not_reported_as_a_hardlink(vault_dir):
+    """Every directory has st_nlink >= 2; the guard must not claim one is hardlinked."""
+    (vault_dir / "sub").mkdir()
+    with pytest.raises(FileNotFoundError) as exc:
+        vault.read_file("sub")
+    assert str(exc.value) == "Not a file: sub"

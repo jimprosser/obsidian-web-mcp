@@ -67,6 +67,8 @@ def resolve_vault_read_path(relative_path: str) -> Path:
     Raise ValueError on a security refusal, never a benign empty-read sentinel.
     """
     path = resolve_vault_path(relative_path)
+    if not path.is_file():
+        raise FileNotFoundError(f"Not a file: {relative_path}")
     if path.stat().st_nlink > 1:
         raise ValueError(f"Refusing hardlinked file: {relative_path}")
     return path
@@ -83,9 +85,6 @@ def read_file(relative_path: str) -> tuple[str, dict]:
     Metadata keys: size (int), modified (ISO str), created (ISO str).
     """
     path = resolve_vault_read_path(relative_path)
-
-    if not path.is_file():
-        raise FileNotFoundError(f"Not a file: {relative_path}")
 
     stat = path.stat()
     content = path.read_text(encoding="utf-8")
