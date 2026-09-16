@@ -153,7 +153,32 @@ def write_bytes_atomic(
         raise ValueError(
             f"Content size {len(content)} bytes exceeds limit of {config.MAX_BINARY_SIZE} bytes"
         )
+    is_new = _place_atomic(relative_path, lambda f: f.write(content), create_dirs, overwrite)
+    return is_new, len(content)
 
+
+def write_file_from_path_atomic(
+    relative_path: str, source: Path, create_dirs: bool = True, overwrite: bool = True
+) -> tuple[bool, int]:
+    """Copy a file (e.g. a streamed upload in the staging dir) into the vault atomically.
+
+    Same placement guarantees as write_bytes_atomic, without holding the content in
+    memory. The source may sit on another filesystem, so it is copied into a temp file
+    next to the target rather than renamed. The size limit is the caller's: the upload
+    route enforces its own cap while streaming.
+    """
+    size = source.stat().st_size
+
+    def fill(f):
+        with open(source, "rb") as src:
+            shutil.copyfileobj(src, f, 1024 * 1024)
+
+    is_new = _place_atomic(relative_path, fill, create_dirs, overwrite)
+    return is_new, size
+
+
+def _place_atomic(relative_path: str, fill, create_dirs: bool, overwrite: bool) -> bool:
+    """Fill a temp file next to the target, then replace or no-clobber link it into place."""
     path = resolve_vault_path(relative_path)
     is_new = not path.exists()
 
@@ -164,7 +189,7 @@ def write_bytes_atomic(
     fd, tmp_path = tempfile.mkstemp(dir=path.parent, suffix=".tmp")
     try:
         with os.fdopen(fd, "wb") as f:
-            f.write(content)
+            fill(f)
             _publish_mode(path, f.fileno())
         if overwrite:
             os.replace(tmp_path, path)
@@ -188,7 +213,7 @@ def write_bytes_atomic(
             pass
         raise
 
-    return is_new, len(content)
+    return is_new
 
 
 def move_path(

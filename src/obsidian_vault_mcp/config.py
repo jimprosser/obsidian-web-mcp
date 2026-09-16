@@ -155,6 +155,32 @@ VAULT_AUDIT_LOG_INCLUDE_READS = os.environ.get(
 # Safety limits
 MAX_CONTENT_SIZE = 1_000_000  # 1MB max write size
 MAX_BINARY_SIZE = 10_000_000  # 10MB max binary write size (images/PDFs run larger than text)
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, str(default)))
+    except ValueError:
+        return default
+
+
+# Signed direct upload (POST /upload/{id}). The route is bearer-exempt because the HMAC
+# signature in the URL is the authorization: single-use, short-lived, constant-time
+# compared, and checked before a single body byte is read. The body is streamed to a
+# temp file under the staging dir (outside the vault), so its cap is a disk bound, not a
+# memory bound, and can sit above MAX_BINARY_SIZE: this path exists for files too large
+# to travel base64-encoded through an MCP tool argument (vault_write_binary).
+VAULT_UPLOAD_URL_SECRET = os.environ.get("VAULT_UPLOAD_URL_SECRET", "").strip()
+VAULT_UPLOAD_URL_TTL_SECONDS = _env_int("VAULT_UPLOAD_URL_TTL_SECONDS", 900)
+VAULT_UPLOAD_URL_MAX_TTL_SECONDS = _env_int("VAULT_UPLOAD_URL_MAX_TTL_SECONDS", 3600)
+VAULT_UPLOAD_MAX_BYTES = _env_int("VAULT_UPLOAD_MAX_BYTES", 100_000_000)
+UPLOAD_STAGING_DIR = Path(os.environ.get(
+    "VAULT_UPLOAD_STAGING_DIR",
+    Path.home() / ".local" / "share" / "vault-mcp" / "uploads",
+))
+# The one path the upload route owns. Reserved in _validate_mcp_path and closed to
+# extension routes in build_app, so nothing else can be mounted under it.
+UPLOAD_ROUTE_PREFIX = "/upload"
 MAX_BATCH_SIZE = 20           # Max files per batch operation
 MAX_SEARCH_RESULTS = 50       # Max results per search
 DEFAULT_SEARCH_RESULTS = 20
@@ -207,7 +233,7 @@ def _validate_mcp_path(path: str) -> None:
     # Imported lazily: auth imports config, so a top-level import here would cycle.
     from .auth import _AUTH_EXEMPT_PATHS
 
-    reserved_prefixes = ("/oauth", "/.well-known")
+    reserved_prefixes = ("/oauth", "/.well-known", UPLOAD_ROUTE_PREFIX)
     collides = path in _AUTH_EXEMPT_PATHS or any(
         path == prefix or path.startswith(prefix + "/") for prefix in reserved_prefixes
     )
@@ -215,7 +241,7 @@ def _validate_mcp_path(path: str) -> None:
         raise ValueError(
             f"VAULT_MCP_PATH {path!r} collides with an authentication-exempt route; "
             "mounting there would serve the vault without auth. Choose a path that is "
-            "not /health and not under /oauth or /.well-known."
+            "not /health and not under /oauth, /.well-known or /upload."
         )
 
 

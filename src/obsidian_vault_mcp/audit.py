@@ -40,6 +40,7 @@ MUTATION_OPERATIONS = {
     "vault_canvas_add_node",
     "vault_canvas_add_edge",
     "vault_daily_note_append",
+    "vault_upload",
 }
 
 # Read/search operations. Audited only when VAULT_AUDIT_LOG_INCLUDE_READS is enabled.

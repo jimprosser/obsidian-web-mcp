@@ -1,6 +1,7 @@
 """Bearer token authentication middleware for the vault MCP server."""
 
 import hmac
+import re
 import uuid
 
 from starlette.middleware.base import BaseHTTPMiddleware
@@ -29,6 +30,17 @@ _AUTH_EXEMPT_METHOD_PATHS = (
     {("GET", "/"), ("HEAD", "/")} if config.VAULT_MCP_PATH != "/" else set()
 )
 
+# The signed direct upload is the one exemption that is neither a fixed path nor a
+# probe: POST to exactly one id segment under /upload. The id alphabet and the single
+# segment are part of the rule, so /upload, /upload/a/b, or a GET on an upload URL all
+# still need a bearer token. The URL's HMAC signature is the authorization; the route
+# validates it before reading any body bytes.
+_SIGNED_UPLOAD_PATH = re.compile(r"/upload/[A-Za-z0-9-]{1,64}")
+
+
+def is_signed_upload_request(method: str, path: str) -> bool:
+    return method == "POST" and _SIGNED_UPLOAD_PATH.fullmatch(path) is not None
+
 
 def _www_authenticate(request: Request, error: str) -> str:
     """RFC 9728 challenge header pointing clients at the protected-resource metadata.
@@ -53,6 +65,9 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
             return await call_next(request)
 
         if (request.method, request.url.path) in _AUTH_EXEMPT_METHOD_PATHS:
+            return await call_next(request)
+
+        if is_signed_upload_request(request.method, request.url.path):
             return await call_next(request)
 
         if not VAULT_MCP_TOKEN:
