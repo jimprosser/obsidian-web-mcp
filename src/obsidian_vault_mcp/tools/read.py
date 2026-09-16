@@ -14,7 +14,7 @@ def vault_read(path: str) -> str:
     """Read a file from the vault, returning content, metadata, and parsed frontmatter."""
     try:
         resolved = resolve_vault_path(path)
-        content, metadata = read_file(path)
+        content, metadata = read_file(path, extract=True)
 
         fm_data = None
         try:
@@ -47,7 +47,7 @@ def vault_batch_read(paths: list[str], include_content: bool = True) -> str:
 
     for path in paths:
         try:
-            content, metadata = read_file(path)
+            content, metadata = read_file(path, extract=True)
 
             fm_data = None
             try:

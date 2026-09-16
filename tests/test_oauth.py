@@ -274,6 +274,26 @@ def test_oauth_protected_resource_metadata(client):
     assert body["bearer_methods_supported"] == ["header"]
 
 
+def test_protected_resource_at_root_is_base_url(client, monkeypatch):
+    """With the endpoint at "/", resource == base URL (authorization server origin)."""
+    monkeypatch.setattr(config, "VAULT_MCP_PATH", "/")
+    monkeypatch.setattr(config, "VAULT_MCP_PUBLIC_URL", "https://obsidian.example.xyz")
+    body = client.get("/.well-known/oauth-protected-resource").json()
+    assert body["resource"] == "https://obsidian.example.xyz"
+    assert body["authorization_servers"] == ["https://obsidian.example.xyz"]
+
+
+def test_protected_resource_includes_subpath(client, monkeypatch):
+    """Under a VAULT_MCP_PATH subpath, resource must be the full endpoint URL so
+    strict RFC 9728 clients (e.g. Home Assistant) accept it — while the
+    authorization server stays the base origin."""
+    monkeypatch.setattr(config, "VAULT_MCP_PATH", "/mcp")
+    monkeypatch.setattr(config, "VAULT_MCP_PUBLIC_URL", "https://obsidian.example.xyz")
+    body = client.get("/.well-known/oauth-protected-resource").json()
+    assert body["resource"] == "https://obsidian.example.xyz/mcp"
+    assert body["authorization_servers"] == ["https://obsidian.example.xyz"]
+
+
 def test_protected_resource_path_is_auth_exempt():
     from obsidian_vault_mcp.auth import _AUTH_EXEMPT_PATHS
     assert "/.well-known/oauth-protected-resource" in _AUTH_EXEMPT_PATHS

@@ -154,6 +154,7 @@ VAULT_AUDIT_LOG_INCLUDE_READS = os.environ.get(
 
 # Safety limits
 MAX_CONTENT_SIZE = 1_000_000  # 1MB max write size
+MAX_BINARY_SIZE = 10_000_000  # 10MB max binary write size (images/PDFs run larger than text)
 MAX_BATCH_SIZE = 20           # Max files per batch operation
 MAX_SEARCH_RESULTS = 50       # Max results per search
 DEFAULT_SEARCH_RESULTS = 20

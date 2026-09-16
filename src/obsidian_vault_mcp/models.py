@@ -1,6 +1,6 @@
 """Pydantic input models for obsidian-vault-mcp tool endpoints."""
 
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -8,6 +8,7 @@ from .config import (
     CONTEXT_LINES,
     DEFAULT_SEARCH_RESULTS,
     MAX_BATCH_SIZE,
+    MAX_BINARY_SIZE,
     MAX_CONTENT_SIZE,
     MAX_LIST_DEPTH,
     MAX_SEARCH_RESULTS,
@@ -53,6 +54,70 @@ class VaultWriteInput(BaseModel):
     )
 
 
+class VaultWriteBinaryInput(BaseModel):
+    """Write an allowed binary file to the vault from base64-encoded content."""
+
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    path: str = Field(
+        ...,
+        description="Relative path from vault root",
+        min_length=1,
+        max_length=500,
+    )
+    data: str = Field(
+        ...,
+        description="Base64-encoded file content",
+        # base64 expands ~4/3; cap the encoded length so an oversized payload is rejected
+        # before it is decoded into memory.
+        max_length=((MAX_BINARY_SIZE + 2) // 3) * 4 + 1024,
+    )
+    media_type: str = Field(
+        ...,
+        description="MIME type of the binary content; must be in the server's allowlist",
+        min_length=3,
+        max_length=200,
+    )
+    overwrite: bool = Field(
+        default=False,
+        description="Overwrite an existing file at the target path",
+    )
+    create_dirs: bool = Field(
+        default=True,
+        description="Create parent directories if they don't exist",
+    )
+
+# Aliases accepted for each canonical edit field. old_str/new_str mirror the
+# str_replace_editor tool; old/new are the shorthands models reach for most.
+_EDIT_FIELD_ALIASES: dict[str, tuple[str, ...]] = {
+    "old_text": ("old_str", "old"),
+    "new_text": ("new_str", "new"),
+}
+
+
+def normalize_edit_aliases(data: Any) -> Any:
+    """Map edit-field aliases onto their canonical old_text/new_text keys.
+
+    Shared by the pydantic model (the MCP schema path) and the write tool (the
+    direct-call path) so both accept the same alias set. Raises ValueError,
+    naming the offending keys, if a canonical field and one of its aliases (or
+    two aliases) are supplied together.
+    """
+    if not isinstance(data, dict):
+        return data
+
+    normalized = dict(data)
+    for canonical, aliases in _EDIT_FIELD_ALIASES.items():
+        present = [key for key in (canonical, *aliases) if key in normalized]
+        if len(present) > 1:
+            joined = ", ".join(f"'{key}'" for key in present)
+            raise ValueError(f"Use only one of {joined}, not several")
+        if present and present[0] != canonical:
+            normalized[canonical] = normalized.pop(present[0])
+
+    return normalized
+
+
 class VaultEditOperationInput(BaseModel):
     """Replace one exact text fragment inside a vault file."""
 
@@ -61,17 +126,7 @@ class VaultEditOperationInput(BaseModel):
     @model_validator(mode="before")
     @classmethod
     def normalize_str_replace_aliases(cls, data):
-        if not isinstance(data, dict):
-            return data
-
-        normalized = dict(data)
-        for canonical, alias in (("old_text", "old_str"), ("new_text", "new_str")):
-            if canonical in normalized and alias in normalized:
-                raise ValueError(f"Use either '{canonical}' or '{alias}', not both")
-            if alias in normalized:
-                normalized[canonical] = normalized.pop(alias)
-
-        return normalized
+        return normalize_edit_aliases(data)
 
     old_text: str = Field(
         ...,
@@ -410,4 +465,61 @@ class VaultDailyNoteAppendInput(BaseModel):
         ...,
         description="Content to append to today's daily note (the note is created from the template if missing)",
         max_length=MAX_CONTENT_SIZE,
+    )
+
+
+class VaultAnalyticsSummaryInput(BaseModel):
+    """Build a compact analytics summary for a vault path."""
+
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    path_prefix: str | None = Field(
+        default=None,
+        description="Optional folder prefix to restrict the analysis",
+        max_length=500,
+    )
+    required_frontmatter: list[str] | None = Field(
+        default=None,
+        description="Optional required frontmatter fields to validate",
+        max_length=20,
+    )
+    max_examples: int = Field(
+        default=3,
+        ge=1,
+        le=20,
+        description="Maximum example findings to include per category",
+    )
+
+
+class VaultAnalyticsFindingsInput(BaseModel):
+    """Return detailed findings for one analytics category."""
+
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    category: Literal[
+        "frontmatter_missing",
+        "required_frontmatter_missing",
+        "broken_wikilinks",
+        "suspicious_tag_variants",
+        "encoding_issues",
+        "oversized_files",
+    ] = Field(
+        ...,
+        description="Analytics finding category to return",
+    )
+    path_prefix: str | None = Field(
+        default=None,
+        description="Optional folder prefix to restrict the analysis",
+        max_length=500,
+    )
+    required_frontmatter: list[str] | None = Field(
+        default=None,
+        description="Optional required frontmatter fields to validate",
+        max_length=20,
+    )
+    max_results: int = Field(
+        default=50,
+        ge=1,
+        le=200,
+        description="Maximum number of findings to return",
     )

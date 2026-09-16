@@ -3,12 +3,37 @@
 import fnmatch
 import os
 import shutil
+import stat
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 
 from . import config
 from .content_extractors import apply_content_extractors
+
+
+def _publish_mode(target: Path, tmp_fd: int) -> None:
+    """Give the about-to-be-published temp file the mode a normal write would produce.
+
+    tempfile.mkstemp() always creates its file 0600 (a temp-file security default),
+    ignoring the process umask; that mode would otherwise survive the os.replace and
+    silently downgrade every file the server writes -- breaking sync daemons / other
+    readers and clobbering an existing note's permissions on each edit.
+
+    Overwriting an existing file: keep that file's current mode (a write must not change
+    permissions). New file: reproduce open()'s default, 0666 & ~umask. We fchmod the fd,
+    not the path, so this can't be raced onto a symlinked target between here and replace.
+    A no-op on platforms without fchmod (Windows), where mode bits are meaningless.
+    """
+    if not hasattr(os, "fchmod"):
+        return
+    try:
+        mode = stat.S_IMODE(os.stat(target).st_mode)
+    except FileNotFoundError:
+        umask = os.umask(0)
+        os.umask(umask)
+        mode = 0o666 & ~umask
+    os.fchmod(tmp_fd, mode)
 
 
 def resolve_vault_path(relative_path: str) -> Path:
@@ -37,38 +62,43 @@ def resolve_vault_path(relative_path: str) -> Path:
     return resolved
 
 
+def resolve_vault_read_path(relative_path: str) -> Path:
+    """Resolve a readable vault path; even legitimate in-vault hardlinks are unsupported.
+
+    Raise ValueError on a security refusal, never a benign empty-read sentinel.
+    """
+    path = resolve_vault_path(relative_path)
+    if not path.is_file():
+        raise FileNotFoundError(f"Not a file: {relative_path}")
+    if path.stat().st_nlink > 1:
+        raise ValueError(f"Refusing hardlinked file: {relative_path}")
+    return path
+
+
 def _iso_timestamp(ts: float) -> str:
     """Convert a Unix timestamp to an ISO 8601 string in UTC."""
     return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
 
 
-def read_file(relative_path: str) -> tuple[str, dict]:
+def read_file(relative_path: str, *, extract: bool = False) -> tuple[str, dict]:
     """Read a file and return (content, metadata).
 
     Metadata keys: size (int), modified (ISO str), created (ISO str).
-    """
-    path = resolve_vault_path(relative_path)
 
-    if not path.is_file():
-        raise FileNotFoundError(f"Not a file: {relative_path}")
+    extract: offer a file that is not valid UTF-8 to the registered content extractors
+    (``content_extractors``). Only the read tools pass True. Every other caller reads in
+    order to write back, and extracted text written back would replace the binary.
+    """
+    path = resolve_vault_read_path(relative_path)
 
     stat = path.stat()
     try:
         content = path.read_text(encoding="utf-8")
     except UnicodeDecodeError:
-        # Built-in extraction is unsupported for this file type. Offer it to a registered
-        # content extractor (OCR / transcript / preview); with none registered this
-        # re-raises -- byte-identical to the stock server.
-        extracted = apply_content_extractors(relative_path, "")
+        extracted = apply_content_extractors(relative_path, path) if extract else None
         if extracted is None:
             raise
         content = extracted
-    else:
-        # Empty built-in result: a registered extractor may still produce content.
-        if not content:
-            extracted = apply_content_extractors(relative_path, content)
-            if extracted is not None:
-                content = extracted
 
     metadata = {
         "size": stat.st_size,
@@ -104,6 +134,7 @@ def write_file_atomic(
     try:
         with os.fdopen(fd, "wb") as f:
             f.write(encoded)
+            _publish_mode(path, f.fileno())
         os.replace(tmp_path, path)
     except BaseException:
         # Clean up the temp file on any failure
@@ -114,6 +145,61 @@ def write_file_atomic(
         raise
 
     return is_new, len(encoded)
+
+
+def write_bytes_atomic(
+    relative_path: str, content: bytes, create_dirs: bool = True, overwrite: bool = True
+) -> tuple[bool, int]:
+    """Write raw bytes to a file atomically.
+
+    The binary counterpart of write_file_atomic: writes to a tempfile in the same
+    directory then puts it in place, so readers never see a partial write.
+    Returns (is_new_file, bytes_written).
+
+    With overwrite=False the placement is a true no-clobber: it uses os.link, which fails
+    atomically if the target already exists, closing the check-then-write race that a plain
+    exists()-then-os.replace would leave open. With overwrite=True it os.replace()s.
+    """
+    if len(content) > config.MAX_BINARY_SIZE:
+        raise ValueError(
+            f"Content size {len(content)} bytes exceeds limit of {config.MAX_BINARY_SIZE} bytes"
+        )
+
+    path = resolve_vault_path(relative_path)
+    is_new = not path.exists()
+
+    if create_dirs:
+        path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Write to a temp file in the same directory, then put it in place atomically.
+    fd, tmp_path = tempfile.mkstemp(dir=path.parent, suffix=".tmp")
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(content)
+            _publish_mode(path, f.fileno())
+        if overwrite:
+            os.replace(tmp_path, path)
+        else:
+            # Atomic create: os.link fails if the target exists (no clobber, no race).
+            try:
+                os.link(tmp_path, path)
+            except FileExistsError:
+                raise FileExistsError(f"File already exists: {relative_path}")
+            finally:
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+            is_new = True
+    except BaseException:
+        # Clean up the temp file on any failure (os.replace consumes it on success).
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+
+    return is_new, len(content)
 
 
 def move_path(

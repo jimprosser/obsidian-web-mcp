@@ -248,11 +248,20 @@ async def oauth_metadata(request: Request) -> JSONResponse:
 
 async def oauth_protected_resource(request: Request) -> JSONResponse:
     """RFC 9728 OAuth protected-resource metadata. Claude/ChatGPT request this path
-    during discovery; it must be reachable without a bearer token (#20). With the MCP
-    endpoint served at "/" (#19), the protected resource is the base URL itself."""
+    during discovery; it must be reachable without a bearer token (#20).
+
+    The ``resource`` identifier must be the actual MCP endpoint URL (RFC 9728 / RFC
+    8707), i.e. the base URL plus VAULT_MCP_PATH. When the endpoint is at "/" (#19)
+    that collapses to the base URL; when mounted under a subpath (VAULT_MCP_PATH,
+    e.g. "/mcp" — added in #43) it must include that path. Strict clients such as
+    Home Assistant's MCP integration reject the metadata unless ``resource`` exactly
+    equals the endpoint they connected to; lenient clients (claude.ai) ignore the
+    mismatch, which is why the "/"-only assumption went unnoticed."""
     base_url = config.advertised_base_url(str(request.base_url))
+    path = config.VAULT_MCP_PATH
+    resource = base_url if path == "/" else f"{base_url}{path}"
     return JSONResponse({
-        "resource": base_url,
+        "resource": resource,
         "authorization_servers": [base_url],
         "bearer_methods_supported": ["header"],
     })

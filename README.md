@@ -47,6 +47,8 @@ This is a server that provides network access to your personal notes. Security i
 
 **Safety limits prevent abuse.** Writes are capped at 1MB per file, batch operations at 20 files per request, and search results at 50 matches. Deletions are soft -- files move to `.trash/` rather than being permanently removed, matching Obsidian's own behavior. The delete tool also requires an explicit `confirm=true` parameter as a safety gate.
 
+**Hardlinked files are refused on read.** Files with more than one hardlink (`st_nlink > 1`) cannot be read or returned by text search, including frontmatter excerpts. Legitimate in-vault hardlinks are not supported.
+
 ## Reporting Security Issues
 
 Found a vulnerability? Please report it privately rather than opening a public issue or pull request. This repository has [private vulnerability reporting](https://github.com/jimprosser/obsidian-web-mcp/security/advisories) enabled: open the repo's **Security** tab and click **Report a vulnerability**. I'll acknowledge the report, coordinate a fix, and credit you in the resulting advisory. Please hold public disclosure until a patch is available.
@@ -58,6 +60,7 @@ Found a vulnerability? Please report it privately rather than opening a public i
 | `vault_read` | Read a file, returning content, metadata, and parsed YAML frontmatter |
 | `vault_batch_read` | Read multiple files in one call; handles missing files gracefully |
 | `vault_write` | Write a file with optional frontmatter merging; creates parent dirs |
+| `vault_write_binary` | Write an allowed binary file (image/PDF) to the vault from base64 content; enforces a media-type allowlist (declared type/extension, not byte-sniffed) and size cap, writes atomically |
 | `vault_edit` | Patch a file with ordered exact text replacements (token-efficient partial edits); supports dry-run diff previews |
 | `vault_append` | Append content to the end of a file without resending the existing body; creates the file when missing |
 | `vault_batch_frontmatter_update` | Update YAML frontmatter fields on multiple files without touching body content |
@@ -72,6 +75,8 @@ Found a vulnerability? Please report it privately rather than opening a public i
 | `vault_daily_note_path` | Resolve today's daily-note path from the configured folder/format |
 | `vault_daily_note_read` | Read today's daily note; returns an error (does not create it) when missing |
 | `vault_daily_note_append` | Append to today's daily note, creating it from the template when missing |
+| `vault_analytics_summary` | Compact vault-hygiene summary: counts and examples of missing frontmatter, broken wikilinks, near-duplicate tag variants, and non-UTF-8 files |
+| `vault_analytics_findings` | Detailed findings for one analytics category (`frontmatter_missing`, `required_frontmatter_missing`, `broken_wikilinks`, `suspicious_tag_variants`, `encoding_issues`, `oversized_files`) |
 
 ## Prerequisites
 
@@ -373,14 +378,15 @@ Two things worth knowing:
   can join the same stream. Use it for a provenance-aware commit, an audit log, or a webhook;
   a listener's exception is logged and swallowed.
 - **Content extractors fill the read side.** `content_extractors.register_content_extractor(cb)`
-  lets an extension supply text for a file the host can't read itself — OCR for a scanned PDF,
-  a transcript, a rendered preview. `cb(path, default_text) -> str | None` is consulted inside
-  `read_file` **only** when the built-in extraction is empty or unsupported; the first non-None
-  result wins, exceptions are logged and swallowed, and with none registered `read_file` is
-  byte-identical to stock. Note that a registered extractor changes what `read_file` returns for
-  that path, so a buggy one returns wrong text *for that one file* — bounded to the file the
-  caller already requested. The OCR/model/subprocess lives entirely in the extension; core only
-  gains a no-op callback list.
+  lets an extension supply text for a file the host can't read itself, such as OCR for a
+  scanned PDF or a screenshot. `cb(relative_path, path) -> str | None` receives the path the
+  client asked for and the host-resolved absolute path (already past containment and the
+  hardlink check). It is consulted only by `vault_read` and `vault_batch_read`, and only for a
+  file that is not valid UTF-8; the first non-None result wins, and exceptions are logged and
+  swallowed. Every other tool calls `read_file` without `extract=True`, because `vault_edit`,
+  `vault_append`, `vault_batch_frontmatter_update` and `vault_write(merge_frontmatter=True)`
+  read in order to write back and would otherwise replace the binary with its extracted text.
+  With nothing registered, reads are byte-identical to stock.
 
 ## VPS Setup With Cloudflare Origin TLS + Caddy Reverse Proxy
 

@@ -1,17 +1,31 @@
-"""Tests for the read-side content-extractor seam.
+"""The read-side content-extractor seam.
 
-Exercises the seam through the real ``read_file`` (not just the registry helper), including
-the byte-identical no-op when nothing is registered and the negative/abuse cases.
+The hazard this seam has to survive: read_file is also the read half of every tool that
+reads, transforms and writes back. If extracted text reached those tools, a correct OCR
+extractor would turn vault_edit on a scanned PDF into "replace the PDF with its OCR
+text". So the tests below are built in a fixed order:
+
+1. Prove the extractor really produces text through the read tools. Without that, a
+   test asserting "the binary is untouched" also passes when extraction never ran.
+2. Then drive every write-back tool through the registered MCP tool - the same entry
+   point a client reaches - and assert on the bytes left on disk.
+
+The extractor used here is signature-agnostic (``*args``) on purpose, so the same
+negative tests can be run against an earlier revision of this seam and show it failing.
 """
+
+import asyncio
+import json
 
 import pytest
 
-from obsidian_vault_mcp import content_extractors
-from obsidian_vault_mcp.content_extractors import (
-    apply_content_extractors,
-    register_content_extractor,
-)
+from obsidian_vault_mcp import content_extractors, server
+from obsidian_vault_mcp.content_extractors import apply_content_extractors, register_content_extractor
 from obsidian_vault_mcp.vault import read_file
+
+EXTRACTED = "Rechnung Nr. 4711 extrahiert"
+# Not valid UTF-8, so the host cannot read it itself.
+BINARY = b"%PDF-1.4\n\xff\xfe\x00\x01 scanned page bytes\n%%EOF\n"
 
 
 @pytest.fixture(autouse=True)
@@ -21,66 +35,148 @@ def _clear_registry():
     content_extractors._content_extractors.clear()
 
 
-# --- byte-identical no-op with nothing registered ---
+@pytest.fixture
+def scan(vault_dir):
+    target = vault_dir / "scan.pdf"
+    target.write_bytes(BINARY)
+    return target
 
-def test_no_extractor_text_file_unchanged(vault_dir):
-    (vault_dir / "note.md").write_text("hello body\n", encoding="utf-8")
-    content, _ = read_file("note.md")
-    assert content == "hello body\n"
+
+@pytest.fixture
+def extractor():
+    calls = []
+
+    def extract(*args):
+        calls.append(args)
+        return EXTRACTED
+
+    register_content_extractor(extract)
+    return calls
 
 
-def test_no_extractor_binary_still_raises(vault_dir):
-    # Stock behaviour: a non-UTF-8 file raises; with no extractor that must be preserved.
-    (vault_dir / "scan.pdf").write_bytes(b"%PDF-1.4\xff\xfe binary bytes")
+def call_tool(name: str, arguments: dict) -> dict:
+    """Call a tool the way a client does: through the FastMCP registration, including
+    the server's input models and audit wrapper, not the bare implementation function."""
+    result = asyncio.run(server.mcp.call_tool(name, arguments))
+    if isinstance(result, tuple):  # (content blocks, structured output)
+        result = result[0]
+    text = "".join(getattr(block, "text", "") for block in result)
+    return json.loads(text)
+
+
+# --- 1. The extractor genuinely works through the read tools -------------------------
+
+def test_vault_read_returns_extracted_text(scan, extractor):
+    result = call_tool("vault_read", {"path": "scan.pdf"})
+
+    assert result["content"] == EXTRACTED, result
+    assert result["metadata"]["size"] == len(BINARY)
+
+
+def test_vault_batch_read_returns_extracted_text(scan, extractor):
+    result = call_tool("vault_batch_read", {"paths": ["scan.pdf", "test-note.md"]})
+    by_path = {entry["path"]: entry for entry in result["files"]}
+
+    assert by_path["scan.pdf"]["content"] == EXTRACTED, result
+    assert "test note" in by_path["test-note.md"]["content"]
+
+
+def test_extractor_receives_relative_and_resolved_path(scan, extractor):
+    call_tool("vault_read", {"path": "scan.pdf"})
+
+    assert extractor == [("scan.pdf", scan.resolve())]
+
+
+# --- 2. No write-back tool ever sees extracted text -----------------------------------
+
+WRITE_BACK_TOOLS = {
+    "vault_edit": {"path": "scan.pdf", "edits": [{"old_text": EXTRACTED, "new_text": "X"}]},
+    "vault_append": {"path": "scan.pdf", "content": "angehaengt"},
+    "vault_batch_frontmatter_update": {"updates": [{"path": "scan.pdf", "fields": {"status": "done"}}]},
+    "vault_write merge_frontmatter": {
+        "path": "scan.pdf",
+        "content": "---\nstatus: done\n---\nneu\n",
+        "merge_frontmatter": True,
+    },
+}
+
+
+@pytest.mark.parametrize("label", sorted(WRITE_BACK_TOOLS))
+def test_write_back_tool_leaves_the_binary_untouched(scan, extractor, label):
+    # Precondition inside the same test, so no ordering can make this pass while the
+    # extractor is not actually producing text.
+    assert call_tool("vault_read", {"path": "scan.pdf"})["content"] == EXTRACTED
+    extractor.clear()
+
+    name = label.split()[0]
+    result = call_tool(name, WRITE_BACK_TOOLS[label])
+
+    assert scan.read_bytes() == BINARY, f"{label} replaced the binary on disk"
+    assert "error" in json.dumps(result), f"{label} did not report the failure: {result}"
+    assert extractor == [], f"{label} consulted the extractor"
+
+
+def test_read_file_does_not_consult_extractors_unless_asked(scan, extractor):
     with pytest.raises(UnicodeDecodeError):
         read_file("scan.pdf")
 
-
-def test_apply_empty_registry_returns_none():
-    assert apply_content_extractors("x.md", "") is None
+    assert extractor == []
 
 
-# --- an extractor fills the empty/unsupported branches ---
+# --- 3. The seam stays out of the way -------------------------------------------------
 
-def test_extractor_supplies_text_for_unsupported(vault_dir):
-    (vault_dir / "scan.pdf").write_bytes(b"%PDF-1.4\xff\xfe binary bytes")
-    register_content_extractor(lambda path, default_text: f"ocr:{path}")
-    content, metadata = read_file("scan.pdf")
-    assert content == "ocr:scan.pdf"
-    assert metadata["size"] > 0  # metadata still comes from the real file
+def test_nothing_registered_binary_read_fails_as_before(scan):
+    result = call_tool("vault_read", {"path": "scan.pdf"})
 
-
-def test_extractor_supplies_text_for_empty_file(vault_dir):
-    (vault_dir / "empty.md").write_text("", encoding="utf-8")
-    register_content_extractor(lambda path, default_text: "filled in")
-    content, _ = read_file("empty.md")
-    assert content == "filled in"
+    assert "error" in result
+    assert apply_content_extractors("scan.pdf", scan) is None
 
 
-def test_first_non_none_wins(vault_dir):
-    (vault_dir / "scan.pdf").write_bytes(b"\xff\xfe")
-    register_content_extractor(lambda path, default_text: None)   # declines
-    register_content_extractor(lambda path, default_text: "second")
-    register_content_extractor(lambda path, default_text: "third")
-    content, _ = read_file("scan.pdf")
-    assert content == "second"
+def test_utf8_text_never_reaches_an_extractor(vault_dir, extractor):
+    result = call_tool("vault_read", {"path": "test-note.md"})
+
+    assert "test note" in result["content"]
+    assert extractor == []
 
 
-def test_extractor_exception_is_swallowed(vault_dir):
-    (vault_dir / "scan.pdf").write_bytes(b"\xff\xfe")
+def test_empty_file_is_not_offered_to_extractors(vault_dir, extractor):
+    """An empty note is a note, not an unreadable file. Filling it in would let the
+    next append persist extractor output into a file the user created empty."""
+    (vault_dir / "leer.md").write_text("", encoding="utf-8")
 
-    def boom(path, default_text):
+    assert call_tool("vault_read", {"path": "leer.md"})["content"] == ""
+    assert extractor == []
+
+
+def test_first_non_none_wins_and_exceptions_are_swallowed(scan):
+    def boom(relative_path, path):
         raise RuntimeError("extractor blew up")
 
     register_content_extractor(boom)
-    register_content_extractor(lambda path, default_text: "recovered")
-    content, _ = read_file("scan.pdf")
-    assert content == "recovered"
+    register_content_extractor(lambda relative_path, path: None)
+    register_content_extractor(lambda relative_path, path: "second")
+    register_content_extractor(lambda relative_path, path: "third")
+
+    assert call_tool("vault_read", {"path": "scan.pdf"})["content"] == "second"
 
 
-def test_extractor_not_consulted_for_normal_text(vault_dir):
-    # Built-in extraction succeeds, so the extractor must not run / not override.
-    (vault_dir / "note.md").write_text("real body\n", encoding="utf-8")
-    register_content_extractor(lambda path, default_text: "SHOULD NOT APPEAR")
-    content, _ = read_file("note.md")
-    assert content == "real body\n"
+def test_hardlinked_binary_never_reaches_an_extractor(vault_dir, tmp_path, extractor):
+    """The host refuses hardlinks before extraction (#79), so an extractor cannot be
+    used to read a file outside the vault through a link."""
+    import os
+
+    outside = tmp_path / "outside.pdf"
+    outside.write_bytes(BINARY)
+    (vault_dir / "copy.pdf").write_bytes(BINARY)
+    try:
+        os.link(outside, vault_dir / "linked.pdf")
+    except (OSError, NotImplementedError) as exc:
+        pytest.skip(f"hardlinks unavailable: {exc}")
+
+    assert call_tool("vault_read", {"path": "copy.pdf"})["content"] == EXTRACTED
+    extractor.clear()
+
+    result = call_tool("vault_read", {"path": "linked.pdf"})
+
+    assert "error" in result and EXTRACTED not in json.dumps(result)
+    assert extractor == []
