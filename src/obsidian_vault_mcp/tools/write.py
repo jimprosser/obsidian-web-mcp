@@ -127,6 +127,8 @@ def vault_write_binary(
             })
 
         is_new, size = write_bytes_atomic(path, decoded, create_dirs=create_dirs, overwrite=overwrite)
+
+        fire_write("created" if is_new else "updated", [path])
         return dumps({"path": path, "created": is_new, "size": size, "media_type": media_type})
     except ValueError as e:
         return dumps({"error": str(e), "path": path, "media_type": media_type})
