@@ -44,8 +44,10 @@ _UPLOAD_ID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}
 
 
 def _upload_root() -> Path:
+    # 0700: a grant decides what gets written where, and metadata.json carries the target
+    # path. None of that is for other users on the box.
     root = config.UPLOAD_STAGING_DIR
-    root.mkdir(parents=True, exist_ok=True)
+    root.mkdir(parents=True, exist_ok=True, mode=0o700)
     return root
 
 
@@ -56,10 +58,11 @@ def upload_dir(upload_id: str) -> Path:
 
 
 def _upload_secret() -> str:
-    secret = config.VAULT_UPLOAD_URL_SECRET or config.VAULT_MCP_TOKEN
-    if not secret:
-        raise ValueError("VAULT_UPLOAD_URL_SECRET or VAULT_MCP_TOKEN must be configured for direct uploads")
-    return secret
+    # No fallback to the bearer token: the signing key is its own secret, and without it
+    # the whole feature is off (config.signed_upload_enabled).
+    if not config.VAULT_UPLOAD_URL_SECRET:
+        raise ValueError("VAULT_UPLOAD_URL_SECRET must be set for signed uploads")
+    return config.VAULT_UPLOAD_URL_SECRET
 
 
 def _canonical(metadata: dict, expires_at: int) -> str:
@@ -92,6 +95,10 @@ def _validate_sha256_hex(value: str) -> str:
 def _write_json_atomic(path: Path, payload: dict) -> None:
     tmp_path = path.with_suffix(path.suffix + ".tmp")
     tmp_path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+    try:
+        tmp_path.chmod(0o600)
+    except OSError:  # no-op where file modes are meaningless
+        pass
     tmp_path.replace(path)
 
 
@@ -156,7 +163,7 @@ def vault_request_upload_url(
         expires_at = now + effective_ttl
         upload_id = str(uuid.uuid4())
         staging = upload_dir(upload_id)
-        staging.mkdir(parents=True, exist_ok=False)
+        staging.mkdir(parents=True, exist_ok=False, mode=0o700)
         metadata = {
             "upload_id": upload_id,
             "path": path,
@@ -207,10 +214,12 @@ def _check_grant(upload_id: str, metadata: dict, expires: str, signature: str) -
     except (TypeError, ValueError):
         return {"error": "Invalid expires parameter", "upload_id": upload_id}, 400
     expected_signature = _signature(metadata, int(metadata["expires_at"]))
+    # Compared as bytes: compare_digest raises TypeError on a non-ASCII str, which a client
+    # can put in the query string (signature=%C3%A9) and turn into a 500.
     if (
         expires_at != int(metadata["expires_at"])
         or not signature
-        or not hmac.compare_digest(signature, expected_signature)
+        or not hmac.compare_digest(signature.encode("utf-8"), expected_signature.encode("ascii"))
     ):
         return {"error": "Invalid upload signature", "upload_id": upload_id}, 403
     if time.time() > expires_at:
@@ -270,14 +279,18 @@ def commit_direct_upload(
         return {"error": "Upload URL has already been used", "upload_id": upload_id}, 409
 
     target = metadata["path"]
-    before = snapshot_path(target)
+    # Only snapshotted when it will be recorded: snapshot_path hashes the whole existing
+    # target, up to VAULT_UPLOAD_MAX_BYTES, and a failure there must not leave the grant
+    # claimed with nothing written.
+    auditing = should_audit_operation(AUDIT_OPERATION)
+    before = snapshot_path(target) if auditing else None
     result, status = _commit(upload_id, metadata, metadata_path, staged_path, sha256, content_type)
     if "error" in result and not metadata.get("completed_at"):
         try:
             claim.rmdir()
         except OSError:
             pass
-    if should_audit_operation(AUDIT_OPERATION):
+    if auditing:
         write_audit_record(
             build_audit_record(
                 operation=AUDIT_OPERATION,

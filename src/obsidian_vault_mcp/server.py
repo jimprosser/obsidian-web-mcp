@@ -350,39 +350,49 @@ def vault_write_binary(path: str, data: str, media_type: str, overwrite: bool = 
     )
 
 
-@mcp.tool(
-    name="vault_request_upload_url",
-    description=(
-        "Create a short-lived, single-use signed URL for uploading a binary file (image or PDF) "
-        "into the vault. The client POSTs the raw bytes to the URL with the matching Content-Type; "
-        "the bytes never pass through the conversation. Use it for files too large for "
-        "vault_write_binary's base64 argument."
-    ),
-    annotations={"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False, "openWorldHint": False},
-)
-def vault_request_upload_url(
-    path: str,
-    media_type: str,
-    max_size_bytes: int,
-    overwrite: bool = False,
-    create_dirs: bool = True,
-    expected_sha256: str | None = None,
-    ttl_seconds: int | None = None,
-) -> str:
-    """Return a short-lived signed direct-upload URL."""
-    inp = VaultRequestUploadUrlInput(
-        path=path,
-        media_type=media_type,
-        max_size_bytes=max_size_bytes,
-        overwrite=overwrite,
-        create_dirs=create_dirs,
-        expected_sha256=expected_sha256,
-        ttl_seconds=ttl_seconds,
+def register_upload_tool() -> None:
+    """Register vault_request_upload_url only when signed uploads are configured.
+
+    The tool hands out URLs for a route that answers without a bearer token. With
+    VAULT_UPLOAD_URL_SECRET unset that route does not exist, so the tool must not be
+    advertised either.
+    """
+    @mcp.tool(
+        name="vault_request_upload_url",
+        description=(
+            "Create a short-lived, single-use signed URL for uploading a binary file (image or PDF) "
+            "into the vault. The client POSTs the raw bytes to the URL with the matching Content-Type; "
+            "the bytes never pass through the conversation. Use it for files too large for "
+            "vault_write_binary's base64 argument."
+        ),
+        annotations={"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False, "openWorldHint": False},
     )
-    return _vault_request_upload_url(
-        inp.path, inp.media_type, inp.max_size_bytes, inp.overwrite,
-        inp.create_dirs, inp.expected_sha256, inp.ttl_seconds,
-    )
+    def vault_request_upload_url(
+        path: str,
+        media_type: str,
+        max_size_bytes: int,
+        overwrite: bool = False,
+        create_dirs: bool = True,
+        expected_sha256: str | None = None,
+        ttl_seconds: int | None = None,
+    ) -> str:
+        """Return a short-lived signed direct-upload URL."""
+        inp = VaultRequestUploadUrlInput(
+            path=path,
+            media_type=media_type,
+            max_size_bytes=max_size_bytes,
+            overwrite=overwrite,
+            create_dirs=create_dirs,
+            expected_sha256=expected_sha256,
+            ttl_seconds=ttl_seconds,
+        )
+        return _vault_request_upload_url(
+            inp.path, inp.media_type, inp.max_size_bytes, inp.overwrite,
+            inp.create_dirs, inp.expected_sha256, inp.ttl_seconds,
+        )
+
+if config.signed_upload_enabled():
+    register_upload_tool()
 
 
 @mcp.tool(
@@ -750,20 +760,21 @@ async def direct_upload(request):
 class _RedactUploadSignature(logging.Filter):
     """Keep signed upload URLs out of the access log.
 
-    A logged URL is a usable credential until it expires or is used. uvicorn's access
-    record carries the full path with query string as an argument; the signature value is
-    replaced before the record is formatted, everything else in the line is kept.
+    A logged URL is a usable credential until it expires or is used, and a request refused
+    for a wrong Content-Type does not burn the grant. uvicorn's access record carries the
+    full path with query string as an argument; for anything under the upload prefix the
+    whole query string goes, rather than a pattern for "signature=". Matching the literal
+    key was bypassable: Starlette decodes query keys, so %73ignature=<sig> was accepted as
+    the signature and logged in full.
     """
 
     def filter(self, record: logging.LogRecord) -> bool:
         args = record.args
-        if isinstance(args, tuple) and len(args) >= 3 and isinstance(args[2], str) and "signature=" in args[2]:
-            path = args[2]
-            if path.startswith(config.UPLOAD_ROUTE_PREFIX + "/"):
-                import re
-
-                redacted = re.sub(r"(signature=)[^&\s]*", r"\1REDACTED", path)
-                record.args = args[:2] + (redacted,) + args[3:]
+        if isinstance(args, tuple) and len(args) >= 3 and isinstance(args[2], str):
+            target = args[2]
+            path, sep, _query = target.partition("?")
+            if sep and (path == config.UPLOAD_ROUTE_PREFIX or path.startswith(config.UPLOAD_ROUTE_PREFIX + "/")):
+                record.args = args[:2] + (path + "?REDACTED",) + args[3:]
         return True
 
 
@@ -827,9 +838,12 @@ def build_app(extensions=()):
 
     app.routes.insert(0, Route("/health", health, methods=["GET"]))
 
-    # Signed direct upload. Bearer-exempt for exactly POST /upload/<id> (see
-    # auth.is_signed_upload_request): the HMAC signature in the URL is the authorization.
-    app.routes.insert(0, Route(f"{config.UPLOAD_ROUTE_PREFIX}/{{upload_id}}", direct_upload, methods=["POST"]))
+    # Signed direct upload, only when the operator set VAULT_UPLOAD_URL_SECRET. Without
+    # it the route does not exist and auth.is_signed_upload_request answers False, so an
+    # upgrade adds no unauthenticated write path. Bearer-exempt for exactly
+    # POST /upload/<id>: the HMAC signature in the URL is the authorization.
+    if config.signed_upload_enabled():
+        app.routes.insert(0, Route(f"{config.UPLOAD_ROUTE_PREFIX}/{{upload_id}}", direct_upload, methods=["POST"]))
 
     # Extension routes (e.g. a localhost search endpoint), added before the auth
     # middleware so they are bearer-protected like the MCP transport.
@@ -890,8 +904,17 @@ def build_app(extensions=()):
                     f"extension route {getattr(r, 'path', r)!r} covers auth-exempt "
                     f"{m} {p!r}; it would be served without bearer authentication"
                 )
-        # The upload namespace belongs to the upload route. Probe the exempt shape and the
-        # paths around it, so neither a sibling id route nor a deeper one can be added.
+        # The upload namespace belongs to the upload route. Probes alone cannot reserve
+        # it: a literal Route("/upload/export") matches no probe path, yet the exemption
+        # regex matches its path, so it would be served with neither a token nor a
+        # signature. The declared path is checked directly, and the probes stay for
+        # parameterized and mounted shapes.
+        declared = getattr(r, "path", "") or ""
+        if declared == config.UPLOAD_ROUTE_PREFIX or declared.startswith(config.UPLOAD_ROUTE_PREFIX + "/"):
+            raise ValueError(
+                f"extension route {declared!r} is under the reserved "
+                f"{config.UPLOAD_ROUTE_PREFIX!r} namespace of the signed upload route"
+            )
         for probe in ("", "/probe-id", "/probe-id/deeper"):
             if _covers(r, "POST", config.UPLOAD_ROUTE_PREFIX + probe) is not Match.NONE:
                 raise ValueError(

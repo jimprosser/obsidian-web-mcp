@@ -39,6 +39,13 @@ _SIGNED_UPLOAD_PATH = re.compile(r"/upload/[A-Za-z0-9-]{1,64}")
 
 
 def is_signed_upload_request(method: str, path: str) -> bool:
+    """Whether this is the one request shape the signed upload route serves tokenless.
+
+    False whenever the feature is off, so a server without VAULT_UPLOAD_URL_SECRET has no
+    bearer-exempt write path at all.
+    """
+    if not config.signed_upload_enabled():
+        return False
     return method == "POST" and _SIGNED_UPLOAD_PATH.fullmatch(path) is not None
 
 
@@ -72,7 +79,7 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
         if (request.method, path) in _AUTH_EXEMPT_METHOD_PATHS:
             return await call_next(request)
 
-        if is_signed_upload_request(request.method, request.url.path):
+        if is_signed_upload_request(request.method, path):
             return await call_next(request)
 
         if not VAULT_MCP_TOKEN:

@@ -181,6 +181,16 @@ UPLOAD_STAGING_DIR = Path(os.environ.get(
 # The one path the upload route owns. Reserved in _validate_mcp_path and closed to
 # extension routes in build_app, so nothing else can be mounted under it.
 UPLOAD_ROUTE_PREFIX = "/upload"
+
+
+def signed_upload_enabled() -> bool:
+    """Whether the signed upload path exists at all.
+
+    Off unless the operator sets VAULT_UPLOAD_URL_SECRET. There is deliberately no
+    fallback to VAULT_MCP_TOKEN: upgrading must not turn on a new unauthenticated write
+    path, and the bearer token should not double as the URL-signing key.
+    """
+    return bool(VAULT_UPLOAD_URL_SECRET)
 MAX_BATCH_SIZE = 20           # Max files per batch operation
 MAX_SEARCH_RESULTS = 50       # Max results per search
 DEFAULT_SEARCH_RESULTS = 20
@@ -252,3 +262,46 @@ def validate_config() -> None:
     CLOSED with a clear message instead of booting a broken or insecure server.
     """
     _validate_mcp_path(VAULT_MCP_PATH)
+    if signed_upload_enabled():
+        _validate_upload_settings()
+
+
+def _validate_upload_settings() -> None:
+    """Fail closed on the signed-upload settings, the way the heartbeat interval does.
+
+    The module-level parses fall back to the default on a bad value, which would silently
+    ignore VAULT_UPLOAD_MAX_BYTES=100MB. Here the raw environment is read again so a
+    typo, a non-positive value, or a staging directory inside the vault stops startup
+    with the variable's name.
+    """
+    for name, parsed in (
+        ("VAULT_UPLOAD_URL_TTL_SECONDS", VAULT_UPLOAD_URL_TTL_SECONDS),
+        ("VAULT_UPLOAD_URL_MAX_TTL_SECONDS", VAULT_UPLOAD_URL_MAX_TTL_SECONDS),
+        ("VAULT_UPLOAD_MAX_BYTES", VAULT_UPLOAD_MAX_BYTES),
+    ):
+        raw = os.environ.get(name, "").strip()
+        if raw:
+            try:
+                value = int(raw)
+            except ValueError:
+                raise ValueError(f"{name} must be an integer, got {raw!r}")
+        else:
+            value = parsed
+        if value <= 0:
+            raise ValueError(f"{name} must be a positive integer, got {value}")
+    if VAULT_UPLOAD_URL_MAX_TTL_SECONDS < VAULT_UPLOAD_URL_TTL_SECONDS:
+        raise ValueError(
+            "VAULT_UPLOAD_URL_MAX_TTL_SECONDS must not be smaller than "
+            f"VAULT_UPLOAD_URL_TTL_SECONDS ({VAULT_UPLOAD_URL_MAX_TTL_SECONDS} < "
+            f"{VAULT_UPLOAD_URL_TTL_SECONDS})"
+        )
+    staging = UPLOAD_STAGING_DIR.expanduser()
+    vault_root = VAULT_PATH.expanduser()
+    try:
+        staging.resolve().relative_to(vault_root.resolve())
+    except ValueError:
+        return
+    raise ValueError(
+        f"VAULT_UPLOAD_STAGING_DIR resolves inside the vault ({staging}); the vault tools "
+        "could reach the grants. Choose a path outside VAULT_PATH."
+    )

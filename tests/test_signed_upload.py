@@ -130,7 +130,21 @@ def test_mcp_path_under_upload_is_rejected(path):
         config._validate_mcp_path(path)
 
 
-@pytest.mark.parametrize("route_path", ["/upload/{a}/{b}", "/upload/{upload_id}", "/upload"])
+@pytest.mark.parametrize(
+    "route_path",
+    [
+        "/upload/{a}/{b}",
+        "/upload/{upload_id}",
+        "/upload",
+        # Literals and typed converters match no probe path, but the exemption regex
+        # matches /upload/export, so it would have been served with neither a token nor a
+        # signature.
+        "/upload/export",
+        "/upload/{n:int}",
+        "/upload/x/y",
+        "/upload/",
+    ],
+)
 def test_extension_route_in_the_upload_namespace_is_rejected(route_path):
     class UploadSquatter(extensions.Extension):
         def register_routes(self, app):
@@ -254,6 +268,46 @@ def test_uploads_what_vault_write_binary_cannot(vault_dir, monkeypatch):
     assert (vault_dir / "gross.pdf").stat().st_size == len(big) > config.MAX_BINARY_SIZE
 
 
+def test_a_non_ascii_signature_is_refused_not_a_crash(vault_dir):
+    """compare_digest raises TypeError on a non-ASCII str, which a client can put in the
+    query string and turn into a 500."""
+    grant = request_url(path="scan.png")
+    tampered = local_path(grant["upload_url"]).replace("signature=", "signature=%C3%A9")
+
+    response = client().post(tampered, content=PNG, headers={"Content-Type": "image/png"})
+
+    assert response.status_code in (403, 404), response.text
+    assert not (vault_dir / "scan.png").exists()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="file modes are meaningless on Windows")
+def test_staging_is_owner_only(vault_dir):
+    grant = request_url(path="scan.png")
+    staging = config.UPLOAD_STAGING_DIR
+    upload = staging / grant["upload_id"]
+
+    assert oct(staging.stat().st_mode & 0o777) == "0o700"
+    assert oct(upload.stat().st_mode & 0o777) == "0o700"
+    assert oct((upload / "metadata.json").stat().st_mode & 0o777) == "0o600"
+
+
+def test_the_target_is_not_hashed_when_auditing_is_off(vault_dir, monkeypatch):
+    """snapshot_path reads the whole existing target, up to VAULT_UPLOAD_MAX_BYTES. With
+    auditing off nothing records it, and an exception there used to leave the grant claimed
+    with nothing written."""
+    from obsidian_vault_mcp.tools import upload as upload_mod
+
+    monkeypatch.setattr(config, "VAULT_AUDIT_LOG_PATH", "")
+    monkeypatch.setattr(upload_mod, "snapshot_path", lambda path: (_ for _ in ()).throw(AssertionError("hashed the target")))
+    (vault_dir / "scan.png").write_bytes(PNG[:20])
+    grant = request_url(path="scan.png", overwrite=True)
+
+    response = client().post(local_path(grant["upload_url"]), content=PNG, headers={"Content-Type": "image/png"})
+
+    assert response.status_code == 200, response.text
+    assert (vault_dir / "scan.png").read_bytes() == PNG
+
+
 # --- The commit is audited and fires a write event ------------------------------------------
 
 def test_commit_is_audited_and_fires_a_write_event(vault_dir, upload_env):
@@ -318,7 +372,9 @@ def _serve_once_and_capture(log_config, capfd) -> str:
     assert uv.started, "uvicorn did not start"
     try:
         req = urllib.request.Request(
-            f"http://127.0.0.1:{port}/upload/0f0e0d0c-0b0a-4908-8706-050403020100?expires=1&signature=SIGNATURE-VALUE-123",
+            # %73ignature is "signature": Starlette decodes query keys, so a filter that
+            # looked for the literal key logged the value in full.
+            f"http://127.0.0.1:{port}/upload/0f0e0d0c-0b0a-4908-8706-050403020100?expires=1&%73ignature=SIGNATURE-VALUE-123",
             data=PNG, method="POST", headers={"Content-Type": "image/png"},
         )
         try:
