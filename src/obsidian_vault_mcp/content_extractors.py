@@ -43,7 +43,7 @@ def register_content_extractor(callback) -> None:
 
 
 def apply_content_extractors(relative_path: str, path: Path) -> str | None:
-    """Return the first non-None extractor result, or ``None`` if none apply."""
+    """Return the first ``str`` extractor result, or ``None`` if none apply."""
     for extractor in _content_extractors:
         try:
             result = extractor(relative_path, path)

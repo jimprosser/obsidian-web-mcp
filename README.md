@@ -384,7 +384,7 @@ Two things worth knowing:
   host: containment and the hardlink refusal). A result that is not a string counts as a
   decline. When an extractor supplies the content, the read tools set `metadata.extracted`
   to `true`, so a caller can tell the text apart from the file's own bytes. It is consulted only by `vault_read` and `vault_batch_read`, and only for a
-  file that is not valid UTF-8; the first non-None result wins, and exceptions are logged and
+  file that is not valid UTF-8; the first string result wins, and exceptions are logged and
   swallowed. Every other tool calls `read_file` without `extract=True`, because `vault_edit`,
   `vault_append`, `vault_batch_frontmatter_update` and `vault_write(merge_frontmatter=True)`
   read in order to write back and would otherwise replace the binary with its extracted text.
