@@ -139,6 +139,13 @@ class VaultEditOperationInput(BaseModel):
         description="Replacement text for old_text",
         max_length=MAX_CONTENT_SIZE,
     )
+    replace_all: bool = Field(
+        default=False,
+        description=(
+            "Replace every occurrence of old_text instead of requiring exactly one. "
+            "Zero matches is still an error."
+        ),
+    )
 
 
 class VaultEditInput(BaseModel):
