@@ -334,7 +334,11 @@ def vault_write(path: str, content: str, create_dirs: bool = True, merge_frontma
 def vault_write_binary(path: str, data: str, media_type: str, overwrite: bool = False, create_dirs: bool = True) -> str:
     """Write a base64-encoded binary file to the vault."""
     inp = VaultWriteBinaryInput(path=path, data=data, media_type=media_type, overwrite=overwrite, create_dirs=create_dirs)
-    return _vault_write_binary(inp.path, inp.data, inp.media_type, inp.overwrite, inp.create_dirs)
+    return _run_audited(
+        "vault_write_binary",
+        lambda: _vault_write_binary(inp.path, inp.data, inp.media_type, inp.overwrite, inp.create_dirs),
+        path=inp.path,
+    )
 
 
 @mcp.tool(

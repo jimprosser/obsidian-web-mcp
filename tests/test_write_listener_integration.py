@@ -1,4 +1,4 @@
-"""The six core mutation tools fire write events at their success path.
+"""The core mutation tools fire write events at their success path.
 
 Semantics under test (from #58): created-vs-updated distinguished; vault_move is a
 single "moved" with both paths; a batch fires once with only the successfully-written
@@ -6,6 +6,7 @@ paths; vault_edit does not fire on a dry-run or a no-change edit; delete fires o
 a confirmed success; a failed/aborted write never fires.
 """
 
+import base64
 import json
 
 import pytest
@@ -16,6 +17,7 @@ from obsidian_vault_mcp.tools.write import (
     vault_batch_frontmatter_update,
     vault_edit,
     vault_write,
+    vault_write_binary,
 )
 from obsidian_vault_mcp.tools.manage import vault_delete, vault_move
 
@@ -45,6 +47,34 @@ def test_vault_write_existing_file_fires_updated(vault_dir, events):
 def test_vault_write_invalid_path_does_not_fire(vault_dir, events):
     result = json.loads(vault_write("../escape.md", "x"))
     assert "error" in result
+    assert events == []
+
+
+# --- vault_write_binary ---
+
+_PNG_B64 = base64.b64encode(b"\x89PNG\r\n\x1a\n fake-image-bytes").decode("ascii")
+
+
+def test_vault_write_binary_new_file_fires_created(vault_dir, events):
+    vault_write_binary("assets/pic.png", _PNG_B64, "image/png")
+    assert events == [("created", ["assets/pic.png"])]
+
+
+def test_vault_write_binary_overwrite_fires_updated(vault_dir, events):
+    vault_write_binary("assets/pic.png", _PNG_B64, "image/png")
+    events.clear()
+    vault_write_binary("assets/pic.png", _PNG_B64, "image/png", overwrite=True)
+    assert events == [("updated", ["assets/pic.png"])]
+
+
+def test_vault_write_binary_refused_does_not_fire(vault_dir, events):
+    vault_write_binary("assets/pic.png", _PNG_B64, "image/png")
+    assert events == [("created", ["assets/pic.png"])]  # the setup write really happened
+    events.clear()
+    refused = json.loads(vault_write_binary("assets/pic.png", _PNG_B64, "image/png"))  # no overwrite
+    rejected = json.loads(vault_write_binary("a.svg", _PNG_B64, "image/svg+xml"))
+    assert "already exists" in refused["error"]
+    assert "Unsupported media_type" in rejected["error"]
     assert events == []
 
 
