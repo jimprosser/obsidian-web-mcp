@@ -98,7 +98,12 @@ def _save_clients() -> None:
         # O_CREAT with 0o600 so the secrets are never briefly world-readable; fchmod
         # forces 0600 even if a stale tmp from a crashed write pre-existed wider.
         fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        os.fchmod(fd, 0o600)
+        if hasattr(os, "fchmod"):
+            # Guarded like vault._publish_mode: os.fchmod does not exist on Windows, where
+            # mode bits are meaningless anyway. Without the guard every registration and
+            # every startup rewrite raised AttributeError, the except below logged it, and
+            # the registry silently stayed empty: clients reconnected on every restart.
+            os.fchmod(fd, 0o600)
         with os.fdopen(fd, "w") as f:
             json.dump(_clients, f)
             f.flush()
