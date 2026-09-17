@@ -6,6 +6,7 @@ _run_audited wrapper is exercised end to end. The bearer middleware is not in th
 here, so the authenticated principal is bound manually via context.set_request_context.
 """
 
+import base64
 import json
 
 import pytest
@@ -103,6 +104,48 @@ def test_move_records_destination(audit_log):
 
 # --- reads (opt-in) ---
 
+# --- binary writes are mutations too ---
+
+_PNG = b"\x89PNG\r\n\x1a\n fake-image-bytes"
+
+
+def _b64(data: bytes) -> str:
+    return base64.b64encode(data).decode("ascii")
+
+
+def _sha256(data: bytes) -> str:
+    return __import__("hashlib").sha256(data).hexdigest()
+
+
+def test_binary_write_is_audited_with_before_and_after(audit_log):
+    server.vault_write_binary("assets/pic.png", _b64(_PNG), "image/png")
+    server.vault_write_binary("assets/pic.png", _b64(_PNG + b"!"), "image/png", overwrite=True)
+
+    first, second = _records(audit_log)
+
+    assert first["operation"] == second["operation"] == "vault_write_binary"
+    assert first["target_path"] == "assets/pic.png"
+    assert first["operation_status"] == "success"
+    assert first["size_before"] is None and first["size_after"] == len(_PNG)
+    assert first["checksum_before"] is None
+    assert first["checksum_after"] == _sha256(_PNG)
+    assert second["checksum_before"] == _sha256(_PNG)
+    assert second["checksum_after"] == _sha256(_PNG + b"!")
+    assert second["size_after"] == len(_PNG) + 1
+    assert first["token_id_hash"] == EXPECTED_HASH
+
+
+def test_refused_binary_write_is_audited_as_error(audit_log):
+    result = json.loads(server.vault_write_binary("a.svg", _b64(_PNG), "image/svg+xml"))
+
+    assert "Unsupported media_type" in result["error"]
+    (rec,) = _records(audit_log)
+    assert rec["operation"] == "vault_write_binary"
+    assert "Unsupported media_type" in rec["error"]
+    assert rec["operation_status"] == "error"
+    assert rec["size_after"] is None
+
+
 def test_reads_not_logged_by_default(audit_log):
     server.vault_read("test-note.md")
     assert _records(audit_log) == []
@@ -173,6 +216,7 @@ def test_snapshot_path_stays_in_vault(vault_dir):
 @pytest.mark.parametrize("name", [
     "vault_write", "vault_edit", "vault_append", "vault_move", "vault_delete",
     "vault_read", "vault_search", "vault_canvas_add_node", "vault_daily_note_append",
+    "vault_write_binary",
 ])
 def test_audited_tools_still_registered(vault_dir, name):
     assert server.mcp._tool_manager.get_tool(name) is not None

@@ -32,6 +32,7 @@ logger = logging.getLogger(__name__)
 # Operations that change the vault. Always audited when a log path is configured.
 MUTATION_OPERATIONS = {
     "vault_write",
+    "vault_write_binary",
     "vault_edit",
     "vault_append",
     "vault_batch_frontmatter_update",

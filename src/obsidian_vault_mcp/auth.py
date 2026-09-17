@@ -61,10 +61,15 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
     """Validates Bearer tokens on all requests except OAuth and health endpoints."""
 
     async def dispatch(self, request: Request, call_next):
-        if request.url.path in _AUTH_EXEMPT_PATHS:
+        # The decoded ASGI path, not request.url.path. The latter is parsed back out of a
+        # URL string, so an encoded "?" or "#" truncates it: "/health%3F/x" would read as
+        # the exempt "/health" here while the router dispatched "/health?/x".
+        path = request.scope["path"]
+
+        if path in _AUTH_EXEMPT_PATHS:
             return await call_next(request)
 
-        if (request.method, request.url.path) in _AUTH_EXEMPT_METHOD_PATHS:
+        if (request.method, path) in _AUTH_EXEMPT_METHOD_PATHS:
             return await call_next(request)
 
         if is_signed_upload_request(request.method, request.url.path):
