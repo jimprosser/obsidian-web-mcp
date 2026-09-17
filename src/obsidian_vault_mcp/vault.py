@@ -92,6 +92,7 @@ def read_file(relative_path: str, *, extract: bool = False) -> tuple[str, dict]:
     path = resolve_vault_read_path(relative_path)
 
     stat = path.stat()
+    from_extractor = False
     try:
         content = path.read_text(encoding="utf-8")
     except UnicodeDecodeError:
@@ -99,12 +100,19 @@ def read_file(relative_path: str, *, extract: bool = False) -> tuple[str, dict]:
         if extracted is None:
             raise
         content = extracted
+        from_extractor = True
 
     metadata = {
         "size": stat.st_size,
         "modified": _iso_timestamp(stat.st_mtime),
         "created": _iso_timestamp(stat.st_birthtime if hasattr(stat, "st_birthtime") else stat.st_ctime),
     }
+    if from_extractor:
+        # Say so in the response: the content is not what the file holds. Without this a
+        # model that gets the safe decode error from vault_edit can fall back to
+        # vault_write and replace the file with the extracted text. Only set when an
+        # extractor supplied the content, so an ordinary read is unchanged.
+        metadata["extracted"] = True
 
     return content, metadata
 

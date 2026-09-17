@@ -34,10 +34,10 @@ def register_content_extractor(callback) -> None:
 
     Consulted only by the read tools, and only for a file that is not valid UTF-8.
     ``relative_path`` is the vault-relative path the client asked for; ``path`` is the
-    host-resolved absolute path, already past the host's containment and hardlink checks,
-    so an extractor never has to resolve or re-validate it. Return the extracted text, or
-    ``None`` to decline -- the next extractor, then the host's default behaviour, applies.
-    Exceptions raised by an extractor are logged and swallowed, never propagated.
+    host-resolved absolute path, already resolved and checked by the host (containment and
+    the hardlink refusal). Return the extracted text, or ``None`` to decline -- the next
+    extractor, then the host's default behaviour, applies. Anything that is not a ``str``
+    counts as a decline, and an exception is logged and swallowed, never propagated.
     """
     _content_extractors.append(callback)
 
@@ -50,6 +50,14 @@ def apply_content_extractors(relative_path: str, path: Path) -> str | None:
         except Exception:
             logger.warning("Content extractor error for %s", relative_path, exc_info=True)
             continue
-        if result is not None:
-            return result
+        if result is None:
+            continue
+        if not isinstance(result, str):
+            logger.warning(
+                "Content extractor for %s returned %s, not str; declining",
+                relative_path,
+                type(result).__name__,
+            )
+            continue
+        return result
     return None

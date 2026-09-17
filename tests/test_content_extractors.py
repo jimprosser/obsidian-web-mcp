@@ -81,6 +81,45 @@ def test_vault_batch_read_returns_extracted_text(scan, extractor):
     assert "test note" in by_path["test-note.md"]["content"]
 
 
+def test_extracted_content_is_marked_in_the_metadata(scan, extractor):
+    """A caller must be able to tell extracted text from the file's own bytes. Without the
+    marker, a model that gets the safe decode error from vault_edit can fall back to
+    vault_write and replace the file with the text it was just shown."""
+    read = call_tool("vault_read", {"path": "scan.pdf"})
+    batch = call_tool("vault_batch_read", {"paths": ["scan.pdf", "test-note.md"]})
+    by_path = {entry["path"]: entry for entry in batch["files"]}
+
+    assert read["metadata"]["extracted"] is True, read
+    assert by_path["scan.pdf"]["metadata"]["extracted"] is True
+    # An ordinary read is unchanged: no key at all, not a False.
+    assert "extracted" not in by_path["test-note.md"]["metadata"]
+
+
+def test_an_ordinary_read_carries_no_extracted_marker(vault_dir, extractor):
+    result = call_tool("vault_read", {"path": "test-note.md"})
+
+    assert "extracted" not in result["metadata"], result
+
+
+@pytest.mark.parametrize("value", [123, b"bytes", ["text"], {"content": "text"}])
+def test_a_non_text_result_counts_as_a_decline(scan, value):
+    """Anything but a str would otherwise land in "content" as-is and travel to the client."""
+    register_content_extractor(lambda relative_path, path: value)
+    register_content_extractor(lambda relative_path, path: "second")
+
+    result = call_tool("vault_read", {"path": "scan.pdf"})
+
+    assert result["content"] == "second", result
+
+
+def test_only_non_text_registered_leaves_the_read_failing(scan):
+    register_content_extractor(lambda relative_path, path: 123)
+
+    result = call_tool("vault_read", {"path": "scan.pdf"})
+
+    assert "error" in result and "123" not in json.dumps(result)
+
+
 def test_extractor_receives_relative_and_resolved_path(scan, extractor):
     call_tool("vault_read", {"path": "scan.pdf"})
 

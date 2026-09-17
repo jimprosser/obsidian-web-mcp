@@ -380,8 +380,10 @@ Two things worth knowing:
 - **Content extractors fill the read side.** `content_extractors.register_content_extractor(cb)`
   lets an extension supply text for a file the host can't read itself, such as OCR for a
   scanned PDF or a screenshot. `cb(relative_path, path) -> str | None` receives the path the
-  client asked for and the host-resolved absolute path (already past containment and the
-  hardlink check). It is consulted only by `vault_read` and `vault_batch_read`, and only for a
+  client asked for and the host-resolved absolute path (already resolved and checked by the
+  host: containment and the hardlink refusal). A result that is not a string counts as a
+  decline. When an extractor supplies the content, the read tools set `metadata.extracted`
+  to `true`, so a caller can tell the text apart from the file's own bytes. It is consulted only by `vault_read` and `vault_batch_read`, and only for a
   file that is not valid UTF-8; the first non-None result wins, and exceptions are logged and
   swallowed. Every other tool calls `read_file` without `extract=True`, because `vault_edit`,
   `vault_append`, `vault_batch_frontmatter_update` and `vault_write(merge_frontmatter=True)`
