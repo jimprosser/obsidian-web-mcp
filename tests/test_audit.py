@@ -45,6 +45,27 @@ def test_audit_off_by_default(vault_dir, monkeypatch, tmp_path):
     assert audit.should_audit_operation("vault_write") is False
 
 
+# --- the shared fixture ignores an audit log exported in the developer's shell ---
+
+@pytest.fixture
+def ambient_audit_log(tmp_path, monkeypatch):
+    """What config holds when VAULT_AUDIT_LOG_PATH (and read auditing) is exported in the
+    shell that launched pytest: both are read from the environment at import."""
+    log_path = tmp_path / "developers-real-audit.jsonl"
+    monkeypatch.setattr(config, "VAULT_AUDIT_LOG_PATH", str(log_path))
+    monkeypatch.setattr(config, "VAULT_AUDIT_LOG_INCLUDE_READS", True)
+    return log_path
+
+
+def test_vault_dir_fixture_switches_off_an_ambient_audit_log(ambient_audit_log, vault_dir):
+    # Argument order matters: the ambient value is in place before vault_dir runs.
+    json.loads(server.vault_write("note.md", "body"))
+    json.loads(server.vault_read("note.md"))
+
+    assert not ambient_audit_log.exists()
+    assert audit.should_audit_operation("vault_write") is False
+
+
 # --- mutations ---
 
 def test_mutation_writes_record_with_required_fields(audit_log):

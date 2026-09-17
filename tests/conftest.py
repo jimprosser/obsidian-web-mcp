@@ -41,4 +41,11 @@ def vault_dir(tmp_path, monkeypatch):
     import obsidian_vault_mcp.config as config
     config.VAULT_PATH = Path(str(vault))
 
+    # Auditing is read from the environment at import, so a VAULT_AUDIT_LOG_PATH exported
+    # in the developer's shell would take every server-level tool call in the suite into
+    # their real audit log. Off by default here; tests that want it switch it on themselves
+    # (see the audit_log fixture in test_audit.py), after this fixture has run.
+    monkeypatch.setattr(config, "VAULT_AUDIT_LOG_PATH", "")
+    monkeypatch.setattr(config, "VAULT_AUDIT_LOG_INCLUDE_READS", False)
+
     yield vault
