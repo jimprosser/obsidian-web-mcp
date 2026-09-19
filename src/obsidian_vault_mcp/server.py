@@ -461,7 +461,7 @@ def vault_list(
 
 @mcp.tool(
     name="vault_move",
-    description="Move a file or directory within the vault. Validates both source and destination paths.",
+    description="Move or rename a file or directory within the vault. Validates both source and destination paths. Links that pointed at the moved note are repointed, the way Obsidian does on a rename.",
     annotations={"readOnlyHint": False, "destructiveHint": True, "idempotentHint": False, "openWorldHint": False},
 )
 def vault_move(source: str, destination: str, create_dirs: bool = True) -> str:
