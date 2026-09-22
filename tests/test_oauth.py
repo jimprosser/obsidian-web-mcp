@@ -7,6 +7,7 @@ unauthenticated attack from the bug reports must no longer yield a token.
 
 import base64
 import hashlib
+import os
 
 import pytest
 from starlette.applications import Starlette
@@ -318,11 +319,26 @@ def test_registration_persists_across_restart(client):
     assert oauth._redirect_uri_ok(client_id, redirect) is True
 
 
+@pytest.mark.skipif(os.name == "nt", reason="file modes are meaningless on Windows")
 def test_registry_file_is_owner_only(client):
     """The persisted registry holds per-client secrets; it must be 0600."""
     _register(client)
     mode = config.OAUTH_CLIENTS_PATH.stat().st_mode & 0o777
     assert mode == 0o600
+
+
+def test_registration_persists_where_there_is_no_fchmod(client, monkeypatch):
+    """os.fchmod does not exist on Windows. Calling it bare raised AttributeError inside
+    _save_clients, the except logged it, and the registry stayed empty: every client had
+    to re-register after each restart, which is what DCR persistence exists to avoid."""
+    monkeypatch.delattr(os, "fchmod", raising=False)
+
+    client_id, _redirect = _register(client)
+
+    assert config.OAUTH_CLIENTS_PATH.is_file(), "the registry was not written"
+    oauth._clients.clear()
+    oauth._load_clients()
+    assert client_id in oauth._clients
 
 
 def test_load_clients_tolerates_corrupt_file(client):
