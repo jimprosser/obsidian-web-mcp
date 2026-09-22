@@ -250,9 +250,13 @@ def _dry_run_report(path: str, original_content: str, normalized_edits: list[dic
     match_counts = []
     all_unique = True
     preview = original_content
+    replacements = 0
     for index, edit in enumerate(normalized_edits):
         old_text = edit.get("old_text", "")
+        replace_all = bool(edit.get("replace_all", False))
         entry = {"index": index}
+        if replace_all:
+            entry["replace_all"] = True
         if not old_text:
             entry["count"] = 0
             entry["error"] = "no old_text to match"
@@ -265,13 +269,20 @@ def _dry_run_report(path: str, original_content: str, normalized_edits: list[dic
             near_miss = _find_near_miss(preview, old_text)
             if near_miss:
                 entry["near_miss"] = near_miss
-        if count != 1:
+        if count == 0 or (count != 1 and not replace_all):
             all_unique = False
             match_counts.append(entry)
             continue
-        # Exactly one match: fold it into the running document so the next
-        # edit is validated against the same state the real apply would see.
-        preview = preview.replace(old_text, edit.get("new_text", ""), 1)
+        # Applicable: fold it into the running document so the next edit is
+        # validated against the same state the real apply would see. With
+        # replace_all every occurrence goes in this step, exactly as it would
+        # when applied.
+        preview = (
+            preview.replace(old_text, edit.get("new_text", ""))
+            if replace_all
+            else preview.replace(old_text, edit.get("new_text", ""), 1)
+        )
+        replacements += count if replace_all else 1
         match_counts.append(entry)
 
     size_error = None
@@ -298,6 +309,7 @@ def _dry_run_report(path: str, original_content: str, normalized_edits: list[dic
         "diff": diff,
         "match_counts": match_counts,
         "edits_applied": len(normalized_edits) if all_unique else 0,
+        "replacements": replacements if all_unique else 0,
         "size": size,
     }
     if size_error:
@@ -330,9 +342,11 @@ def vault_edit(path: str, edits: list[dict], dry_run: bool = False) -> str:
         if dry_run:
             return _dry_run_report(path, original_content, normalized_edits)
 
+        replacements = 0
         for index, normalized_edit in enumerate(normalized_edits):
             old_text = normalized_edit.get("old_text", "")
             new_text = normalized_edit.get("new_text", "")
+            replace_all = bool(normalized_edit.get("replace_all", False))
 
             if not old_text:
                 # An empty old_text would make content.count() report a phantom
@@ -349,10 +363,11 @@ def vault_edit(path: str, edits: list[dict], dry_run: bool = False) -> str:
 
             count = content.count(old_text)
 
-            if count != 1:
+            if count == 0 or (count != 1 and not replace_all):
+                requirement = "at least once" if replace_all else "exactly once"
                 payload = {
                     "error": (
-                        f"Edit {index} old_text must match exactly once; "
+                        f"Edit {index} old_text must match {requirement}; "
                         f"found {count} matches"
                     ),
                     "path": path,
@@ -368,7 +383,8 @@ def vault_edit(path: str, edits: list[dict], dry_run: bool = False) -> str:
                         payload["near_miss"] = near_miss
                 return dumps(payload)
 
-            content = content.replace(old_text, new_text, 1)
+            content = content.replace(old_text, new_text) if replace_all else content.replace(old_text, new_text, 1)
+            replacements += count if replace_all else 1
 
         diff = _unified_diff(path, original_content, content)
         size = len(content.encode("utf-8"))
@@ -384,6 +400,7 @@ def vault_edit(path: str, edits: list[dict], dry_run: bool = False) -> str:
             "dry_run": False,
             "diff": diff,
             "edits_applied": len(edits),
+            "replacements": replacements,
             "size": size,
         })
     except ValueError as e:
