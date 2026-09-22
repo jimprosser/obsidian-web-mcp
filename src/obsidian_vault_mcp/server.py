@@ -13,6 +13,7 @@ import time
 import urllib.parse
 import urllib.request
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
@@ -28,6 +29,7 @@ from .config import (
     VAULT_MCP_TOKEN,
     VAULT_PATH,
 )
+from . import config
 from .frontmatter_index import FrontmatterIndex
 from .audit import (
     BATCH_OPERATIONS,
@@ -143,6 +145,12 @@ from .tools.write import (
     vault_write as _vault_write,
     vault_write_binary as _vault_write_binary,
 )
+from .tools.upload import (
+    commit_direct_upload,
+    upload_dir,
+    validate_upload_grant,
+    vault_request_upload_url as _vault_request_upload_url,
+)
 from .tools.search import vault_search as _vault_search, vault_search_frontmatter as _vault_search_frontmatter
 from .tools.manage import vault_list as _vault_list, vault_move as _vault_move, vault_delete as _vault_delete
 from .tools.canvas import (
@@ -165,6 +173,7 @@ from .models import (
     VaultReadInput,
     VaultWriteInput,
     VaultWriteBinaryInput,
+    VaultRequestUploadUrlInput,
     VaultEditInput,
     VaultEditOperationInput,
     VaultAppendInput,
@@ -339,6 +348,51 @@ def vault_write_binary(path: str, data: str, media_type: str, overwrite: bool = 
         lambda: _vault_write_binary(inp.path, inp.data, inp.media_type, inp.overwrite, inp.create_dirs),
         path=inp.path,
     )
+
+
+def register_upload_tool() -> None:
+    """Register vault_request_upload_url only when signed uploads are configured.
+
+    The tool hands out URLs for a route that answers without a bearer token. With
+    VAULT_UPLOAD_URL_SECRET unset that route does not exist, so the tool must not be
+    advertised either.
+    """
+    @mcp.tool(
+        name="vault_request_upload_url",
+        description=(
+            "Create a short-lived, single-use signed URL for uploading a binary file (image or PDF) "
+            "into the vault. The client POSTs the raw bytes to the URL with the matching Content-Type; "
+            "the bytes never pass through the conversation. Use it for files too large for "
+            "vault_write_binary's base64 argument."
+        ),
+        annotations={"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False, "openWorldHint": False},
+    )
+    def vault_request_upload_url(
+        path: str,
+        media_type: str,
+        max_size_bytes: int,
+        overwrite: bool = False,
+        create_dirs: bool = True,
+        expected_sha256: str | None = None,
+        ttl_seconds: int | None = None,
+    ) -> str:
+        """Return a short-lived signed direct-upload URL."""
+        inp = VaultRequestUploadUrlInput(
+            path=path,
+            media_type=media_type,
+            max_size_bytes=max_size_bytes,
+            overwrite=overwrite,
+            create_dirs=create_dirs,
+            expected_sha256=expected_sha256,
+            ttl_seconds=ttl_seconds,
+        )
+        return _vault_request_upload_url(
+            inp.path, inp.media_type, inp.max_size_bytes, inp.overwrite,
+            inp.create_dirs, inp.expected_sha256, inp.ttl_seconds,
+        )
+
+if config.signed_upload_enabled():
+    register_upload_tool()
 
 
 @mcp.tool(
@@ -625,6 +679,117 @@ def vault_analytics_findings(
     )
 
 
+_UPLOAD_CHUNK_LIMIT_MESSAGE = "Uploaded content exceeds the {cap} bytes this upload URL allows"
+
+
+async def direct_upload(request):
+    """Accept the bytes for a signed upload URL.
+
+    The order is the security property. The grant (id, signature, expiry, single use) is
+    validated before a single body byte is read, so a request without a valid URL costs
+    the server nothing. The body is then streamed into a temp file in the upload's
+    staging dir and cut off at the grant's cap; it is never held in memory. The commit
+    checks the grant again, validates size, type and checksum, and places the file.
+
+    Rejected grants are logged, not audited: an unauthenticated flood must not be able
+    to grow the audit log. Every attempt on a valid grant is audited by the commit.
+    """
+    import hashlib
+    import tempfile
+
+    import anyio
+    from starlette.responses import JSONResponse
+
+    upload_id = request.path_params["upload_id"]
+    expires = request.query_params.get("expires", "")
+    signature = request.query_params.get("signature", "")
+
+    grant, status = await anyio.to_thread.run_sync(validate_upload_grant, upload_id, expires, signature)
+    if status != 200:
+        logger.warning("Upload refused before reading the body: %s (%s)", upload_id, grant.get("error"))
+        return JSONResponse(grant, status_code=status)
+
+    cap = min(int(grant["max_size_bytes"]), config.VAULT_UPLOAD_MAX_BYTES)
+    too_large = {"error": _UPLOAD_CHUNK_LIMIT_MESSAGE.format(cap=cap), "upload_id": upload_id}
+    content_type = request.headers.get("content-type", "")
+    if content_type.split(";", 1)[0].strip().lower() == "multipart/form-data":
+        return JSONResponse(
+            {
+                "error": "Send the raw file bytes with the file's Content-Type (curl --data-binary), not multipart",
+                "upload_id": upload_id,
+            },
+            status_code=415,
+        )
+
+    content_length = request.headers.get("content-length")
+    if content_length is not None:
+        try:
+            if int(content_length) > cap:
+                return JSONResponse(too_large, status_code=413)
+        except ValueError:
+            return JSONResponse({"error": "Invalid Content-Length", "upload_id": upload_id}, status_code=400)
+
+    fd, part_name = tempfile.mkstemp(dir=upload_dir(upload_id), suffix=".part")
+    part = Path(part_name)
+    try:
+        digest = hashlib.sha256()
+        received = 0
+        with open(fd, "wb") as out:
+            async for chunk in request.stream():
+                received += len(chunk)
+                if received > cap:
+                    # Stop at the first chunk past the cap; a missing or understated
+                    # Content-Length buys no more than the grant allows.
+                    return JSONResponse(too_large, status_code=413)
+                digest.update(chunk)
+                await anyio.to_thread.run_sync(out.write, chunk)
+
+        result, status = await anyio.to_thread.run_sync(
+            commit_direct_upload, upload_id, part, digest.hexdigest(), content_type, expires, signature
+        )
+    finally:
+        part.unlink(missing_ok=True)
+
+    if "error" in result:
+        logger.warning("Upload rejected: %s (%s)", upload_id, result["error"])
+    else:
+        logger.info("Upload committed: %s -> %s (%s bytes)", upload_id, result["path"], result["size"])
+    return JSONResponse(result, status_code=status)
+
+
+class _RedactUploadSignature(logging.Filter):
+    """Keep signed upload URLs out of the access log.
+
+    A logged URL is a usable credential until it expires or is used, and a request refused
+    for a wrong Content-Type does not burn the grant. uvicorn's access record carries the
+    full path with query string as an argument; for anything under the upload prefix the
+    whole query string goes, rather than a pattern for "signature=". Matching the literal
+    key was bypassable: Starlette decodes query keys, so %73ignature=<sig> was accepted as
+    the signature and logged in full.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        args = record.args
+        if isinstance(args, tuple) and len(args) >= 3 and isinstance(args[2], str):
+            target = args[2]
+            path, sep, _query = target.partition("?")
+            if sep and (path == config.UPLOAD_ROUTE_PREFIX or path.startswith(config.UPLOAD_ROUTE_PREFIX + "/")):
+                record.args = args[:2] + (path + "?REDACTED",) + args[3:]
+        return True
+
+
+def uvicorn_log_config() -> dict:
+    """uvicorn's default logging config plus the signature redaction on the access log."""
+    import copy
+
+    from uvicorn.config import LOGGING_CONFIG
+
+    log_config = copy.deepcopy(LOGGING_CONFIG)
+    log_config.setdefault("filters", {})["redact_upload_signature"] = {"()": _RedactUploadSignature}
+    log_config["handlers"]["access"].setdefault("filters", []).append("redact_upload_signature")
+    return log_config
+
+
 def build_app(extensions=()):
     """Assemble the authenticated Starlette app served to clients.
 
@@ -672,6 +837,13 @@ def build_app(extensions=()):
         return JSONResponse({"status": "ok", "audit": {"enabled": audit_enabled()}})
 
     app.routes.insert(0, Route("/health", health, methods=["GET"]))
+
+    # Signed direct upload, only when the operator set VAULT_UPLOAD_URL_SECRET. Without
+    # it the route does not exist and auth.is_signed_upload_request answers False, so an
+    # upgrade adds no unauthenticated write path. Bearer-exempt for exactly
+    # POST /upload/<id>: the HMAC signature in the URL is the authorization.
+    if config.signed_upload_enabled():
+        app.routes.insert(0, Route(f"{config.UPLOAD_ROUTE_PREFIX}/{{upload_id}}", direct_upload, methods=["POST"]))
 
     # Extension routes (e.g. a localhost search endpoint), added before the auth
     # middleware so they are bearer-protected like the MCP transport.
@@ -731,6 +903,23 @@ def build_app(extensions=()):
                 raise ValueError(
                     f"extension route {getattr(r, 'path', r)!r} covers auth-exempt "
                     f"{m} {p!r}; it would be served without bearer authentication"
+                )
+        # The upload namespace belongs to the upload route. Probes alone cannot reserve
+        # it: a literal Route("/upload/export") matches no probe path, yet the exemption
+        # regex matches its path, so it would be served with neither a token nor a
+        # signature. The declared path is checked directly, and the probes stay for
+        # parameterized and mounted shapes.
+        declared = getattr(r, "path", "") or ""
+        if declared == config.UPLOAD_ROUTE_PREFIX or declared.startswith(config.UPLOAD_ROUTE_PREFIX + "/"):
+            raise ValueError(
+                f"extension route {declared!r} is under the reserved "
+                f"{config.UPLOAD_ROUTE_PREFIX!r} namespace of the signed upload route"
+            )
+        for probe in ("", "/probe-id", "/probe-id/deeper"):
+            if _covers(r, "POST", config.UPLOAD_ROUTE_PREFIX + probe) is not Match.NONE:
+                raise ValueError(
+                    f"extension route {getattr(r, 'path', r)!r} is under the reserved "
+                    f"{config.UPLOAD_ROUTE_PREFIX!r} namespace of the signed upload route"
                 )
     app.add_middleware(BearerAuthMiddleware)
     return app
@@ -844,6 +1033,7 @@ def serve(extensions=()):
         host=VAULT_MCP_HOST,
         port=VAULT_MCP_PORT,
         log_level="info",
+        log_config=uvicorn_log_config(),
         # Honor X-Forwarded-* ONLY from the trusted loopback proxy (Cloudflare
         # Tunnel / Caddy), never from arbitrary clients. Trusting "*" let any
         # caller spoof the advertised OAuth origin via X-Forwarded-Host.

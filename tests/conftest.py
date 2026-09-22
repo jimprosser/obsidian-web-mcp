@@ -6,6 +6,12 @@ from pathlib import Path
 
 import pytest
 
+# Signed uploads are off unless VAULT_UPLOAD_URL_SECRET is set, and the tool is registered
+# at import time, so the in-process suite needs the secret before obsidian_vault_mcp.server
+# is imported. The off-by-default behaviour is covered separately, in a child process
+# started without it (tests/test_signed_upload.py).
+os.environ.setdefault("VAULT_UPLOAD_URL_SECRET", "suite-upload-secret")
+
 
 @pytest.fixture
 def vault_dir(tmp_path, monkeypatch):

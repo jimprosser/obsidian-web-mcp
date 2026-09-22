@@ -47,6 +47,8 @@ This is a server that provides network access to your personal notes. Security i
 
 **Safety limits prevent abuse.** Writes are capped at 1MB per file, batch operations at 20 files per request, and search results at 50 matches. Deletions are soft -- files move to `.trash/` rather than being permanently removed, matching Obsidian's own behavior. The delete tool also requires an explicit `confirm=true` parameter as a safety gate.
 
+**The signed upload route is the one unauthenticated write path, it is off unless configured, and it is narrow.** It exists only when `VAULT_UPLOAD_URL_SECRET` is set. Only `POST /upload/<id>` with exactly one id segment skips the bearer check; the URL's HMAC signature is the authorization. The grant (id, signature, expiry, single use) is validated before a single body byte is read, the body streams to a temp file outside the vault and is cut off at the grant's size cap, and the grant is checked again immediately before the file is placed. `/upload` is reserved: `VAULT_MCP_PATH` cannot be mounted under it, and an extension route whose path is `/upload` or starts with `/upload/` is rejected at startup, literal or parameterized. Committed uploads are audited and fire write events; refused requests are only logged. The signature is redacted from the access log.
+
 **Hardlinked files are refused on read.** Files with more than one hardlink (`st_nlink > 1`) cannot be read or returned by text search, including frontmatter excerpts. Legitimate in-vault hardlinks are not supported.
 
 ## Reporting Security Issues
@@ -60,6 +62,7 @@ Found a vulnerability? Please report it privately rather than opening a public i
 | `vault_read` | Read a file, returning content, metadata, and parsed YAML frontmatter |
 | `vault_batch_read` | Read multiple files in one call; handles missing files gracefully |
 | `vault_write` | Write a file with optional frontmatter merging; creates parent dirs |
+| `vault_request_upload_url` | Get a short-lived, single-use signed URL, then `POST` a file's raw bytes to it. For images and PDFs too large to send base64-encoded through `vault_write_binary`; the bytes never pass through the conversation. See [Signed uploads](#signed-uploads) |
 | `vault_write_binary` | Write an allowed binary file (image/PDF) to the vault from base64 content; enforces a media-type allowlist (declared type/extension, not byte-sniffed) and size cap, writes atomically |
 | `vault_edit` | Patch a file with ordered exact text replacements (token-efficient partial edits); supports dry-run diff previews, and an opt-in `replace_all` per edit for renaming a term across a note |
 | `vault_append` | Append content to the end of a file without resending the existing body; creates the file when missing |
@@ -138,8 +141,26 @@ All configuration is via environment variables:
 | `VAULT_MCP_HEARTBEAT_INTERVAL` | No | `60` | Seconds between heartbeat pings. Must be a positive integer; a bad value fails closed at startup. Only used when `VAULT_MCP_HEARTBEAT_URL` is set. |
 | `VAULT_AUDIT_LOG_PATH` | No | (none) | Append-only JSONL audit log of vault mutations. When set, every mutation appends one record; empty disables auditing. The raw bearer token is never written -- only its SHA-256 hash. Must resolve **outside** the vault and be writable; otherwise the server **fails closed** at startup. See [Audit logging](#audit-logging). |
 | `VAULT_AUDIT_LOG_INCLUDE_READS` | No | `false` | Also record read/search operations (`1`/`true`/`yes`/`on`). Off by default; mutations are always logged once the audit log is enabled. |
+| `VAULT_UPLOAD_MAX_BYTES` | No | `100000000` | Largest file a signed upload URL can accept. Independent of the 10 MB `vault_write_binary` limit, because the body streams to disk instead of travelling base64-encoded through a tool argument. |
+| `VAULT_UPLOAD_URL_SECRET` | No | _(none)_ | **Master switch for signed uploads.** HMAC key for upload URLs. With it unset there is no upload tool, no upload route and no bearer-exempt path; there is no fallback to `VAULT_MCP_TOKEN`. |
+| `VAULT_UPLOAD_URL_TTL_SECONDS` | No | `900` | Default lifetime of an upload URL. |
+| `VAULT_UPLOAD_URL_MAX_TTL_SECONDS` | No | `3600` | Upper bound for a requested lifetime. |
+| `VAULT_UPLOAD_STAGING_DIR` | No | `~/.local/share/vault-mcp/uploads` | Where grants and in-flight bodies live, owner-only (0700). Must resolve outside the vault, or the server refuses to start. |
+
+With signed uploads enabled, the four settings above are validated at startup: a value that is not a positive integer, a maximum lifetime below the default lifetime, or a staging directory inside the vault stops the server with the variable's name.
 
 Generate secrets with: `python -c "import secrets; print(secrets.token_hex(32))"`
+
+## Signed uploads
+
+**Off by default.** The route answers without a bearer token, so it exists only once you set `VAULT_UPLOAD_URL_SECRET`. Upgrading the server does not turn it on.
+
+`vault_write_binary` carries a file base64-encoded inside a tool argument, so the file travels through the model's context. A few megabytes is more than clients carry in practice. For those files:
+
+1. The client calls `vault_request_upload_url(path, media_type, max_size_bytes)` and gets `upload_url`.
+2. It sends the raw bytes: `curl -X POST -H "Content-Type: application/pdf" --data-binary @file.pdf "<upload_url>"`.
+
+The URL is valid once, for the declared path, media type and size, until it expires. Multipart form uploads are refused; send the raw body. Set `VAULT_MCP_PUBLIC_URL` so the returned URL points at your public hostname. The signed URL is a credential while it lives: the access log shows the path with its query string redacted, and the server never logs the signature.
 
 ## Audit logging
 
