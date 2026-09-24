@@ -11,6 +11,7 @@ register_audit_operation, which must leave no record.
 """
 
 import asyncio
+import gc
 import json
 
 import pytest
@@ -201,3 +202,45 @@ def test_built_in_tools_still_go_through_the_same_wrapper(vault_dir, audit_log):
 
     records = [r for r in audit_log() if r["operation"] == "vault_write"]
     assert len(records) == 1 and records[0]["target_path"] == "eingebaut.md", audit_log()
+
+
+# --- func must be synchronous ---------------------------------------------------------
+
+async def _async_work_that_writes_and_raises(vault_dir):
+    (vault_dir / "n.md").write_text("changed\n", encoding="utf-8")
+    raise RuntimeError("failed after the write")
+
+
+@pytest.mark.filterwarnings("error::RuntimeWarning")
+def test_an_async_func_is_refused_not_logged_as_success(vault_dir, audit_log):
+    """The reproduction from review: before the fix this logged operation_status "success"
+    for a call that raised, because the record was written before the coroutine ran."""
+    async def tool():
+        return await run_audited("ext_audit_write", lambda: _async_work_that_writes_and_raises(vault_dir), path="n.md")
+
+    with pytest.raises(TypeError, match="must be synchronous"):
+        asyncio.run(tool())
+    gc.collect()  # a coroutine left unclosed would warn here, and the filter turns that into a failure
+
+    assert not (vault_dir / "n.md").exists(), "the refused coroutine still ran"
+    assert not [r for r in audit_log() if r["operation_status"] == "success"], audit_log()
+
+
+@pytest.mark.parametrize("operation,context,audit_on", [
+    ("ext_audit_write", {"path": "n.md"}, False),                              # passthrough: auditing off
+    ("ext_audit_unregistered", {"path": "n.md"}, True),                        # passthrough: not declared
+    ("vault_batch_frontmatter_update", {"paths": ["n.md"]}, True),             # the per-file batch path
+])
+@pytest.mark.filterwarnings("error::RuntimeWarning")
+def test_an_async_func_is_refused_on_every_path(vault_dir, audit_log, monkeypatch, operation, context, audit_on):
+    """Refused with the log off too, so the mistake shows in development and not first in
+    a deployment that switches auditing on."""
+    if not audit_on:
+        monkeypatch.setattr(config, "VAULT_AUDIT_LOG_PATH", "")
+
+    with pytest.raises(TypeError, match="must be synchronous"):
+        run_audited(operation, lambda: _async_work_that_writes_and_raises(vault_dir), **context)
+    gc.collect()
+
+    assert not (vault_dir / "n.md").exists()
+    assert not [r for r in audit_log() if r["operation_status"] == "success"], audit_log()

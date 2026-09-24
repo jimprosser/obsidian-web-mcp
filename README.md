@@ -417,7 +417,9 @@ Two things worth knowing:
   `audit.register_audit_operation("my_tool", kind="mutation")` (or `kind="read"`), then
   returning `run_audited("my_tool", work, path=path)`. Without the declaration the wrapper is a
   passthrough, because the log only covers operation names it knows. A built-in name cannot
-  be re-registered, and registering a name twice with a different kind raises.
+  be re-registered, and registering a name twice with a different kind raises. `func` must
+  be synchronous: the record is written when it returns, so a coroutine is refused with
+  `TypeError` rather than logged before its work has run.
 
 ## VPS Setup With Cloudflare Origin TLS + Caddy Reverse Proxy
 

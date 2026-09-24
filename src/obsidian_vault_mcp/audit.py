@@ -15,6 +15,7 @@ must not be able to break a write.
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
 import logging
 import os
@@ -302,6 +303,25 @@ def _parse_tool_result(result: str) -> dict:
     return payload if isinstance(payload, dict) else {}
 
 
+def _call_synchronously(operation: str, func):
+    """Call ``func`` and refuse an awaitable result.
+
+    The record is written after ``func()`` returns. A coroutine function returns before its
+    body has run, so auditing it would log the outcome of work that has not happened yet
+    (a call that later raises would read "success"). The coroutine is closed unstarted, so
+    nothing of it runs and no "never awaited" warning follows.
+    """
+    result = func()
+    if inspect.isawaitable(result):
+        if inspect.iscoroutine(result):
+            result.close()
+        raise TypeError(
+            f"run_audited({operation!r}, func): func returned an awaitable. func must be "
+            "synchronous; for an async tool, await the work first and audit a synchronous step."
+        )
+    return result
+
+
 def run_audited(operation: str, func, **context) -> str:
     """Run a tool and emit audit records when auditing covers this operation.
 
@@ -322,9 +342,13 @@ def run_audited(operation: str, func, **context) -> str:
     it is read. Batch mutations emit one record per file (see _run_audited_batch). An
     audit-write failure is swallowed inside write_audit_record so the trail can never break
     the tool result.
+
+    ``func`` must be synchronous. An awaitable result raises TypeError on every path,
+    including with auditing off, so the mistake shows in development and not first in a
+    deployment that turns the log on.
     """
     if not should_audit_operation(operation):
-        return func()
+        return _call_synchronously(operation, func)
 
     if operation in BATCH_OPERATIONS:
         return _run_audited_batch(operation, func, context)
@@ -333,7 +357,7 @@ def run_audited(operation: str, func, **context) -> str:
     before = snapshot_path(before_target_path(operation, context)) if is_mutation else None
 
     try:
-        result = func()
+        result = _call_synchronously(operation, func)
     except Exception:
         write_audit_record(build_audit_record(
             operation=operation,
@@ -374,7 +398,7 @@ def _run_audited_batch(operation: str, func, context: dict) -> str:
     before_map = {p: snapshot_path(p) for p in paths}
 
     try:
-        result = func()
+        result = _call_synchronously(operation, func)
     except Exception:
         for p in paths:
             write_audit_record(build_audit_record(
