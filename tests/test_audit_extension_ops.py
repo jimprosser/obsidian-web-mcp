@@ -164,14 +164,35 @@ def test_registering_the_same_kind_twice_is_a_no_op():
         ("ext_audit_write", "read", "already registered"),
         ("vault_write", "read", "built-in"),
         ("vault_read", "read", "built-in"),
-        ("", "mutation", "non-empty"),
-        ("   ", "mutation", "non-empty"),
         ("ext_other", "write", "kind"),
+        # Found by probing the first revision, which accepted all of these:
+        # a padded name silently misses the name the tool later passes,
+        ("", "mutation", "characters"),
+        ("   ", "mutation", "characters"),
+        (" ext_padded ", "mutation", "characters"),
+        # control characters and unbounded length clutter every record,
+        ("line\nbreak", "mutation", "characters"),
+        ("tab\tname", "mutation", "characters"),
+        ("x" * 129, "mutation", "characters"),
+        ("ünicode_tool", "mutation", "characters"),
+        # and another spelling of a built-in reads as that built-in in the log.
+        ("VAULT_WRITE", "mutation", "would read as"),
+        ("vault-write", "mutation", "would read as"),
+        ("Vault.Read", "read", "would read as"),
     ],
 )
 def test_a_bad_registration_is_refused(name, kind, message):
     with pytest.raises(ValueError, match=message):
         register_audit_operation(name, kind=kind)
+
+
+@pytest.mark.parametrize("name", ["ext_fts_search", "fts-search", "ns.tool", "a", "x" * 128])
+def test_names_in_the_mcp_tool_name_alphabet_are_accepted(name):
+    try:
+        register_audit_operation(name, kind="read")
+        assert audit.operation_kind(name) == "read"
+    finally:
+        audit._registered_operations.pop(name, None)
 
 
 def test_built_in_tools_still_go_through_the_same_wrapper(vault_dir, audit_log):

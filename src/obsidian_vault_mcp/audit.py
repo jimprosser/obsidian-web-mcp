@@ -18,6 +18,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -75,6 +76,14 @@ def read_audit_enabled() -> bool:
 # treatment (issue #91). Registered before serving, read during request handling.
 _registered_operations: dict[str, str] = {}
 _OPERATION_KINDS = ("read", "mutation")
+# The character set and length MCP allows for tool names. An operation name is written into
+# every record, so whitespace, control characters or an unbounded length would either make
+# the declaration silently miss the name the tool later passes, or clutter the log.
+_OPERATION_NAME = re.compile(r"[A-Za-z0-9_.-]{1,128}")
+
+
+def _lookalike_key(name: str) -> str:
+    return name.casefold().replace("-", "_").replace(".", "_")
 
 
 def register_audit_operation(operation: str, kind: str = "mutation") -> None:
@@ -87,13 +96,27 @@ def register_audit_operation(operation: str, kind: str = "mutation") -> None:
 
     Registering the same name twice with the same kind is a no-op, so an extension that
     is loaded twice does not fail; a different kind is a conflict and raises.
+
+    The name must use the characters MCP allows in tool names (letters, digits, ``_``,
+    ``-``, ``.``, at most 128), and must not be a built-in name in another spelling
+    (``VAULT_WRITE``, ``vault-write``): in the log it would read as the built-in tool.
     """
-    if not isinstance(operation, str) or not operation.strip():
-        raise ValueError("operation must be a non-empty string")
+    if not isinstance(operation, str) or not _OPERATION_NAME.fullmatch(operation):
+        raise ValueError(
+            "operation must be 1-128 characters of letters, digits, '_', '-' or '.', "
+            f"got {operation!r}"
+        )
     if kind not in _OPERATION_KINDS:
         raise ValueError(f"kind must be one of {_OPERATION_KINDS}, got {kind!r}")
-    if operation in MUTATION_OPERATIONS or operation in READ_OPERATIONS:
+    built_ins = MUTATION_OPERATIONS | READ_OPERATIONS
+    if operation in built_ins:
         raise ValueError(f"{operation!r} is a built-in operation and cannot be re-registered")
+    key = _lookalike_key(operation)
+    for built_in in built_ins:
+        if _lookalike_key(built_in) == key:
+            raise ValueError(
+                f"{operation!r} would read as the built-in operation {built_in!r} in the log"
+            )
     existing = _registered_operations.get(operation)
     if existing is not None and existing != kind:
         raise ValueError(f"{operation!r} is already registered as {existing!r}, not {kind!r}")
