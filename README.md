@@ -411,6 +411,17 @@ Two things worth knowing:
   read in order to write back and would otherwise replace the binary with its extracted text.
   With nothing registered, reads are byte-identical to stock.
 
+#### Community extensions
+
+Extensions built on the seam by other people. They are not maintained or reviewed here;
+they run in-process with the server's full privileges, so read the code before you load one.
+"Tested against" is the lowest server version the extension's own suite was run against.
+
+| Extension | What it adds | Tested against |
+|---|---|---|
+| [obsidian-web-mcp-fts](https://github.com/sebastian-stadelmann/obsidian-web-mcp-fts) | `vault_fts_search`: ranked full-text search on SQLite FTS5 (BM25, stemming, further languages additive). Read-only, no routes; the index file must live outside the vault. | v0.3.0 |
+| [obsidian-vault-mcp-ext](https://github.com/mleitnercom/obsidian-vault-mcp-ext) | Template rendering (`{{var}}`, not full Templater), hybrid semantic search (FAISS + BM25, optional `[semantic]` extra), recurring-task materialisation, URL and file import (SSRF-hardened, off by default), markdown encoding repair and directory soft-delete, OCR for screenshots and scanned PDFs through the content-extractor seam. | v0.3.0 |
+
 ## VPS Setup With Cloudflare Origin TLS + Caddy Reverse Proxy
 
 This is an alternative to the Cloudflare Tunnel flow above. In this setup, the MCP server runs on a VPS, Cloudflare proxies a public hostname such as `your-mcp-server.dev`, Caddy terminates TLS with a Cloudflare Origin Certificate, and Caddy reverse-proxies requests to the local MCP server on `VAULT_MCP_PORT`. No Cloudflare Tunnel is required.
