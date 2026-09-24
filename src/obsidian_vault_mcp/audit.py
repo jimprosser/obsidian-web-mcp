@@ -15,6 +15,7 @@ must not be able to break a write.
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import os
 import uuid
@@ -69,6 +70,45 @@ def read_audit_enabled() -> bool:
     return audit_enabled() and bool(config.VAULT_AUDIT_LOG_INCLUDE_READS)
 
 
+# Operations an extension registered, name -> "read" | "mutation". The built-in sets
+# above stay closed; this is how a tool the host does not know about gets the same
+# treatment (issue #91). Registered before serving, read during request handling.
+_registered_operations: dict[str, str] = {}
+_OPERATION_KINDS = ("read", "mutation")
+
+
+def register_audit_operation(operation: str, kind: str = "mutation") -> None:
+    """Declare an extension tool's operation name to the audit log.
+
+    Without this, should_audit_operation answers False for any name the host does not
+    know, so an extension tool is invisible in the log however the operator configures
+    it. ``kind="mutation"`` records every call; ``kind="read"`` records only when
+    VAULT_AUDIT_LOG_INCLUDE_READS is on, like the built-in read tools.
+
+    Registering the same name twice with the same kind is a no-op, so an extension that
+    is loaded twice does not fail; a different kind is a conflict and raises.
+    """
+    if not isinstance(operation, str) or not operation.strip():
+        raise ValueError("operation must be a non-empty string")
+    if kind not in _OPERATION_KINDS:
+        raise ValueError(f"kind must be one of {_OPERATION_KINDS}, got {kind!r}")
+    if operation in MUTATION_OPERATIONS or operation in READ_OPERATIONS:
+        raise ValueError(f"{operation!r} is a built-in operation and cannot be re-registered")
+    existing = _registered_operations.get(operation)
+    if existing is not None and existing != kind:
+        raise ValueError(f"{operation!r} is already registered as {existing!r}, not {kind!r}")
+    _registered_operations[operation] = kind
+
+
+def operation_kind(operation: str) -> str | None:
+    """"read", "mutation", or None for an operation the audit log does not cover."""
+    if operation in MUTATION_OPERATIONS:
+        return "mutation"
+    if operation in READ_OPERATIONS:
+        return "read"
+    return _registered_operations.get(operation)
+
+
 def should_audit_operation(operation: str) -> bool:
     """True when this operation should emit a record under the current config.
 
@@ -77,9 +117,10 @@ def should_audit_operation(operation: str) -> bool:
     """
     if not audit_enabled():
         return False
-    return operation in MUTATION_OPERATIONS or (
-        operation in READ_OPERATIONS and read_audit_enabled()
-    )
+    kind = operation_kind(operation)
+    if kind == "mutation":
+        return True
+    return kind == "read" and read_audit_enabled()
 
 
 def audit_log_path() -> Path:
@@ -227,3 +268,119 @@ def write_audit_record(record: dict[str, Any]) -> bool:
     except Exception as exc:
         logger.error("Audit log write failed: %s", exc)
         return False
+
+
+def _parse_tool_result(result: str) -> dict:
+    """Parse a tool's JSON result into a dict, or {} when it is not a JSON object."""
+    try:
+        payload = json.loads(result)
+    except (ValueError, TypeError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def run_audited(operation: str, func, **context) -> str:
+    """Run a tool and emit audit records when auditing covers this operation.
+
+    Public so an extension tool can be audited the same way a built-in one is, after
+    declaring its name with register_audit_operation (issue #91)::
+
+        register_audit_operation("vault_fts_search", kind="read")
+
+        def vault_fts_search(query: str) -> str:
+            return run_audited("vault_fts_search", lambda: _search(query), path=None)
+
+    ``context`` carries the call's arguments; ``path`` (or ``source``) is what gets
+    snapshotted for a mutation, and the result's ``path`` wins when the tool reports one.
+
+    A straight passthrough when auditing is off (no log path) or the operation is a read
+    and read-audit is disabled, so there is no cost on the default path. For mutations the
+    target is snapshotted (size + checksum) before and after; reads capture the target as
+    it is read. Batch mutations emit one record per file (see _run_audited_batch). An
+    audit-write failure is swallowed inside write_audit_record so the trail can never break
+    the tool result.
+    """
+    if not should_audit_operation(operation):
+        return func()
+
+    if operation in BATCH_OPERATIONS:
+        return _run_audited_batch(operation, func, context)
+
+    is_mutation = operation_kind(operation) == "mutation"
+    before = snapshot_path(before_target_path(operation, context)) if is_mutation else None
+
+    try:
+        result = func()
+    except Exception:
+        write_audit_record(build_audit_record(
+            operation=operation,
+            target_path=infer_target_path(operation, context),
+            before=before,
+            operation_status="error",
+            error="tool exception",
+        ))
+        raise
+
+    parsed = _parse_tool_result(result)
+    target_path = infer_target_path(operation, context, parsed)
+    status = "error" if "error" in parsed else "success"
+    error = parsed.get("error") if status == "error" else None
+    if is_mutation:
+        record = build_audit_record(
+            operation=operation, target_path=target_path, before=before,
+            after=snapshot_path(target_path), operation_status=status, error=error,
+        )
+    else:
+        record = build_audit_record(
+            operation=operation, target_path=target_path,
+            before=snapshot_path(target_path), operation_status=status, error=error,
+        )
+    write_audit_record(record)
+    return result
+
+
+def _run_audited_batch(operation: str, func, context: dict) -> str:
+    """Audit a batch mutation as one record per file with correct per-file status.
+
+    The batch tools report per-file outcomes inside ``results`` (some files can fail while
+    the call as a whole "succeeds"), so a single top-level record would both hide partial
+    failures and lose per-file snapshots. Each file gets its own before/after snapshot and
+    its own operation_status.
+    """
+    paths = [p for p in (context.get("paths") or []) if isinstance(p, str) and p]
+    before_map = {p: snapshot_path(p) for p in paths}
+
+    try:
+        result = func()
+    except Exception:
+        for p in paths:
+            write_audit_record(build_audit_record(
+                operation=operation, target_path=p, before=before_map.get(p),
+                operation_status="error", error="tool exception",
+            ))
+        raise
+
+    parsed = _parse_tool_result(result)
+    items = parsed.get("results")
+    if not isinstance(items, list) or not items:
+        # A tool-level failure (e.g. validation) before any per-file work ran.
+        write_audit_record(build_audit_record(
+            operation=operation, target_path=paths or None,
+            operation_status="error" if "error" in parsed else "success",
+            error=parsed.get("error"),
+        ))
+        return result
+
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        path = item.get("path")
+        item_error = item.get("error")
+        item_status = "error" if item_error else "success"
+        before = before_map.get(path) if isinstance(path, str) else None
+        after = snapshot_path(path) if (item_status == "success" and isinstance(path, str)) else None
+        write_audit_record(build_audit_record(
+            operation=operation, target_path=path, before=before, after=after,
+            operation_status=item_status, error=item_error,
+        ))
+    return result

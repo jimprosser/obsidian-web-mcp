@@ -410,6 +410,14 @@ Two things worth knowing:
   `vault_append`, `vault_batch_frontmatter_update` and `vault_write(merge_frontmatter=True)`
   read in order to write back and would otherwise replace the binary with its extracted text.
   With nothing registered, reads are byte-identical to stock.
+- **Extension tools join the audit log.** The built-in tools run through
+  `audit.run_audited(operation, func, **context)`, which records a mutation with before/after
+  size and checksum, and a read only when `VAULT_AUDIT_LOG_INCLUDE_READS` is on. An extension
+  tool gets the same treatment by declaring its name once, from `register_tools`:
+  `audit.register_audit_operation("my_tool", kind="mutation")` (or `kind="read"`), then
+  returning `run_audited("my_tool", work, path=path)`. Without the declaration the wrapper is a
+  passthrough, because the log only covers operation names it knows. A built-in name cannot
+  be re-registered, and registering a name twice with a different kind raises.
 
 ## VPS Setup With Cloudflare Origin TLS + Caddy Reverse Proxy
 
