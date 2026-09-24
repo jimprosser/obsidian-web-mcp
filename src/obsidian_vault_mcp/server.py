@@ -32,15 +32,12 @@ from .config import (
 from . import config
 from .frontmatter_index import FrontmatterIndex
 from .audit import (
-    BATCH_OPERATIONS,
-    MUTATION_OPERATIONS,
+    run_audited,
     audit_enabled,
     audit_log_path,
     audit_path_inside_vault,
     audit_path_writable,
-    before_target_path,
     build_audit_record,
-    infer_target_path,
     should_audit_operation,
     snapshot_path,
     write_audit_record,
@@ -193,111 +190,6 @@ from .models import (
 )
 
 
-def _parse_tool_result(result: str) -> dict:
-    """Parse a tool's JSON result into a dict, or {} when it is not a JSON object."""
-    try:
-        payload = json.loads(result)
-    except (ValueError, TypeError):
-        return {}
-    return payload if isinstance(payload, dict) else {}
-
-
-def _run_audited(operation: str, func, **context) -> str:
-    """Run a tool and emit audit records when auditing covers this operation.
-
-    A straight passthrough when auditing is off (no log path) or the operation is a read
-    and read-audit is disabled, so there is no cost on the default path. For mutations the
-    target is snapshotted (size + checksum) before and after; reads capture the target as
-    it is read. Batch mutations emit one record per file (see _run_audited_batch). An
-    audit-write failure is swallowed inside write_audit_record so the trail can never break
-    the tool result.
-    """
-    if not should_audit_operation(operation):
-        return func()
-
-    if operation in BATCH_OPERATIONS:
-        return _run_audited_batch(operation, func, context)
-
-    is_mutation = operation in MUTATION_OPERATIONS
-    before = snapshot_path(before_target_path(operation, context)) if is_mutation else None
-
-    try:
-        result = func()
-    except Exception:
-        write_audit_record(build_audit_record(
-            operation=operation,
-            target_path=infer_target_path(operation, context),
-            before=before,
-            operation_status="error",
-            error="tool exception",
-        ))
-        raise
-
-    parsed = _parse_tool_result(result)
-    target_path = infer_target_path(operation, context, parsed)
-    status = "error" if "error" in parsed else "success"
-    error = parsed.get("error") if status == "error" else None
-    if is_mutation:
-        record = build_audit_record(
-            operation=operation, target_path=target_path, before=before,
-            after=snapshot_path(target_path), operation_status=status, error=error,
-        )
-    else:
-        record = build_audit_record(
-            operation=operation, target_path=target_path,
-            before=snapshot_path(target_path), operation_status=status, error=error,
-        )
-    write_audit_record(record)
-    return result
-
-
-def _run_audited_batch(operation: str, func, context: dict) -> str:
-    """Audit a batch mutation as one record per file with correct per-file status.
-
-    The batch tools report per-file outcomes inside ``results`` (some files can fail while
-    the call as a whole "succeeds"), so a single top-level record would both hide partial
-    failures and lose per-file snapshots. Each file gets its own before/after snapshot and
-    its own operation_status.
-    """
-    paths = [p for p in (context.get("paths") or []) if isinstance(p, str) and p]
-    before_map = {p: snapshot_path(p) for p in paths}
-
-    try:
-        result = func()
-    except Exception:
-        for p in paths:
-            write_audit_record(build_audit_record(
-                operation=operation, target_path=p, before=before_map.get(p),
-                operation_status="error", error="tool exception",
-            ))
-        raise
-
-    parsed = _parse_tool_result(result)
-    items = parsed.get("results")
-    if not isinstance(items, list) or not items:
-        # A tool-level failure (e.g. validation) before any per-file work ran.
-        write_audit_record(build_audit_record(
-            operation=operation, target_path=paths or None,
-            operation_status="error" if "error" in parsed else "success",
-            error=parsed.get("error"),
-        ))
-        return result
-
-    for item in items:
-        if not isinstance(item, dict):
-            continue
-        path = item.get("path")
-        item_error = item.get("error")
-        item_status = "error" if item_error else "success"
-        before = before_map.get(path) if isinstance(path, str) else None
-        after = snapshot_path(path) if (item_status == "success" and isinstance(path, str)) else None
-        write_audit_record(build_audit_record(
-            operation=operation, target_path=path, before=before, after=after,
-            operation_status=item_status, error=item_error,
-        ))
-    return result
-
-
 @mcp.tool(
     name="vault_read",
     description="Read a file from the Obsidian vault, returning content, metadata, and parsed YAML frontmatter.",
@@ -306,7 +198,7 @@ def _run_audited_batch(operation: str, func, context: dict) -> str:
 def vault_read(path: str) -> str:
     """Read a file from the vault."""
     inp = VaultReadInput(path=path)
-    return _run_audited("vault_read", lambda: _vault_read(inp.path), path=inp.path)
+    return run_audited("vault_read", lambda: _vault_read(inp.path), path=inp.path)
 
 
 @mcp.tool(
@@ -317,7 +209,7 @@ def vault_read(path: str) -> str:
 def vault_batch_read(paths: list[str], include_content: bool = True) -> str:
     """Read multiple files at once."""
     inp = VaultBatchReadInput(paths=paths, include_content=include_content)
-    return _run_audited("vault_batch_read", lambda: _vault_batch_read(inp.paths, inp.include_content))
+    return run_audited("vault_batch_read", lambda: _vault_batch_read(inp.paths, inp.include_content))
 
 
 @mcp.tool(
@@ -328,7 +220,7 @@ def vault_batch_read(paths: list[str], include_content: bool = True) -> str:
 def vault_write(path: str, content: str, create_dirs: bool = True, merge_frontmatter: bool = False) -> str:
     """Write a file to the vault."""
     inp = VaultWriteInput(path=path, content=content, create_dirs=create_dirs, merge_frontmatter=merge_frontmatter)
-    return _run_audited(
+    return run_audited(
         "vault_write",
         lambda: _vault_write(inp.path, inp.content, inp.create_dirs, inp.merge_frontmatter),
         path=inp.path,
@@ -343,7 +235,7 @@ def vault_write(path: str, content: str, create_dirs: bool = True, merge_frontma
 def vault_write_binary(path: str, data: str, media_type: str, overwrite: bool = False, create_dirs: bool = True) -> str:
     """Write a base64-encoded binary file to the vault."""
     inp = VaultWriteBinaryInput(path=path, data=data, media_type=media_type, overwrite=overwrite, create_dirs=create_dirs)
-    return _run_audited(
+    return run_audited(
         "vault_write_binary",
         lambda: _vault_write_binary(inp.path, inp.data, inp.media_type, inp.overwrite, inp.create_dirs),
         path=inp.path,
@@ -412,7 +304,7 @@ def vault_edit(path: str, edits: list[VaultEditOperationInput], dry_run: bool = 
     if inp.dry_run:
         # A dry run writes nothing; don't record it as a mutation.
         return _vault_edit(inp.path, [edit.model_dump() for edit in inp.edits], inp.dry_run)
-    return _run_audited(
+    return run_audited(
         "vault_edit",
         lambda: _vault_edit(inp.path, [edit.model_dump() for edit in inp.edits], inp.dry_run),
         path=inp.path,
@@ -430,7 +322,7 @@ def vault_edit(path: str, edits: list[VaultEditOperationInput], dry_run: bool = 
 def vault_append(path: str, content: str, separator: str = "\n\n", create_dirs: bool = True) -> str:
     """Append content to a file."""
     inp = VaultAppendInput(path=path, content=content, separator=separator, create_dirs=create_dirs)
-    return _run_audited(
+    return run_audited(
         "vault_append",
         lambda: _vault_append(inp.path, inp.content, inp.separator, inp.create_dirs),
         path=inp.path,
@@ -445,7 +337,7 @@ def vault_append(path: str, content: str, separator: str = "\n\n", create_dirs: 
 def vault_batch_frontmatter_update(updates: list[dict]) -> str:
     """Batch update frontmatter fields."""
     inp = VaultBatchFrontmatterUpdateInput(updates=updates)
-    return _run_audited(
+    return run_audited(
         "vault_batch_frontmatter_update",
         lambda: _vault_batch_frontmatter_update(inp.updates),
         paths=[u.get("path") for u in inp.updates if isinstance(u, dict) and u.get("path")],
@@ -466,7 +358,7 @@ def vault_search(
 ) -> str:
     """Search vault file contents."""
     inp = VaultSearchInput(query=query, path_prefix=path_prefix, file_pattern=file_pattern, max_results=max_results, context_lines=context_lines)
-    return _run_audited(
+    return run_audited(
         "vault_search",
         lambda: _vault_search(inp.query, inp.path_prefix, inp.file_pattern, inp.max_results, inp.context_lines),
     )
@@ -486,7 +378,7 @@ def vault_search_frontmatter(
 ) -> str:
     """Search by frontmatter fields."""
     inp = VaultSearchFrontmatterInput(field=field, value=value, match_type=match_type, path_prefix=path_prefix, max_results=max_results)
-    return _run_audited(
+    return run_audited(
         "vault_search_frontmatter",
         lambda: _vault_search_frontmatter(inp.field, inp.value, inp.match_type, inp.path_prefix, inp.max_results),
     )
@@ -506,7 +398,7 @@ def vault_list(
 ) -> str:
     """List vault directory contents."""
     inp = VaultListInput(path=path, depth=depth, include_files=include_files, include_dirs=include_dirs, pattern=pattern)
-    return _run_audited(
+    return run_audited(
         "vault_list",
         lambda: _vault_list(inp.path, inp.depth, inp.include_files, inp.include_dirs, inp.pattern),
         path=inp.path,
@@ -521,7 +413,7 @@ def vault_list(
 def vault_move(source: str, destination: str, create_dirs: bool = True) -> str:
     """Move a file or directory."""
     inp = VaultMoveInput(source=source, destination=destination, create_dirs=create_dirs)
-    return _run_audited(
+    return run_audited(
         "vault_move",
         lambda: _vault_move(inp.source, inp.destination, inp.create_dirs),
         source=inp.source,
@@ -537,7 +429,7 @@ def vault_move(source: str, destination: str, create_dirs: bool = True) -> str:
 def vault_delete(path: str, confirm: bool = False) -> str:
     """Delete a file (move to .trash/)."""
     inp = VaultDeleteInput(path=path, confirm=confirm)
-    return _run_audited(
+    return run_audited(
         "vault_delete",
         lambda: _vault_delete(inp.path, inp.confirm),
         path=inp.path,
@@ -552,7 +444,7 @@ def vault_delete(path: str, confirm: bool = False) -> str:
 def vault_canvas_read(path: str) -> str:
     """Read an Obsidian Canvas file."""
     inp = VaultCanvasReadInput(path=path)
-    return _run_audited("vault_canvas_read", lambda: _vault_canvas_read(inp.path), path=inp.path)
+    return run_audited("vault_canvas_read", lambda: _vault_canvas_read(inp.path), path=inp.path)
 
 
 @mcp.tool(
@@ -566,7 +458,7 @@ def vault_canvas_read(path: str) -> str:
 def vault_canvas_add_node(path: str, node: dict) -> str:
     """Append a node to a Canvas file."""
     inp = VaultCanvasAddNodeInput(path=path, node=node)
-    return _run_audited(
+    return run_audited(
         "vault_canvas_add_node",
         lambda: _vault_canvas_add_node(inp.path, inp.node.model_dump(exclude_none=True, mode="json")),
         path=inp.path,
@@ -585,7 +477,7 @@ def vault_canvas_add_node(path: str, node: dict) -> str:
 def vault_canvas_add_edge(path: str, edge: dict) -> str:
     """Append an edge to a Canvas file."""
     inp = VaultCanvasAddEdgeInput(path=path, edge=edge)
-    return _run_audited(
+    return run_audited(
         "vault_canvas_add_edge",
         lambda: _vault_canvas_add_edge(inp.path, inp.edge.model_dump(exclude_none=True, mode="json")),
         path=inp.path,
@@ -609,7 +501,7 @@ def vault_daily_note_path() -> str:
 )
 def vault_daily_note_read() -> str:
     """Read today's daily note."""
-    return _run_audited("vault_daily_note_read", _vault_daily_note_read)
+    return run_audited("vault_daily_note_read", _vault_daily_note_read)
 
 
 @mcp.tool(
@@ -620,7 +512,7 @@ def vault_daily_note_read() -> str:
 def vault_daily_note_append(content: str) -> str:
     """Append to today's daily note."""
     inp = VaultDailyNoteAppendInput(content=content)
-    return _run_audited(
+    return run_audited(
         "vault_daily_note_append",
         lambda: _vault_daily_note_append(inp.content),
         path=_daily_note_path(_today()),
