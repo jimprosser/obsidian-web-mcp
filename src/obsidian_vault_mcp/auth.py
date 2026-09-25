@@ -1,5 +1,6 @@
 """Bearer token authentication middleware for the vault MCP server."""
 
+import hashlib
 import hmac
 import re
 import uuid
@@ -64,6 +65,35 @@ def _www_authenticate(request: Request, error: str) -> str:
     return f'Bearer realm="mcp", resource_metadata="{resource_metadata}", error="{error}"'
 
 
+def _master_matches(token: str) -> bool:
+    """Compare fixed-length digests so token length does not affect comparison."""
+    if not VAULT_MCP_TOKEN:
+        return False
+    candidate = hashlib.sha256(token.encode("utf-8")).digest()
+    configured = hashlib.sha256(VAULT_MCP_TOKEN.encode("utf-8")).digest()
+    return hmac.compare_digest(candidate, configured)
+
+
+def _authenticate_bearer(request: Request, token: str) -> str | None:
+    """Return the OAuth client id for a valid per-client token, None for master.
+
+    Returns None for the master bearer and raises ValueError for anything that is
+    neither the master bearer nor a valid, unrevoked, unexpired per-client token
+    bound to this server's resource identifier.
+    """
+    if _master_matches(token):
+        return None
+    if not token.startswith("v1."):
+        raise ValueError("invalid token")
+
+    from .oauth import canonical_resource, get_oauth_state
+
+    metadata = get_oauth_state().lookup_access_token(token)
+    if metadata is None or metadata.resource != canonical_resource(request):
+        raise ValueError("invalid token")
+    return metadata.client_id
+
+
 class BearerAuthMiddleware(BaseHTTPMiddleware):
     """Validates Bearer tokens on all requests except OAuth and health endpoints."""
 
@@ -89,7 +119,7 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
             )
 
         auth_header = request.headers.get("Authorization", "")
-        if not auth_header.startswith("Bearer "):
+        if not auth_header.startswith("Bearer ") or not auth_header[7:]:
             return JSONResponse(
                 {"error": "Missing or malformed Authorization header"},
                 status_code=401,
@@ -97,20 +127,24 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
             )
 
         token = auth_header[7:]
-        # Constant-time compare: avoid leaking the token via response timing (#2).
-        if not hmac.compare_digest(token, VAULT_MCP_TOKEN):
+        try:
+            # None means the master bearer; a string is the per-client OAuth id.
+            oauth_client_id = _authenticate_bearer(request, token)
+        except ValueError:
+            # Constant-time paths inside; a distinct message would leak which
+            # credential class failed and help an attacker enumerate tokens (#2).
             return JSONResponse(
                 {"error": "Invalid token"},
                 status_code=401,
                 headers={"WWW-Authenticate": _www_authenticate(request, "invalid_token")},
             )
 
-        # Thread the authenticated principal (plus a request id and best-effort client
-        # hint) to the tool layer for the audit log. The raw token never leaves this
-        # context; audit.build_audit_record stores only its SHA-256 hash. client_id is a
-        # User-Agent-derived hint -- it becomes a true per-client id if the static bearer
-        # token is ever replaced with per-client tokens.
-        client = request.headers.get("user-agent", "").strip()[:200] or None
+        # Thread the authenticated principal (plus a request id and client hint) to the
+        # tool layer for the audit log. The raw token never leaves this context;
+        # audit.build_audit_record stores only its SHA-256 hash. Per-client OAuth
+        # tokens carry the real client_id; the master bearer keeps the legacy
+        # User-Agent-derived hint.
+        client = oauth_client_id or request.headers.get("user-agent", "").strip()[:200] or None
         ctx_token = set_request_context(principal=token, request_id=uuid.uuid4().hex, client=client)
         try:
             return await call_next(request)

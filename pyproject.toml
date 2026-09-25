@@ -20,6 +20,7 @@ dev = [
 
 [project.scripts]
 vault-mcp = "obsidian_vault_mcp.server:main"
+vault-mcp-oauth = "obsidian_vault_mcp.oauth_admin:_entrypoint"
 
 [build-system]
 requires = ["hatchling"]
