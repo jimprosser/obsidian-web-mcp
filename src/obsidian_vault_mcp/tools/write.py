@@ -19,10 +19,30 @@ from ..write_events import fire_write
 logger = logging.getLogger(__name__)
 
 
-def vault_write(path: str, content: str, create_dirs: bool = True, merge_frontmatter: bool = False) -> str:
-    """Write a file to the vault, optionally merging frontmatter with existing content."""
+def vault_write(
+    path: str,
+    content: str,
+    create_dirs: bool = True,
+    merge_frontmatter: bool = False,
+    overwrite: bool = True,
+) -> str:
+    """Write a file to the vault, optionally merging frontmatter with existing content.
+
+    overwrite=False makes it create-only: an existing file is left untouched and the
+    call reports it, also when two calls race for the same name, so a client that
+    lost a response can retry without replacing anything.
+    """
     try:
         resolve_vault_path(path)
+
+        if not overwrite and merge_frontmatter:
+            # Merging needs an existing file; create-only forbids one. Refuse the
+            # contradiction instead of silently ignoring one of the two.
+            return dumps({
+                "error": "merge_frontmatter needs an existing file and overwrite=false forbids one; use one or the other",
+                "path": path,
+                "created": False,
+            })
 
         if merge_frontmatter:
             try:
@@ -49,7 +69,14 @@ def vault_write(path: str, content: str, create_dirs: bool = True, merge_frontma
                     "created": False,
                 })
 
-        is_new, size = write_file_atomic(path, content, create_dirs=create_dirs)
+        try:
+            is_new, size = write_file_atomic(path, content, create_dirs=create_dirs, overwrite=overwrite)
+        except FileExistsError:
+            return dumps({
+                "error": f"File already exists: {path}. Set overwrite=true to replace it.",
+                "path": path,
+                "created": False,
+            })
 
         fire_write("created" if is_new else "updated", [path])
         return dumps({"path": path, "created": is_new, "size": size})

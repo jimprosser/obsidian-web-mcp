@@ -52,6 +52,13 @@ class VaultWriteInput(BaseModel):
         default=False,
         description="If true, merge YAML frontmatter with existing file's frontmatter instead of replacing",
     )
+    overwrite: bool = Field(
+        default=True,
+        description=(
+            "If false, create only: an existing file is never replaced (also under concurrent "
+            "calls) and the call reports it instead"
+        ),
+    )
 
 
 class VaultWriteBinaryInput(BaseModel):
