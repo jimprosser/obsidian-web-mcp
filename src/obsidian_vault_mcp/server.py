@@ -759,18 +759,17 @@ def build_app(extensions=()):
     ext_routes = [r for r in app.routes if id(r) not in before_ids]
 
     def _covers(route, method, path):
-        """Match enum for route vs (method, path); NONE if the probe can't run."""
+        """Match enum for route vs (method, path); reject uninspectable routes."""
         try:
             match, _ = route.matches(
                 {"type": "http", "method": method, "path": path, "headers": []}
             )
             return match
-        except Exception:
-            logger.warning(
-                "extension route %r could not be auth-checked; allowing "
-                "(trusted-extension model)", getattr(route, "path", route)
-            )
-            return Match.NONE
+        except Exception as exc:
+            route_path = getattr(route, "path", route)
+            raise ValueError(
+                f"extension route {route_path!r} could not be safely inspected"
+            ) from exc
 
     for r in ext_routes:
         # Footguns: a Mount can shadow an exempt prefix; a WebSocketRoute isn't covered
