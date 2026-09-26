@@ -81,7 +81,8 @@ def test_registering_twice_or_the_default_changes_nothing(vault):
 
 
 @pytest.mark.parametrize("bad", ["", "  ", "*.ocr .txt", "!*.md", "-x", "--pre=/bin/sh", "sub/*.txt",
-                                 "sub\\*.txt", "*" * 51, None, 7])
+                                 "sub\\*.txt", "*" * 51, None, 7,
+                                 "{*.ocr.txt,*.csv}", "*.{txt,csv}"])  # braces: ripgrep only
 def test_a_bad_pattern_is_refused(vault, bad):
     with pytest.raises(ValueError):
         content_extractors.register_search_pattern(bad)
