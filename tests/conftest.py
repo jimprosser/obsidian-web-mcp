@@ -1,7 +1,6 @@
 """Test fixtures for the Obsidian vault MCP server."""
 
 import os
-import tempfile
 from pathlib import Path
 
 import pytest
@@ -44,8 +43,12 @@ def vault_dir(tmp_path, monkeypatch):
     monkeypatch.setenv("VAULT_MCP_TOKEN", "test-token-12345")
 
     # Reload config to pick up new env var
-    import obsidian_vault_mcp.config as config
+    from obsidian_vault_mcp import config, oauth
+
+    oauth.close_oauth_state()
     config.VAULT_PATH = Path(str(vault))
+    config.VAULT_OAUTH_STATE_PATH = tmp_path / "oauth-state" / "oauth.sqlite3"
+    config.OAUTH_CLIENTS_PATH = tmp_path / "legacy" / "oauth_clients.json"
 
     # Auditing is read from the environment at import, so a VAULT_AUDIT_LOG_PATH exported
     # in the developer's shell would take every server-level tool call in the suite into
@@ -55,3 +58,5 @@ def vault_dir(tmp_path, monkeypatch):
     monkeypatch.setattr(config, "VAULT_AUDIT_LOG_INCLUDE_READS", False)
 
     yield vault
+
+    oauth.close_oauth_state()

@@ -122,7 +122,7 @@ All configuration is via environment variables:
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
 | `VAULT_PATH` | Yes | `~/Obsidian/MyVault` | Absolute path to your Obsidian vault directory |
-| `VAULT_MCP_TOKEN` | Yes | (none) | 256-bit bearer token validated on every MCP request |
+| `VAULT_MCP_TOKEN` | Yes | (none) | 256-bit master bearer token validated on every MCP request. Protected requests also accept validated durable OAuth access tokens, each with full tool access. |
 | `VAULT_OAUTH_PASSWORD` | **Yes** | (none) | Password for the interactive login at `/oauth/authorize`. **If unset, the server refuses to authorize any client (fail-closed).** |
 | `VAULT_OAUTH_USERNAME` | No | `obsidian` | Username for the interactive login |
 | `VAULT_MCP_HOST` | No | `127.0.0.1` | Bind address. Loopback by default; set `0.0.0.0` only for deliberate LAN exposure |
@@ -134,6 +134,10 @@ All configuration is via environment variables:
 | `VAULT_OAUTH_CLIENT_ID` | No | `vault-mcp-client` | Client ID for the headless `client_credentials` grant |
 | `VAULT_OAUTH_CLIENT_SECRET` | No | (none) | Only required for the headless `client_credentials` grant. The Claude/ChatGPT browser flow uses dynamic client registration and does **not** need this. |
 | `VAULT_OAUTH_REDIRECT_URIS` | No | (none) | Comma-separated allowlist of redirect URIs for the static `VAULT_OAUTH_CLIENT_ID` when using the browser flow. Dynamically-registered clients (Claude/ChatGPT) carry their own; leave unset unless you connect a static client through `/oauth/authorize`. |
+| `VAULT_OAUTH_STATE_PATH` | No | `~/.local/share/vault-mcp/oauth_state.sqlite3` | Versioned SQLite lifecycle store. Must remain outside `VAULT_PATH`; its final directory must be owner-only (`0700`). The database and SQLite sidecars must be owner-only (`0600`). Unsafe paths, ownership, modes, or symlinks fail startup before SQLite opens. |
+| `VAULT_OAUTH_ACCESS_TOKEN_TTL_SECONDS` | No | `86400` | Lifetime of newly issued per-client access tokens. Must be an integer from 1 second through 30 days (`2592000`); invalid values fail startup. |
+| `VAULT_OAUTH_REFRESH_TOKEN_TTL_SECONDS` | No | `2592000` | Lifetime of newly issued refresh tokens. Must be an integer from 1 second through 90 days (`7776000`); invalid values fail startup. |
+| `OAUTH_CLIENTS_PATH` | No | `~/.local/share/vault-mcp/oauth_clients.json` | Legacy plaintext client registry. Read only by the explicit `vault-mcp-oauth migrate` command; normal server startup never touches it. The source must be an owner-only regular file outside the vault and is removed only after the SQLite import commits durably. |
 | `VAULT_DAILY_NOTES_FOLDER` | No | (none) | Folder for the daily-note tools; empty means the vault root |
 | `VAULT_DAILY_NOTES_FORMAT` | No | `%Y-%m-%d` | `strftime` pattern for the daily-note filename |
 | `VAULT_DAILY_NOTES_TEMPLATE` | No | (none) | `strftime` template prepended when a daily note is first created |
@@ -150,6 +154,42 @@ All configuration is via environment variables:
 With signed uploads enabled, the four settings above are validated at startup: a value that is not a positive integer, a maximum lifetime below the default lifetime, or a staging directory inside the vault stops the server with the variable's name.
 
 Generate secrets with: `python -c "import secrets; print(secrets.token_hex(32))"`
+
+### OAuth lifecycle state
+
+Dynamic client secrets, authorization codes, and access tokens are never stored
+in plaintext. SQLite contains domain-separated verifiers plus metadata. Codes
+expire after exactly five minutes and are consumed atomically; access tokens use
+the versioned `v1.<identifier>.<secret>` wire format with bounded expiry,
+independent revocation, and canonical resource binding. The authorization-code
+grant also issues a refresh token (`r1.<identifier>.<secret>`); refresh tokens
+rotate on every use, a replayed rotated token is rejected and kills the access
+token of its session, and revoking a client or an access token revokes the
+refresh tokens tied to them. Client-credentials (machine) grants issue no
+refresh token: the static client re-authenticates with its own secret.
+
+Local operator commands expose metadata only:
+
+```bash
+vault-mcp-oauth migrate
+vault-mcp-oauth clients list
+vault-mcp-oauth clients revoke <client-id>
+vault-mcp-oauth tokens list [--client-id <client-id>] [--active-only]
+vault-mcp-oauth tokens revoke <token-id>
+vault-mcp-oauth refresh list [--client-id <client-id>] [--active-only]
+vault-mcp-oauth refresh revoke <token-id>
+```
+
+`vault-mcp-oauth migrate` performs the one-way import of the legacy
+`oauth_clients.json` registry and removes the source file only after the SQLite
+import commits durably. Normal server startup never reads or consumes the
+legacy file. Neither inventory, revoke, nor migrate output includes client
+secrets, authorization codes, or complete bearer tokens.
+
+Every protected request accepts either the configured `VAULT_MCP_TOKEN` master
+credential or a durable `v1.*` OAuth access token. Each dynamically registered
+client receives the same full tool surface as the master bearer; this PR
+introduces no capability policy and no read-only mode.
 
 ## Signed uploads
 
@@ -170,7 +210,8 @@ searches are logged too when `VAULT_AUDIT_LOG_INCLUDE_READS` is on (off by defau
 reads are high-volume).
 
 Each record carries: `timestamp` (UTC), `token_id_hash` (SHA-256 of the bearer token -- the
-raw token is never written), `client_id` (a best-effort User-Agent hint), `operation`,
+raw token is never written), `client_id` (the durable OAuth client ID for per-client
+tokens, otherwise a best-effort User-Agent hint), `operation`,
 `target_path`, `size_before`/`size_after`, `checksum_before`/`checksum_after` (SHA-256),
 `request_id`, `operation_status`, and `error`. Example line:
 
@@ -307,7 +348,9 @@ src/obsidian_vault_mcp/
     extensions.py           # Extension seam: base class for adding tools/routes/hooks
     frontmatter_index.py    # In-memory YAML frontmatter index with filesystem watcher
     models.py               # Pydantic input validation models
-    oauth.py                # OAuth 2.0 authorization code flow with PKCE
+    oauth.py                # OAuth routes and confidential-client exchange
+    oauth_admin.py          # Metadata-only lifecycle migrate/inventory/revoke CLI
+    oauth_state.py          # Transactional SQLite OAuth lifecycle store
     serialization.py        # JSON encoder for tool responses (dates, etc.)
     server.py               # FastMCP server setup, tool registration, entry point
     vault.py                # Core filesystem operations (path security, atomic writes)
@@ -323,6 +366,8 @@ tests/
     test_frontmatter.py     # Frontmatter index and query tests
     test_issues_5_28.py     # Regression tests for date serialization + index rebuild
     test_oauth.py           # OAuth flow, PKCE, and auth-bypass regression tests
+    test_oauth_admin.py     # Metadata-only local operator operations
+    test_oauth_state.py     # Persistence, migration, expiry, and concurrency
     test_tools.py           # Integration tests for tool functions
     test_vault.py           # Path resolution and file operation tests
 scripts/

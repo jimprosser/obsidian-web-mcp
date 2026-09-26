@@ -1,6 +1,7 @@
 """Tests for environment-driven configuration (VAULT_MCP_ALLOWED_HOSTS)."""
 
 import importlib
+from pathlib import Path
 
 import pytest
 
@@ -11,8 +12,59 @@ import obsidian_vault_mcp.config as config_module
 def _restore_config(monkeypatch):
     """Reload config after each test so the module-level parse doesn't leak."""
     yield
-    monkeypatch.delenv("VAULT_MCP_ALLOWED_HOSTS", raising=False)
+    for name in (
+        "VAULT_MCP_ALLOWED_HOSTS",
+        "VAULT_OAUTH_STATE_PATH",
+        "VAULT_OAUTH_ACCESS_TOKEN_TTL_SECONDS",
+        "VAULT_OAUTH_REFRESH_TOKEN_TTL_SECONDS",
+    ):
+        monkeypatch.delenv(name, raising=False)
     importlib.reload(config_module)
+
+
+def test_oauth_state_defaults_are_lazy_and_bounded(monkeypatch):
+    monkeypatch.delenv("VAULT_OAUTH_STATE_PATH", raising=False)
+    monkeypatch.delenv("VAULT_OAUTH_ACCESS_TOKEN_TTL_SECONDS", raising=False)
+    monkeypatch.delenv("VAULT_OAUTH_REFRESH_TOKEN_TTL_SECONDS", raising=False)
+
+    cfg = importlib.reload(config_module)
+
+    assert cfg.VAULT_OAUTH_STATE_PATH == (
+        Path.home() / ".local/share/vault-mcp/oauth_state.sqlite3"
+    )
+    assert cfg.oauth_access_token_ttl_seconds() == 86_400
+    assert cfg.oauth_refresh_token_ttl_seconds() == 2_592_000
+
+
+def test_oauth_state_environment_is_parsed_strictly(monkeypatch, tmp_path):
+    state_path = tmp_path / "state" / "oauth.sqlite3"
+    monkeypatch.setenv("VAULT_OAUTH_STATE_PATH", str(state_path))
+    monkeypatch.setenv("VAULT_OAUTH_ACCESS_TOKEN_TTL_SECONDS", "2592000")
+    monkeypatch.setenv("VAULT_OAUTH_REFRESH_TOKEN_TTL_SECONDS", "7776000")
+
+    cfg = importlib.reload(config_module)
+
+    assert cfg.VAULT_OAUTH_STATE_PATH == state_path
+    assert cfg.oauth_access_token_ttl_seconds() == 2_592_000
+    assert cfg.oauth_refresh_token_ttl_seconds() == 7_776_000
+
+
+@pytest.mark.parametrize("value", ["", "0", "-1", "abc", "2592001"])
+def test_invalid_oauth_access_token_ttl_fails_startup_validation(monkeypatch, value):
+    monkeypatch.setenv("VAULT_OAUTH_ACCESS_TOKEN_TTL_SECONDS", value)
+    cfg = importlib.reload(config_module)
+
+    with pytest.raises(ValueError, match="VAULT_OAUTH_ACCESS_TOKEN_TTL_SECONDS"):
+        cfg.validate_config()
+
+
+@pytest.mark.parametrize("value", ["", "0", "-1", "abc", "7776001"])
+def test_invalid_oauth_refresh_token_ttl_fails_startup_validation(monkeypatch, value):
+    monkeypatch.setenv("VAULT_OAUTH_REFRESH_TOKEN_TTL_SECONDS", value)
+    cfg = importlib.reload(config_module)
+
+    with pytest.raises(ValueError, match="VAULT_OAUTH_REFRESH_TOKEN_TTL_SECONDS"):
+        cfg.validate_config()
 
 
 def test_allowed_hosts_defaults_empty(monkeypatch):
