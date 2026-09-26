@@ -103,10 +103,22 @@ DEFAULT_ALLOWED_BINARY_MEDIA_TYPES = {
 }
 
 
+def allowed_binary_media_types() -> dict[str, set[str]]:
+    """The built-in allowlist plus the operator's VAULT_EXTRA_BINARY_MEDIA_TYPES_JSON.
+
+    Extras are added per media type and never remove a built-in entry, so no setting can
+    drop PNG or PDF.
+    """
+    merged = {media_type: set(extensions) for media_type, extensions in DEFAULT_ALLOWED_BINARY_MEDIA_TYPES.items()}
+    for media_type, extensions in config.EXTRA_BINARY_MEDIA_TYPES.items():
+        merged.setdefault(media_type, set()).update(extensions)
+    return merged
+
+
 def _validate_binary_target(path: str, media_type: str) -> Path:
     """Resolve a binary target path and enforce the media-type / extension allowlist."""
     resolved = resolve_vault_path(path)
-    allowed_extensions = DEFAULT_ALLOWED_BINARY_MEDIA_TYPES.get(media_type.strip().lower())
+    allowed_extensions = allowed_binary_media_types().get(media_type.strip().lower())
     if not allowed_extensions:
         raise ValueError(f"Unsupported media_type: {media_type}")
     extension = Path(path).suffix.lower()

@@ -244,7 +244,7 @@ def vault_write(
 
 @mcp.tool(
     name="vault_write_binary",
-    description="Write an allowed binary file (image or PDF) to the Obsidian vault from base64-encoded content. Enforces a media-type/extension allowlist and a size cap; writes atomically.",
+    description="Write an allowed binary file (image, PDF, or a type the operator added) to the Obsidian vault from base64-encoded content. Enforces a media-type/extension allowlist and a size cap; writes atomically.",
     annotations={"readOnlyHint": False, "destructiveHint": True, "idempotentHint": False, "openWorldHint": False},
 )
 def vault_write_binary(path: str, data: str, media_type: str, overwrite: bool = False, create_dirs: bool = True) -> str:
@@ -267,7 +267,7 @@ def register_upload_tool() -> None:
     @mcp.tool(
         name="vault_request_upload_url",
         description=(
-            "Create a short-lived, single-use signed URL for uploading a binary file (image or PDF) "
+            "Create a short-lived, single-use signed URL for uploading a binary file (image, PDF, or a type the operator added) "
             "into the vault. The client POSTs the raw bytes to the URL with the matching Content-Type; "
             "the bytes never pass through the conversation. Use it for files too large for "
             "vault_write_binary's base64 argument."
