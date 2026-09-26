@@ -93,8 +93,11 @@ def _authorize(
     client: TestClient,
     client_id: str,
     redirect_uri: str,
+    resource: str | None = RESOURCE,
 ) -> str:
     params = _authz_params(client_id, redirect_uri)
+    if resource is None:
+        params.pop("resource")
     response = client.post(
         "/oauth/authorize",
         data={
@@ -120,22 +123,21 @@ def _exchange(
     client_secret: str,
     redirect_uri: str,
     verifier: str | None = None,
-    resource: str = RESOURCE,
+    resource: str | None = RESOURCE,
 ):
     if verifier is None:
         verifier, _ = _pkce()
-    return client.post(
-        "/oauth/token",
-        data={
-            "grant_type": "authorization_code",
-            "code": code,
-            "client_id": client_id,
-            "client_secret": client_secret,
-            "redirect_uri": redirect_uri,
-            "code_verifier": verifier,
-            "resource": resource,
-        },
-    )
+    data = {
+        "grant_type": "authorization_code",
+        "code": code,
+        "client_id": client_id,
+        "client_secret": client_secret,
+        "redirect_uri": redirect_uri,
+        "code_verifier": verifier,
+    }
+    if resource is not None:
+        data["resource"] = resource
+    return client.post("/oauth/token", data=data)
 
 
 def test_registration_returns_per_client_secret_and_persists(client):
@@ -259,6 +261,63 @@ def test_invalid_exchange_inputs_do_not_consume_code(client):
     assert bad_resource.status_code == 400
     assert bad_resource.json()["error"] == "invalid_target"
     assert accepted.status_code == 200
+
+
+def test_authorize_without_resource_issues_code(client):
+    client_id, _, redirect_uri = _register(client)
+
+    code = _authorize(client, client_id, redirect_uri, resource=None)
+
+    assert code
+    assert oauth.get_oauth_state().authorization_code_active(code)
+
+
+def test_exchange_without_resource_binds_canonical(client):
+    client_id, client_secret, redirect_uri = _register(client)
+    code = _authorize(client, client_id, redirect_uri, resource=None)
+
+    response = _exchange(
+        client,
+        code=code,
+        client_id=client_id,
+        client_secret=client_secret,
+        redirect_uri=redirect_uri,
+        resource=None,
+    )
+
+    assert response.status_code == 200
+    token = response.json()["access_token"]
+    metadata = oauth.get_oauth_state().lookup_access_token(token)
+    assert metadata is not None
+    assert metadata.resource == RESOURCE
+
+
+def test_exchange_with_wrong_resource_rejected(client):
+    client_id, client_secret, redirect_uri = _register(client)
+    code = _authorize(client, client_id, redirect_uri, resource=None)
+
+    response = _exchange(
+        client,
+        code=code,
+        client_id=client_id,
+        client_secret=client_secret,
+        redirect_uri=redirect_uri,
+        resource="https://wrong.example.test",
+    )
+
+    assert response.status_code == 400
+    assert response.json()["error"] == "invalid_target"
+
+
+def test_authorize_with_wrong_resource_still_rejected(client):
+    client_id, _, redirect_uri = _register(client)
+    params = _authz_params(client_id, redirect_uri)
+    params["resource"] = "https://wrong.example.test"
+
+    response = client.get("/oauth/authorize", params=params)
+
+    assert response.status_code == 400
+    assert response.json()["error"] == "invalid_target"
 
 
 def test_static_authorization_code_uses_configured_secret(client):

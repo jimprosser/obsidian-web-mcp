@@ -179,7 +179,8 @@ def _validate_authorization_request(request: Request, params: Mapping[str, str])
             },
             status_code=400,
         )
-    if params["resource"] != canonical_resource(request):
+    provided_resource = params["resource"]
+    if provided_resource and provided_resource != canonical_resource(request):
         return JSONResponse(
             {
                 "error": "invalid_target",
@@ -278,7 +279,9 @@ async def oauth_authorize(request: Request):
         client_id=client.client_id,
         redirect_uri=params["redirect_uri"],
         code_challenge=params["code_challenge"],
-        resource=params["resource"],
+        # Absent resource binds server-side to this server's canonical resource,
+        # so plain OAuth 2.0 clients without RFC 8707 parameters can connect.
+        resource=params["resource"] or canonical_resource(request),
     )
     query = {"code": code}
     if params["state"]:
@@ -324,17 +327,20 @@ async def _handle_authorization_code(
             "client_secret",
             "redirect_uri",
             "code_verifier",
-            "resource",
         )
     }
     if not all(fields.values()):
         return _oauth_error(
             "invalid_request",
-            "code, client_id, client_secret, redirect_uri, code_verifier, "
-            "and resource are required",
+            "code, client_id, client_secret, redirect_uri, "
+            "and code_verifier are required",
         )
+    # Absent resource binds to the canonical resource, mirroring authorize.
+    resource = str(form.get("resource", "") or "") or canonical_resource(request)
     try:
-        issued = get_oauth_state().redeem_authorization_code(**fields)
+        issued = get_oauth_state().redeem_authorization_code(
+            **fields, resource=resource
+        )
     except InvalidClient:
         return _oauth_error(
             "invalid_client", "client authentication failed", status_code=401
