@@ -81,20 +81,11 @@ def _search_ripgrep(
     return matches
 
 
-def _search_python(
-    query: str,
-    search_path: Path,
-    file_pattern: str,
-    max_results: int,
-    context_lines: int,
-) -> list[dict]:
-    """Fallback Python-based search."""
+def _iter_vault_files(search_path: Path, file_pattern: str):
+    """Yield files under search_path, honoring EXCLUDED_DIRS and the glob pattern."""
     import fnmatch
 
-    query_lower = query.lower()
-    matches = []
-
-    for file_path in search_path.rglob("*"):
+    for file_path in sorted(search_path.rglob("*")):
         if not file_path.is_file():
             continue
 
@@ -104,6 +95,21 @@ def _search_python(
         if not fnmatch.fnmatch(file_path.name, file_pattern):
             continue
 
+        yield file_path
+
+
+def _search_python(
+    query: str,
+    search_path: Path,
+    file_pattern: str,
+    max_results: int,
+    context_lines: int,
+) -> list[dict]:
+    """Fallback Python-based search."""
+    query_lower = query.lower()
+    matches = []
+
+    for file_path in _iter_vault_files(search_path, file_pattern):
         try:
             rel_path = str(file_path.relative_to(config.VAULT_PATH))
             safe_path = resolve_vault_read_path(rel_path)
@@ -130,6 +136,36 @@ def _search_python(
     return matches
 
 
+def _search_filenames(
+    query: str,
+    search_path: Path,
+    file_pattern: str,
+    max_results: int,
+) -> list[dict]:
+    """Match the query against vault-relative file paths (case-insensitive)."""
+    query_lower = query.lower()
+    matches = []
+
+    for file_path in _iter_vault_files(search_path, file_pattern):
+        try:
+            rel_path = str(file_path.relative_to(config.VAULT_PATH))
+        except ValueError:
+            continue
+
+        if query_lower in rel_path.lower():
+            matches.append({
+                "path": rel_path,
+                "line_number": None,
+                "match_context": rel_path,
+                "match_type": "filename",
+            })
+
+            if len(matches) >= max_results:
+                break
+
+    return matches
+
+
 def _get_frontmatter_excerpt(file_path: Path, max_keys: int = 3) -> dict | None:
     """Read frontmatter from a file, returning first N key-value pairs."""
     try:
@@ -152,7 +188,7 @@ def vault_search(
     max_results: int = 20,
     context_lines: int = 2,
 ) -> str:
-    """Search for text across vault files."""
+    """Search for text across vault file names and contents."""
     try:
         if path_prefix:
             search_path = resolve_vault_path(path_prefix)
@@ -162,10 +198,17 @@ def vault_search(
         if not search_path.is_dir():
             return dumps({"error": f"Search path is not a directory: {path_prefix}"})
 
-        if shutil.which("rg"):
-            matches = _search_ripgrep(query, search_path, file_pattern, max_results, context_lines)
-        else:
-            matches = _search_python(query, search_path, file_pattern, max_results, context_lines)
+        matches = _search_filenames(query, search_path, file_pattern, max_results)
+
+        remaining = max_results - len(matches)
+        if remaining > 0:
+            if shutil.which("rg"):
+                content_matches = _search_ripgrep(query, search_path, file_pattern, remaining, context_lines)
+            else:
+                content_matches = _search_python(query, search_path, file_pattern, remaining, context_lines)
+            for match in content_matches:
+                match["match_type"] = "content"
+            matches += content_matches
 
         for match in matches:
             file_full_path = config.VAULT_PATH / match["path"]

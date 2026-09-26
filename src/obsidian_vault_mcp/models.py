@@ -303,7 +303,7 @@ class VaultSearchInput(BaseModel):
 
     query: str = Field(
         ...,
-        description="Search string to find in file contents",
+        description="Search string to find in note names/paths and file contents",
         min_length=1,
         max_length=200,
     )

@@ -346,7 +346,7 @@ def vault_batch_frontmatter_update(updates: list[dict]) -> str:
 
 @mcp.tool(
     name="vault_search",
-    description="Search for text across vault files. Uses ripgrep if available, falls back to Python. Returns matching lines with context and frontmatter excerpts.",
+    description="Search for text across vault files, matching note names/paths as well as contents. Filename matches are returned first (match_type 'filename'), then content matches (match_type 'content') with context lines and frontmatter excerpts.",
     annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False},
 )
 def vault_search(
