@@ -367,7 +367,7 @@ def vault_batch_frontmatter_update(updates: list[dict]) -> str:
 def vault_search(
     query: str,
     path_prefix: str | None = None,
-    file_pattern: str = "*.md",
+    file_pattern: str | None = None,
     max_results: int = 20,
     context_lines: int = 2,
 ) -> str:
