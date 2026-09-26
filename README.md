@@ -70,7 +70,7 @@ Found a vulnerability? Please report it privately rather than opening a public i
 | `vault_search` | Full-text search across vault files (uses ripgrep if available, falls back to Python) |
 | `vault_search_frontmatter` | Query the in-memory frontmatter index by field value, substring, or field existence |
 | `vault_list` | List directory contents with recursion depth, glob filtering, and file/dir toggles |
-| `vault_move` | Move or rename a file or directory within the vault |
+| `vault_move` | Move or rename a file or directory within the vault, repointing the links that pointed at it the way Obsidian does on a rename |
 | `vault_delete` | Soft-delete a file by moving it to `.trash/` (requires explicit confirmation) |
 | `vault_canvas_read` | Read an Obsidian `.canvas` file and return its parsed nodes and edges |
 | `vault_canvas_add_node` | Append a node to a `.canvas` file (created if missing); generates an id when omitted and preserves unknown node fields |
