@@ -118,40 +118,21 @@ def read_file(relative_path: str, *, extract: bool = False) -> tuple[str, dict]:
 
 
 def write_file_atomic(
-    relative_path: str, content: str, create_dirs: bool = True
+    relative_path: str, content: str, create_dirs: bool = True, overwrite: bool = True
 ) -> tuple[bool, int]:
     """Write content to a file atomically.
 
     Returns (is_new_file, bytes_written). Writes to a tempfile in the same
-    directory then replaces the target, so readers never see a partial write.
+    directory then puts it in place, so readers never see a partial write.
+    With overwrite=False an existing file is never replaced, not even by a
+    concurrent writer: see _place_atomic.
     """
     encoded = content.encode("utf-8")
     if len(encoded) > config.MAX_CONTENT_SIZE:
         raise ValueError(
             f"Content size {len(encoded)} bytes exceeds limit of {config.MAX_CONTENT_SIZE} bytes"
         )
-
-    path = resolve_vault_path(relative_path)
-    is_new = not path.exists()
-
-    if create_dirs:
-        path.parent.mkdir(parents=True, exist_ok=True)
-
-    # Write to a temp file in the same directory, then atomic-replace.
-    fd, tmp_path = tempfile.mkstemp(dir=path.parent, suffix=".tmp")
-    try:
-        with os.fdopen(fd, "wb") as f:
-            f.write(encoded)
-            _publish_mode(path, f.fileno())
-        os.replace(tmp_path, path)
-    except BaseException:
-        # Clean up the temp file on any failure
-        try:
-            os.unlink(tmp_path)
-        except OSError:
-            pass
-        raise
-
+    is_new = _place_atomic(relative_path, lambda f: f.write(encoded), create_dirs, overwrite)
     return is_new, len(encoded)
 
 

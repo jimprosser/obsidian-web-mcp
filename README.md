@@ -61,7 +61,7 @@ Found a vulnerability? Please report it privately rather than opening a public i
 |------|-------------|
 | `vault_read` | Read a file, returning content, metadata, and parsed YAML frontmatter |
 | `vault_batch_read` | Read multiple files in one call; handles missing files gracefully |
-| `vault_write` | Write a file with optional frontmatter merging; creates parent dirs |
+| `vault_write` | Write a file with optional frontmatter merging; creates parent dirs; `overwrite: false` for create-only (never replaces, also under concurrent calls) |
 | `vault_request_upload_url` | Get a short-lived, single-use signed URL, then `POST` a file's raw bytes to it. For images and PDFs too large to send base64-encoded through `vault_write_binary`; the bytes never pass through the conversation. See [Signed uploads](#signed-uploads) |
 | `vault_write_binary` | Write an allowed binary file (image/PDF) to the vault from base64 content; enforces a media-type allowlist (declared type/extension, not byte-sniffed) and size cap, writes atomically |
 | `vault_edit` | Patch a file with ordered exact text replacements (token-efficient partial edits); supports dry-run diff previews, and an opt-in `replace_all` per edit for renaming a term across a note |

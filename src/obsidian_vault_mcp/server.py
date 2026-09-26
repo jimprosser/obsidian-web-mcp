@@ -214,15 +214,30 @@ def vault_batch_read(paths: list[str], include_content: bool = True) -> str:
 
 @mcp.tool(
     name="vault_write",
-    description="Write a file to the Obsidian vault. Supports frontmatter merging with existing files. Creates parent directories by default.",
+    description=(
+        "Write a file to the Obsidian vault. Supports frontmatter merging with existing files. "
+        "Creates parent directories by default. Replaces an existing file unless overwrite=false: "
+        "then it only creates, and an existing file is left untouched and reported, also when two "
+        "calls race. Use overwrite=false for a note that must not exist yet; if it reports the file "
+        "exists, choose another name rather than retrying with overwrite=true."
+    ),
     annotations={"readOnlyHint": False, "destructiveHint": True, "idempotentHint": False, "openWorldHint": False},
 )
-def vault_write(path: str, content: str, create_dirs: bool = True, merge_frontmatter: bool = False) -> str:
+def vault_write(
+    path: str,
+    content: str,
+    create_dirs: bool = True,
+    merge_frontmatter: bool = False,
+    overwrite: bool = True,
+) -> str:
     """Write a file to the vault."""
-    inp = VaultWriteInput(path=path, content=content, create_dirs=create_dirs, merge_frontmatter=merge_frontmatter)
+    inp = VaultWriteInput(
+        path=path, content=content, create_dirs=create_dirs,
+        merge_frontmatter=merge_frontmatter, overwrite=overwrite,
+    )
     return run_audited(
         "vault_write",
-        lambda: _vault_write(inp.path, inp.content, inp.create_dirs, inp.merge_frontmatter),
+        lambda: _vault_write(inp.path, inp.content, inp.create_dirs, inp.merge_frontmatter, inp.overwrite),
         path=inp.path,
     )
 
