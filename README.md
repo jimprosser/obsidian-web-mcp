@@ -410,6 +410,11 @@ Two things worth knowing:
   `vault_append`, `vault_batch_frontmatter_update` and `vault_write(merge_frontmatter=True)`
   read in order to write back and would otherwise replace the binary with its extracted text.
   With nothing registered, reads are byte-identical to stock.
+- **Extensions can widen the default search.** `content_extractors.register_search_pattern("*.ocr.txt")`,
+  called from `register_tools`, adds a filename glob to what `vault_search` searches when the caller
+  leaves `file_pattern` unset: notes plus the registered patterns. An explicit `file_pattern`, `*.md`
+  included, is used exactly as given, and with nothing registered the search is unchanged. The typical
+  use is an extractor that persists its text as a sidecar file, so that text is found by a plain search.
 - **Extension tools join the audit log.** The built-in tools run through
   `audit.run_audited(operation, func, **context)`, which records a mutation with before/after
   size and checksum, and a read only when `VAULT_AUDIT_LOG_INCLUDE_READS` is on. An extension
