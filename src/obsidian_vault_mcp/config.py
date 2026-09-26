@@ -203,10 +203,6 @@ EXCLUDED_DIRS = {".obsidian", ".trash", ".git", ".DS_Store"}
 # Frontmatter index refresh interval (seconds)
 FRONTMATTER_INDEX_DEBOUNCE = 5.0
 
-# Rate limiting (requests per minute) -- track in-memory, enforce per-token
-RATE_LIMIT_READ = 100
-RATE_LIMIT_WRITE = 30
-
 
 def _validate_mcp_path(path: str) -> None:
     """Reject a VAULT_MCP_PATH that is malformed or would expose the vault unauthenticated.
