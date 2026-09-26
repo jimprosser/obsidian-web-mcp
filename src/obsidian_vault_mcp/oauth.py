@@ -38,9 +38,12 @@ import hmac
 import html
 import json
 import logging
+import math
 import os
 import secrets
+import threading
 import time
+from collections import deque
 from urllib.parse import urlencode, urlparse
 
 from starlette.requests import Request
@@ -63,6 +66,55 @@ _auth_codes: dict[str, dict] = {}
 # /oauth/authorize rejects it with "Invalid or unregistered redirect_uri" and the only
 # recourse is removing and re-adding the connector.
 _clients: dict[str, dict] = {}
+
+
+# --- Brakes on the two unauthenticated write paths (#97) ---------------------------------
+#
+# Failed password attempts at /oauth/authorize and registrations at /oauth/register are
+# counted globally, not per address: someone guessing passwords can switch addresses,
+# and one correct guess hands over the whole vault. The numbers are far above what the
+# owner does and far below what guessing needs. The trade-off: someone hammering the
+# login can hold it closed for the owner until the window passes; tokens already issued
+# keep working, so connected clients are not affected.
+LOGIN_FAILURE_LIMIT = 10
+LOGIN_FAILURE_WINDOW_SECONDS = 15 * 60
+REGISTRATION_LIMIT = 20
+REGISTRATION_WINDOW_SECONDS = 60 * 60
+
+_clock = time.monotonic  # tests move time through this
+
+
+class _SlidingLimit:
+    """At most ``limit`` events in any ``window`` seconds, across all callers."""
+
+    def __init__(self, limit: int, window: float):
+        self.limit = limit
+        self.window = window
+        self._events: deque[float] = deque()
+        self._lock = threading.Lock()
+
+    def _prune(self, now: float) -> None:
+        while self._events and self._events[0] <= now - self.window:
+            self._events.popleft()
+
+    def retry_after(self) -> int:
+        """Seconds until the next event is allowed; 0 when it is allowed now."""
+        with self._lock:
+            now = _clock()
+            self._prune(now)
+            if len(self._events) < self.limit:
+                return 0
+            return max(1, math.ceil(self._events[0] + self.window - now))
+
+    def record(self) -> None:
+        with self._lock:
+            now = _clock()
+            self._prune(now)
+            self._events.append(now)
+
+
+_login_failures = _SlidingLimit(LOGIN_FAILURE_LIMIT, LOGIN_FAILURE_WINDOW_SECONDS)
+_registrations = _SlidingLimit(REGISTRATION_LIMIT, REGISTRATION_WINDOW_SECONDS)
 
 
 def _load_clients() -> None:
@@ -187,7 +239,7 @@ def _issue_code_redirect(client_id: str, redirect_uri: str, state: str,
     return RedirectResponse(url=f"{redirect_uri}{separator}{urlencode(params)}", status_code=302)
 
 
-def _login_form(params: dict, error: str = "") -> HTMLResponse:
+def _login_form(params: dict, error: str = "", status: int | None = None, headers: dict | None = None) -> HTMLResponse:
     """Render the login page, carrying the OAuth params as hidden fields.
 
     Every reflected value is HTML-escaped to avoid reflected XSS.
@@ -197,7 +249,8 @@ def _login_form(params: dict, error: str = "") -> HTMLResponse:
         for k, v in params.items() if v
     )
     err_html = f'<p class="err">{html.escape(error)}</p>' if error else ""
-    status = 401 if error else 200
+    if status is None:
+        status = 401 if error else 200
     page = f"""<!doctype html>
 <html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Authorize Obsidian Vault access</title>
@@ -224,7 +277,7 @@ def _login_form(params: dict, error: str = "") -> HTMLResponse:
   <p class="sub">A client is requesting access to your Obsidian vault.</p>
  </form>
 </body></html>"""
-    return HTMLResponse(page, status_code=status)
+    return HTMLResponse(page, status_code=status, headers=headers)
 
 
 def _misconfigured_page() -> HTMLResponse:
@@ -333,8 +386,21 @@ async def oauth_authorize(request: Request):
         # No credentials yet -- show the login form.
         return _login_form(oauth_params)
 
-    # POST: verify the submitted credentials.
+    # POST: refuse every attempt while the failure brake is tripped, the correct password
+    # included; otherwise the brake would only slow a guesser down, not stop a lucky guess.
+    wait = _login_failures.retry_after()
+    if wait:
+        logger.warning("OAuth login refused: too many failed attempts, %ss until the next try.", wait)
+        return _login_form(
+            oauth_params,
+            error=f"Too many failed sign-in attempts. Try again in {max(1, wait // 60)} minute(s).",
+            status=429,
+            headers={"Retry-After": str(wait)},
+        )
+
+    # Verify the submitted credentials.
     if not _check_credentials(form.get("username", ""), form.get("password", "")):
+        _login_failures.record()
         logger.warning("OAuth login failed.")
         return _login_form(oauth_params, error="Incorrect username or password.")
 
@@ -433,6 +499,16 @@ async def oauth_register(request: Request) -> JSONResponse:
     bearer token. Registering a client confers no access on its own -- the human
     must still log in at /oauth/authorize.
     """
+    wait = _registrations.retry_after()
+    if wait:
+        logger.warning("OAuth registration refused: registration limit reached, %ss until the next.", wait)
+        return JSONResponse(
+            {"error": "too_many_requests",
+             "error_description": "Too many client registrations; try again later."},
+            status_code=429,
+            headers={"Retry-After": str(wait)},
+        )
+
     try:
         body = await request.json()
     except Exception:
@@ -456,6 +532,7 @@ async def oauth_register(request: Request) -> JSONResponse:
         "redirect_uris": redirect_uris,
         "created_at": time.time(),
     }
+    _registrations.record()
     _save_clients()  # survive restarts; otherwise this registration is lost on reboot
 
     return JSONResponse({
