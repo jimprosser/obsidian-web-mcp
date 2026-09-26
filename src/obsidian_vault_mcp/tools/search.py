@@ -9,6 +9,7 @@ from pathlib import Path
 import frontmatter
 
 from .. import config
+from ..content_extractors import default_search_patterns
 from ..serialization import dumps
 from ..vault import resolve_vault_path, resolve_vault_read_path
 
@@ -18,16 +19,17 @@ logger = logging.getLogger(__name__)
 def _search_ripgrep(
     query: str,
     search_path: Path,
-    file_pattern: str,
+    file_pattern: list[str] | str,
     max_results: int,
     context_lines: int,
 ) -> list[dict]:
-    """Search using ripgrep for performance."""
+    """Search using ripgrep for performance. file_pattern: one glob or several (any match)."""
+    file_patterns = [file_pattern] if isinstance(file_pattern, str) else list(file_pattern)
     cmd = [
         "rg",
         "--json",
         f"--max-count={max_results}",
-        f"--glob={file_pattern}",
+        *(f"--glob={pattern}" for pattern in file_patterns),
         "-i",
         f"--context={context_lines}",
     ]
@@ -84,11 +86,12 @@ def _search_ripgrep(
 def _search_python(
     query: str,
     search_path: Path,
-    file_pattern: str,
+    file_pattern: list[str] | str,
     max_results: int,
     context_lines: int,
 ) -> list[dict]:
-    """Fallback Python-based search."""
+    """Fallback Python-based search. file_pattern: one glob or several (any match)."""
+    file_patterns = [file_pattern] if isinstance(file_pattern, str) else list(file_pattern)
     import fnmatch
 
     query_lower = query.lower()
@@ -101,7 +104,7 @@ def _search_python(
         if any(part in config.EXCLUDED_DIRS for part in file_path.parts):
             continue
 
-        if not fnmatch.fnmatch(file_path.name, file_pattern):
+        if not any(fnmatch.fnmatch(file_path.name, pattern) for pattern in file_patterns):
             continue
 
         try:
@@ -148,11 +151,16 @@ def _get_frontmatter_excerpt(file_path: Path, max_keys: int = 3) -> dict | None:
 def vault_search(
     query: str,
     path_prefix: str | None = None,
-    file_pattern: str = "*.md",
+    file_pattern: str | None = None,
     max_results: int = 20,
     context_lines: int = 2,
 ) -> str:
-    """Search for text across vault files."""
+    """Search for text across vault files.
+
+    file_pattern=None means the default: notes plus the patterns extensions registered
+    (content_extractors.register_search_pattern). An explicit pattern is used as given.
+    """
+    file_patterns = [file_pattern] if file_pattern is not None else default_search_patterns()
     try:
         if path_prefix:
             search_path = resolve_vault_path(path_prefix)
@@ -163,9 +171,9 @@ def vault_search(
             return dumps({"error": f"Search path is not a directory: {path_prefix}"})
 
         if shutil.which("rg"):
-            matches = _search_ripgrep(query, search_path, file_pattern, max_results, context_lines)
+            matches = _search_ripgrep(query, search_path, file_patterns, max_results, context_lines)
         else:
-            matches = _search_python(query, search_path, file_pattern, max_results, context_lines)
+            matches = _search_python(query, search_path, file_patterns, max_results, context_lines)
 
         for match in matches:
             file_full_path = config.VAULT_PATH / match["path"]

@@ -21,9 +21,23 @@ failing on a file that is not UTF-8, exactly as without an extractor.
 """
 
 import logging
+import re
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
+
+# Default search patterns (#96). What an extractor makes readable is often persisted as a
+# file next to its source (an OCR sidecar, "scan.pdf.ocr.txt"), and vault_search looks at
+# notes only by default, so that text was invisible to a search that did not name the
+# pattern. An extension adds its pattern here; it applies only when the caller leaves
+# file_pattern at its default, and with nothing registered the search is unchanged.
+DEFAULT_SEARCH_PATTERN = "*.md"
+_search_patterns: list[str] = []
+# A filename glob: no whitespace, no path separator, not a ripgrep negation ("!") or
+# option ("-"), at most as long as vault_search's own file_pattern argument. No braces
+# either: ripgrep expands {a,b}, the Python fallback does not, and the same registration
+# must find the same files on both backends.
+_SEARCH_PATTERN = re.compile(r"[^\s/\\!\-{}][^\s/\\{}]{0,49}")
 
 # Registered at startup (before serving), consulted during request handling.
 _content_extractors: list = []
@@ -40,6 +54,27 @@ def register_content_extractor(callback) -> None:
     counts as a decline, and an exception is logged and swallowed, never propagated.
     """
     _content_extractors.append(callback)
+
+
+def register_search_pattern(pattern: str) -> None:
+    """Add a filename glob (e.g. ``"*.ocr.txt"``) to vault_search's default patterns.
+
+    Called from an extension's ``register_tools``. Applies only when a caller leaves
+    ``file_pattern`` at its default; an explicit ``file_pattern`` is used exactly as given.
+    Registering a pattern twice, or the default ``*.md``, changes nothing.
+    """
+    if not isinstance(pattern, str) or not _SEARCH_PATTERN.fullmatch(pattern):
+        raise ValueError(
+            f"Search pattern must be a filename glob without whitespace, path separators or "
+            f"braces, not starting with '!' or '-', at most 50 characters: {pattern!r}"
+        )
+    if pattern != DEFAULT_SEARCH_PATTERN and pattern not in _search_patterns:
+        _search_patterns.append(pattern)
+
+
+def default_search_patterns() -> list[str]:
+    """The patterns vault_search uses when the caller gives none."""
+    return [DEFAULT_SEARCH_PATTERN, *_search_patterns]
 
 
 def apply_content_extractors(relative_path: str, path: Path) -> str | None:
