@@ -80,6 +80,36 @@ def _iso_timestamp(ts: float) -> str:
     return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
 
 
+class BinaryFileTypeError(UnicodeDecodeError):
+    """A file whose extension is on the binary allowlist, refused as text (#95).
+
+    A UnicodeDecodeError on purpose: every caller already handles one as "not a text file",
+    so a binary type is refused exactly the way an undecodable file is, whatever its bytes.
+    """
+
+    def __init__(self, relative_path: str, suffix: str):
+        super().__init__("utf-8", b"", 0, 0, "binary file type")
+        self.relative_path = relative_path
+        self.suffix = suffix
+
+    def __str__(self) -> str:
+        return f"{self.relative_path} is a binary file ({self.suffix}), not text"
+
+
+def binary_extensions() -> frozenset[str]:
+    """Extensions decided as binary by name, never by content: those on the binary allowlist.
+
+    A PDF whose bytes happen to be all ASCII decodes as UTF-8; judged by its bytes it was
+    read as text and editable as text, which breaks its stream lengths and xref offsets.
+    The binary write path already trusts the declared extension; reads and text writes
+    follow the same rule.
+    """
+    # Imported here: tools.write imports this module.
+    from .tools.write import DEFAULT_ALLOWED_BINARY_MEDIA_TYPES
+
+    return frozenset(ext for extensions in DEFAULT_ALLOWED_BINARY_MEDIA_TYPES.values() for ext in extensions)
+
+
 def read_file(relative_path: str, *, extract: bool = False) -> tuple[str, dict]:
     """Read a file and return (content, metadata).
 
@@ -94,6 +124,9 @@ def read_file(relative_path: str, *, extract: bool = False) -> tuple[str, dict]:
     stat = path.stat()
     from_extractor = False
     try:
+        suffix = path.suffix.lower()
+        if suffix in binary_extensions():
+            raise BinaryFileTypeError(relative_path, suffix)
         content = path.read_text(encoding="utf-8")
     except UnicodeDecodeError:
         extracted = apply_content_extractors(relative_path, path) if extract else None
@@ -127,6 +160,15 @@ def write_file_atomic(
     With overwrite=False an existing file is never replaced, not even by a
     concurrent writer: see _place_atomic.
     """
+    suffix = Path(relative_path).suffix.lower()
+    if suffix in binary_extensions():
+        # Text writes never create or replace a binary type, whatever the content: a PDF
+        # replaced by its extracted text is gone (#95). Binary writes go through
+        # write_bytes_atomic, which does not pass here.
+        raise ValueError(
+            f"{relative_path} is a binary file type ({suffix}); a text write cannot create or "
+            "replace it. Use vault_write_binary or a signed upload."
+        )
     encoded = content.encode("utf-8")
     if len(encoded) > config.MAX_CONTENT_SIZE:
         raise ValueError(
