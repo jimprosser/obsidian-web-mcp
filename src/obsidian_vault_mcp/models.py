@@ -1,8 +1,13 @@
 """Pydantic input models for obsidian-vault-mcp tool endpoints."""
 
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, StringConstraints, field_validator, model_validator
+
+# File content is written byte for byte. The models strip surrounding whitespace from their
+# string fields, which is right for paths and names and wrong for a note: stripped, every
+# note lost its trailing newline and a note starting with indented text lost the indent (#99).
+VerbatimText = Annotated[str, StringConstraints(strip_whitespace=False)]
 
 from .config import (
     CONTEXT_LINES,
@@ -39,7 +44,7 @@ class VaultWriteInput(BaseModel):
         min_length=1,
         max_length=500,
     )
-    content: str = Field(
+    content: VerbatimText = Field(
         ...,
         description="Full file content to write",
         max_length=MAX_CONTENT_SIZE,
