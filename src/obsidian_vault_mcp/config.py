@@ -1,4 +1,6 @@
+import json
 import os
+import re
 from pathlib import Path
 
 # Vault configuration
@@ -255,6 +257,66 @@ def _validate_mcp_path(path: str) -> None:
         )
 
 
+# Extra binary media types (#100). Which file types a vault accepts through
+# vault_write_binary and the signed upload is the operator's call: a JSON object mapping a
+# media type to its extensions, e.g.
+#   {"application/vnd.openxmlformats-officedocument.wordprocessingml.document": [".docx"]}
+# It only ever adds to the built-in allowlist (tools/write.py), never replaces it. Parsed
+# leniently here (a bad value means no extras) and strictly in validate_config(), which
+# stops startup with the variable's name.
+VAULT_EXTRA_BINARY_MEDIA_TYPES_JSON = os.environ.get("VAULT_EXTRA_BINARY_MEDIA_TYPES_JSON", "").strip()
+
+# Extensions a binary write must never target: the text formats the other write tools own
+# (a note, a canvas, a base), so no configuration can point a binary write at a note path;
+# and SVG, excluded from the built-in list on purpose because it can carry active content.
+REFUSED_EXTRA_BINARY_EXTENSIONS = frozenset({".md", ".markdown", ".canvas", ".base", ".txt", ".svg"})
+
+_MEDIA_TYPE = re.compile(r"[a-z0-9][a-z0-9!#$&^_.+-]*/[a-z0-9][a-z0-9!#$&^_.+-]*")
+_EXTENSION = re.compile(r"\.[a-z0-9][a-z0-9_-]*")
+
+
+def parse_extra_binary_media_types(raw: str) -> dict[str, frozenset[str]]:
+    """Parse VAULT_EXTRA_BINARY_MEDIA_TYPES_JSON; raise ValueError naming what is wrong."""
+    name = "VAULT_EXTRA_BINARY_MEDIA_TYPES_JSON"
+    if not raw:
+        return {}
+    try:
+        data = json.loads(raw)
+    except ValueError as e:
+        raise ValueError(f"{name} is not valid JSON: {e}")
+    if not isinstance(data, dict):
+        raise ValueError(f"{name} must be a JSON object mapping a media type to a list of extensions")
+    parsed: dict[str, frozenset[str]] = {}
+    for media_type, extensions in data.items():
+        normalized_type = media_type.strip().lower()
+        if not _MEDIA_TYPE.fullmatch(normalized_type):
+            raise ValueError(f"{name}: {media_type!r} is not a media type of the form type/subtype")
+        if not isinstance(extensions, list) or not extensions:
+            raise ValueError(f"{name}: the value for {media_type!r} must be a non-empty list of extensions")
+        normalized = set()
+        for extension in extensions:
+            ext = extension.strip().lower() if isinstance(extension, str) else ""
+            if not _EXTENSION.fullmatch(ext):
+                raise ValueError(
+                    f"{name}: {extension!r} for {media_type!r} is not an extension; "
+                    "use a leading dot, e.g. '.docx'"
+                )
+            if ext in REFUSED_EXTRA_BINARY_EXTENSIONS:
+                raise ValueError(
+                    f"{name}: {ext} cannot be a binary type; it is a text format the write tools "
+                    "own, or excluded on purpose (.svg can carry active content)"
+                )
+            normalized.add(ext)
+        parsed[normalized_type] = frozenset(normalized)
+    return parsed
+
+
+try:
+    EXTRA_BINARY_MEDIA_TYPES = parse_extra_binary_media_types(VAULT_EXTRA_BINARY_MEDIA_TYPES_JSON)
+except ValueError:
+    EXTRA_BINARY_MEDIA_TYPES = {}  # validate_config() refuses to start with this value
+
+
 def validate_config() -> None:
     """Validate operator-supplied configuration at startup.
 
@@ -262,6 +324,7 @@ def validate_config() -> None:
     CLOSED with a clear message instead of booting a broken or insecure server.
     """
     _validate_mcp_path(VAULT_MCP_PATH)
+    parse_extra_binary_media_types(os.environ.get("VAULT_EXTRA_BINARY_MEDIA_TYPES_JSON", "").strip())
     if signed_upload_enabled():
         _validate_upload_settings()
 
