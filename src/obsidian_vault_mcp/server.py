@@ -371,7 +371,7 @@ def vault_search(
     max_results: int = 20,
     context_lines: int = 2,
 ) -> str:
-    """Search vault file contents."""
+    """Search vault note names/paths and file contents."""
     inp = VaultSearchInput(query=query, path_prefix=path_prefix, file_pattern=file_pattern, max_results=max_results, context_lines=context_lines)
     return run_audited(
         "vault_search",

@@ -82,20 +82,32 @@ def _search_ripgrep(
 
 
 def _iter_vault_files(search_path: Path, file_pattern: str):
-    """Yield files under search_path, honoring EXCLUDED_DIRS and the glob pattern."""
+    """Yield files under search_path, honoring EXCLUDED_DIRS and the glob pattern.
+
+    Excluded and dot-prefixed directories are pruned without descending into
+    them (a vault's .git can dwarf the vault itself), and symlinks are never
+    followed -- the same rule resolve_vault_path enforces on reads, applied
+    here so the walk cannot surface a name it would refuse to open.
+    """
     import fnmatch
+    import os
 
-    for file_path in sorted(search_path.rglob("*")):
-        if not file_path.is_file():
-            continue
+    def walk(directory):
+        try:
+            entries = sorted(os.scandir(directory), key=lambda e: e.name)
+        except OSError:
+            return
+        for entry in entries:
+            if entry.name.startswith(".") or entry.name in config.EXCLUDED_DIRS:
+                continue
+            if entry.is_symlink():
+                continue
+            if entry.is_dir(follow_symlinks=False):
+                yield from walk(entry.path)
+            elif entry.is_file(follow_symlinks=False) and fnmatch.fnmatch(entry.name, file_pattern):
+                yield Path(entry.path)
 
-        if any(part in config.EXCLUDED_DIRS for part in file_path.parts):
-            continue
-
-        if not fnmatch.fnmatch(file_path.name, file_pattern):
-            continue
-
-        yield file_path
+    yield from walk(search_path)
 
 
 def _search_python(
@@ -198,21 +210,33 @@ def vault_search(
         if not search_path.is_dir():
             return dumps({"error": f"Search path is not a directory: {path_prefix}"})
 
-        matches = _search_filenames(query, search_path, file_pattern, max_results)
+        name_candidates = _search_filenames(query, search_path, file_pattern, max_results)
 
-        remaining = max_results - len(matches)
-        if remaining > 0:
-            if shutil.which("rg"):
-                content_matches = _search_ripgrep(query, search_path, file_pattern, remaining, context_lines)
-            else:
-                content_matches = _search_python(query, search_path, file_pattern, remaining, context_lines)
-            for match in content_matches:
-                match["match_type"] = "content"
-            matches += content_matches
+        # Content matches keep a guaranteed share of the budget: a query that
+        # is also a folder or date token can match many names, and those must
+        # not starve the body hits clients relied on before name matching.
+        content_budget = max_results - min(len(name_candidates), max_results // 2)
+        if shutil.which("rg"):
+            content_matches = _search_ripgrep(query, search_path, file_pattern, content_budget, context_lines)
+        else:
+            content_matches = _search_python(query, search_path, file_pattern, content_budget, context_lines)
 
-        for match in matches:
+        # Only content hits get the frontmatter excerpt. Name-only hits are
+        # never read at all: the path locates the note, and reading it would
+        # be both an unbounded cost and a disclosure the walk already refuses.
+        for match in content_matches:
+            match["match_type"] = "content"
             file_full_path = config.VAULT_PATH / match["path"]
             match["frontmatter_excerpt"] = _get_frontmatter_excerpt(file_full_path)
+
+        # A file that also matched on content appears once, as the content
+        # match (it carries the line and context). Budget content did not use
+        # is backfilled with further name hits.
+        content_paths = {match["path"] for match in content_matches}
+        name_matches = [m for m in name_candidates if m["path"] not in content_paths]
+        name_matches = name_matches[: max_results - len(content_matches)]
+
+        matches = name_matches + content_matches
 
         truncated = len(matches) >= max_results
 
