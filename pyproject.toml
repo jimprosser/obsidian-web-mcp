@@ -18,7 +18,10 @@ dev = [
     "pytest-asyncio>=0.23",
 ]
 cloudflare-access = [
-    "pyjwt>=2.8",
+    # mcp already ships pyjwt[crypto]>=2.10.1; this extra's job is the FLOOR, not the
+    # install. 2.13 preserves the JWKS cache on fetch errors; 2.14 adds redirect
+    # rejection and unknown-kid refresh rate-limiting. Below 2.14 all three regress.
+    "pyjwt>=2.14",
     "cryptography>=42",
 ]
 

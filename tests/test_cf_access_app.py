@@ -25,7 +25,17 @@ def cf_app(monkeypatch, tmp_path):
         raise cf_access.CfAccessError("bad")
 
     monkeypatch.setattr(cf_access, "verify_access_token", fake_verify)
-    return TestClient(server.build_app(), raise_server_exceptions=False)
+    # Context-managed so the lifespan runs: the MCP session manager the transport
+    # needs is started there, and the initialize test below exercises it for real.
+    # The shared FastMCP instance caches its session manager, whose run() is
+    # once-per-instance -- reset it so every test gets a startable manager.
+    monkeypatch.setattr(server.mcp, "_session_manager", None)
+    # base_url on loopback: the transport's DNS-rebinding protection 421s the
+    # default "testserver" host before the initialize request could reach it.
+    with TestClient(
+        server.build_app(), raise_server_exceptions=False, base_url="http://127.0.0.1:8420"
+    ) as client:
+        yield client
 
 
 def test_health_ok_without_token(cf_app):
@@ -62,11 +72,30 @@ def test_invalid_cf_header_is_401(cf_app):
     assert r.status_code == 401
 
 
-def test_valid_cf_header_reaches_transport(cf_app):
-    # A valid CF token clears auth; the request reaches the MCP transport, which then
-    # rejects this non-MCP GET on its own terms (i.e. NOT a 401 from our middleware).
-    r = cf_app.get("/", headers={"Cf-Access-Jwt-Assertion": "good-token"})
-    assert r.status_code != 401
+def test_valid_cf_header_completes_mcp_initialize(cf_app):
+    # A valid CF token clears auth AND the request completes a real MCP initialize
+    # through the transport -- proving the whole chain works, not merely "not 401".
+    r = cf_app.post(
+        "/",
+        headers={
+            "Cf-Access-Jwt-Assertion": "good-token",
+            "Accept": "application/json, text/event-stream",
+            "Content-Type": "application/json",
+        },
+        json={
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-06-18",
+                "capabilities": {},
+                "clientInfo": {"name": "cf-access-test", "version": "0"},
+            },
+        },
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["result"]["serverInfo"]["name"] == "obsidian_web_mcp"
 
 
 def test_mode_off_still_mounts_oauth(monkeypatch, tmp_path):

@@ -57,11 +57,16 @@ is off and the server behaves exactly as it does by default):
 | `VAULT_MCP_CF_ACCESS_TEAM_DOMAIN` | Your Cloudflare team domain, e.g. `myteam.cloudflareaccess.com` (a bare `myteam` or a full URL is accepted). |
 | `VAULT_MCP_CF_ACCESS_AUD` | The Access application **audience (AUD)** tag from the Cloudflare dashboard. |
 
-Install the extra dependencies (PyJWT + cryptography):
+Install the extra:
 
 ```bash
 pip install 'obsidian-web-mcp[cloudflare-access]'
 ```
+
+The base install already pulls PyJWT (via `mcp`); the extra's job is to enforce the
+**version floor** (`pyjwt>=2.14`, where JWKS redirect rejection, unknown-kid refresh
+rate-limiting, and cache-preserve-on-fetch-error are all in place) and to add
+`cryptography` for RS256 verification.
 
 #### Setting up Cloudflare (Managed OAuth)
 
@@ -123,8 +128,10 @@ When the mode is **on**:
   `/.well-known/oauth-*` discovery endpoints are not mounted, and `VAULT_MCP_TOKEN` is not
   accepted. Cloudflare is the sole auth authority, so there is no public password endpoint
   to brute-force.
-- The audit log records the caller's **identity** (the token's `email` claim, or its `sub`
-  for service tokens) instead of a shared-token hash.
+- The audit log records the caller's **identity** instead of a shared-token hash: the
+  token's `email` claim, or for service tokens its `common_name` (their `sub` is empty),
+  falling back to `sub`. In this mode the audit record's `client_id` field is that
+  **plaintext identity** and `token_id_hash` is its hash.
 
 > **Run it behind Cloudflare — keep the origin unreachable directly.** The signature
 > proves the token is *authentic* (Cloudflare minted it for your team + AUD, and the

@@ -15,8 +15,10 @@ from __future__ import annotations
 
 import logging
 import threading
+import urllib.request
 import uuid
 
+from starlette.concurrency import run_in_threadpool
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import JSONResponse
@@ -86,24 +88,40 @@ _HOSTNAME_LABEL = r"[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?"
 
 
 def validate_cf_access_config() -> None:
-    """When CF Access mode is on, reject a team domain that isn't a plausible hostname.
+    """Fail startup on a broken Cloudflare Access configuration.
 
-    A typo'd VAULT_MCP_CF_ACCESS_TEAM_DOMAIN would otherwise boot a server that
-    fail-closes every request (safe, but silently broken) -- so catch a malformed value
-    at startup with a clear message, matching how VAULT_MCP_PATH is validated. This is a
-    pure FORMAT check: connectivity to the JWKS endpoint is NOT probed here (warm_jwks
-    stays non-fatal so a transient Cloudflare blip can't wedge startup). A no-op unless
-    both settings are set (a half-config is mode-off and only warns, in serve()).
+    Two failure shapes, both caught here so a bad value stops the boot with a clear
+    message, matching how VAULT_MCP_PATH is validated:
+
+    - HALF-CONFIG: exactly one of the two settings set. The operator meant to enable
+      the mode, so silently booting bearer+OAuth instead would swap the auth surface
+      out from under them -- the same "silently broken server" a malformed value causes.
+    - MALFORMED DOMAIN: mode on, but the team domain isn't a plausible hostname. The
+      error names the setting and the expected format WITHOUT echoing the value: a
+      pasted URL can carry credentials, and this message lands in the startup log.
+
+    This is a pure FORMAT check: connectivity to the JWKS endpoint is NOT probed here
+    (warm_jwks stays non-fatal so a transient Cloudflare blip can't wedge startup).
+    A no-op when neither setting is set.
     """
     import re
 
-    if not cf_access_enabled():
+    team_set = bool(team_domain())
+    aud_set = bool(_aud())
+    if not team_set and not aud_set:
         return
-    domain = team_domain()
-    if not re.fullmatch(rf"{_HOSTNAME_LABEL}(?:\.{_HOSTNAME_LABEL})+", domain):
+    if team_set != aud_set:
+        only = "VAULT_MCP_CF_ACCESS_TEAM_DOMAIN" if team_set else "VAULT_MCP_CF_ACCESS_AUD"
         raise ValueError(
-            "VAULT_MCP_CF_ACCESS_TEAM_DOMAIN does not look like a valid hostname "
-            f"(normalized to {domain!r}); expected e.g. 'myteam.cloudflareaccess.com'"
+            "Cloudflare Access mode requires BOTH VAULT_MCP_CF_ACCESS_TEAM_DOMAIN and "
+            f"VAULT_MCP_CF_ACCESS_AUD; only {only} is set. Set both to enable the mode, "
+            "or neither to run with bearer auth + OAuth."
+        )
+    if not re.fullmatch(rf"{_HOSTNAME_LABEL}(?:\.{_HOSTNAME_LABEL})+", team_domain()):
+        raise ValueError(
+            "VAULT_MCP_CF_ACCESS_TEAM_DOMAIN does not look like a valid hostname; "
+            "expected a Cloudflare team domain like 'myteam.cloudflareaccess.com' "
+            "(value not shown in case it carries credentials)"
         )
 
 
@@ -127,22 +145,72 @@ def require_dependencies() -> None:
         ) from e
 
 
-def _get_jwk_client():
-    """Return a cached PyJWKClient for the configured team's JWKS endpoint.
+# Far above any real Cloudflare key set (a handful of RSA keys is a few KB); the cap
+# exists so a compromised or misdirected endpoint cannot feed an unbounded body into
+# json.loads, which PyJWKClient's own fetch would accept.
+_JWKS_MAX_BYTES = 1 << 20
 
-    Built on first use (not at import) so the OFF path never imports PyJWT. PyJWKClient
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Refuse redirects on the JWKS fetch. Returning None makes urllib raise."""
+
+    def redirect_request(self, *args, **kwargs):
+        return None
+
+
+def _build_jwk_client(uri: str):
+    """A PyJWKClient whose HTTP fetch is bounded: no redirects, response size capped.
+
+    Only fetch_data is overridden -- get_jwk_set validates and caches whatever a
+    subclass's fetch_data returns, so the cache-preserve-on-error and unknown-kid
+    cooldown semantics of the parent are kept.
+    """
+    from jwt import PyJWKClient
+    from jwt.exceptions import PyJWKClientConnectionError
+
+    class _BoundedPyJWKClient(PyJWKClient):
+        def fetch_data(self):
+            import json
+            import time
+
+            request = urllib.request.Request(url=self.uri, headers=self.headers)
+            opener = urllib.request.build_opener(_NoRedirect)
+            try:
+                with opener.open(request, timeout=self.timeout) as response:
+                    raw = response.read(_JWKS_MAX_BYTES + 1)
+            except Exception as e:
+                raise PyJWKClientConnectionError(
+                    f"Failed to fetch the JWKS endpoint: {type(e).__name__}"
+                ) from e
+            if len(raw) > _JWKS_MAX_BYTES:
+                raise PyJWKClientConnectionError(
+                    f"JWKS response exceeded the {_JWKS_MAX_BYTES}-byte cap"
+                )
+            jwk_set = json.loads(raw)
+            # The parent's fetch_data stamps the fetch time that rate-limits
+            # unknown-kid refreshes; keep that behavior (guarded: internal attr).
+            if hasattr(self, "_last_successful_fetch"):
+                self._last_successful_fetch = time.monotonic()
+            return jwk_set
+
+    return _BoundedPyJWKClient(uri)
+
+
+def _get_jwk_client():
+    """Return a cached JWK client for the configured team's JWKS endpoint.
+
+    Built on first use (not at import) so the OFF path never imports PyJWT. The client
     caches fetched keys in-process and refreshes on an unknown kid, so verification does
     not hit Cloudflare per request.
 
-    Thread-safe: double-checked locking ensures only one PyJWKClient is ever constructed
+    Thread-safe: double-checked locking ensures only one client is ever constructed
     even when concurrent requests race on the first call.
     """
     global _jwk_client
     if _jwk_client is None:
         with _jwk_client_lock:
             if _jwk_client is None:
-                from jwt import PyJWKClient
-                _jwk_client = PyJWKClient(certs_url())
+                _jwk_client = _build_jwk_client(certs_url())
     return _jwk_client
 
 
@@ -205,17 +273,23 @@ class CloudflareAccessMiddleware(BaseHTTPMiddleware):
             return await call_next(request)
 
         try:
-            claims = verify_access_token(request.headers.get(_CF_ACCESS_HEADER, ""))
+            # verify_access_token can block on the JWKS fetch (urlopen, up to 30s);
+            # run it in a worker thread so a slow fetch cannot stall the event loop
+            # and every other in-flight request with it.
+            claims = await run_in_threadpool(
+                verify_access_token, request.headers.get(_CF_ACCESS_HEADER, "")
+            )
         except CfAccessError:
             return JSONResponse(
                 {"error": "Invalid or missing Cloudflare Access token"},
                 status_code=401,
             )
 
-        # Prefer the human email; fall back to the opaque subject for service tokens so
-        # the audit principal is never empty for a validly-authenticated request. This
-        # only labels the audit record -- it has no bearing on the auth decision above.
-        principal = claims.get("email") or claims.get("sub") or None
+        # Prefer the human email; service-token JWTs carry sub: "" with the identity
+        # in common_name, so try that before the subject -- the audit principal must
+        # never be empty for a validly-authenticated request. This only labels the
+        # audit record; it has no bearing on the auth decision above.
+        principal = claims.get("email") or claims.get("common_name") or claims.get("sub") or None
         ctx_token = set_request_context(
             principal=principal, request_id=uuid.uuid4().hex, client=principal
         )

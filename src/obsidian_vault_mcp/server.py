@@ -878,15 +878,14 @@ def serve(extensions=()):
 
     # Cloudflare Access mode: fail CLOSED on missing deps, warm the key set, and (below)
     # suppress the static-token warning that is irrelevant when Cloudflare is the auth
-    # authority. A half-configured pair (exactly one of the two settings) means mode OFF;
-    # warn so it is not silently insecure-by-omission.
+    # authority. A half-configured pair (exactly one of the two settings) fails startup
+    # in validate_config(), so this point is only reached with the mode fully on or off.
     from .cf_access import (
         cf_access_enabled,
         require_dependencies,
         team_domain,
         warm_jwks,
     )
-    from .config import VAULT_MCP_CF_ACCESS_AUD, VAULT_MCP_CF_ACCESS_TEAM_DOMAIN
 
     cf_on = cf_access_enabled()
     if cf_on:
@@ -897,11 +896,6 @@ def serve(extensions=()):
             sys.exit(1)
         logger.info("Cloudflare Access mode ENABLED (team: %s)", team_domain())
         warm_jwks()
-    elif bool(VAULT_MCP_CF_ACCESS_TEAM_DOMAIN) != bool(VAULT_MCP_CF_ACCESS_AUD):
-        logger.warning(
-            "Only one of VAULT_MCP_CF_ACCESS_TEAM_DOMAIN / VAULT_MCP_CF_ACCESS_AUD is "
-            "set; Cloudflare Access mode requires BOTH and is therefore OFF."
-        )
 
     if not cf_on and not VAULT_MCP_TOKEN:
         logger.warning("VAULT_MCP_TOKEN is not set -- auth will reject all requests")
