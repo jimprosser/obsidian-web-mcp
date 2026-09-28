@@ -324,9 +324,12 @@ class VaultSearchInput(BaseModel):
         description="Limit search to files under this directory prefix",
         max_length=500,
     )
-    file_pattern: str = Field(
-        default="*.md",
-        description="Glob pattern for files to search (e.g. '*.md', '*.canvas')",
+    file_pattern: str | None = Field(
+        default=None,
+        description=(
+            "Glob pattern for files to search (e.g. '*.md', '*.canvas'). Default: note names and "
+            "contents (*.md), plus the contents of file types installed extensions add, such as OCR text"
+        ),
         max_length=50,
     )
     max_results: int = Field(
