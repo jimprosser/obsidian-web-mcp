@@ -525,6 +525,8 @@ Two things worth knowing:
   leaves `file_pattern` unset: notes plus the registered patterns. An explicit `file_pattern`, `*.md`
   included, is used exactly as given, and with nothing registered the search is unchanged. The typical
   use is an extractor that persists its text as a sidecar file, so that text is found by a plain search.
+  Name matching stays on notes (`*.md`) unless the caller passes a pattern: a registered pattern names a
+  derivative of a note or file, and matching it by name would return both for every name query.
 - **Extension tools join the audit log.** The built-in tools run through
   `audit.run_audited(operation, func, **context)`, which records a mutation with before/after
   size and checksum, and a read only when `VAULT_AUDIT_LOG_INCLUDE_READS` is on. An extension

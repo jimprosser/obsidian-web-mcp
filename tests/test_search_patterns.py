@@ -44,13 +44,53 @@ def vault(vault_dir):
     content_extractors._search_patterns.clear()
 
 
-def search(**arguments) -> set[str]:
+def results(**arguments) -> list[dict]:
     result = asyncio.run(server.mcp.call_tool("vault_search", arguments))
     if isinstance(result, tuple):
         result = result[0]
     payload = json.loads("".join(getattr(block, "text", "") for block in result))
     assert "error" not in payload, payload
-    return {match["path"] for match in payload["results"]}
+    return payload["results"]
+
+
+def search(**arguments) -> set[str]:
+    return {match["path"] for match in results(**arguments)}
+
+
+@pytest.fixture
+def named(vault_dir):
+    """A note and its sidecar share the query in their names, not in their text."""
+    (vault_dir / "Rechnung-Stadtwerke.md").write_text("Betrag 42 EUR\n", encoding="utf-8")
+    (vault_dir / "Rechnung-Stadtwerke.pdf.ocr.txt").write_text("Betrag 42 EUR\n", encoding="utf-8")
+    yield vault_dir
+    content_extractors._search_patterns.clear()
+
+
+def test_name_matches_stay_on_notes_when_a_pattern_is_registered(named, backend):
+    """A registered pattern widens content search only; names would return note and sidecar."""
+    content_extractors.register_search_pattern("*.ocr.txt")
+
+    hits = results(query="stadtwerke")
+
+    assert [(h["path"], h["match_type"]) for h in hits] == [("Rechnung-Stadtwerke.md", "filename")]
+
+
+def test_an_explicit_pattern_applies_to_names_too(named, backend):
+    content_extractors.register_search_pattern("*.ocr.txt")
+
+    hits = results(query="stadtwerke", file_pattern="*.ocr.txt")
+
+    assert [(h["path"], h["match_type"]) for h in hits] == [("Rechnung-Stadtwerke.pdf.ocr.txt", "filename")]
+
+
+def test_content_still_reaches_the_registered_patterns(named, backend):
+    """Guard: the name rule does not narrow content search."""
+    content_extractors.register_search_pattern("*.ocr.txt")
+
+    hits = results(query="Betrag")
+
+    assert {(h["path"], h["match_type"]) for h in hits} == {
+        ("Rechnung-Stadtwerke.md", "content"), ("Rechnung-Stadtwerke.pdf.ocr.txt", "content")}
 
 
 def test_without_a_registration_the_default_is_notes_only(vault, backend):

@@ -327,8 +327,8 @@ class VaultSearchInput(BaseModel):
     file_pattern: str | None = Field(
         default=None,
         description=(
-            "Glob pattern for files to search (e.g. '*.md', '*.canvas'). Default: notes (*.md) "
-            "plus any file types installed extensions add, such as OCR text"
+            "Glob pattern for files to search (e.g. '*.md', '*.canvas'). Default: note names and "
+            "contents (*.md), plus the contents of file types installed extensions add, such as OCR text"
         ),
         max_length=50,
     )
