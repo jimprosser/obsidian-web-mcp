@@ -102,12 +102,14 @@ def binary_extensions() -> frozenset[str]:
     A PDF whose bytes happen to be all ASCII decodes as UTF-8; judged by its bytes it was
     read as text and editable as text, which breaks its stream lengths and xref offsets.
     The binary write path already trusts the declared extension; reads and text writes
-    follow the same rule.
+    follow the same rule. That includes the types an operator adds through
+    VAULT_EXTRA_BINARY_MEDIA_TYPES_JSON: a .docx the binary write path accepts is binary
+    here too, so a text write cannot replace it.
     """
     # Imported here: tools.write imports this module.
-    from .tools.write import DEFAULT_ALLOWED_BINARY_MEDIA_TYPES
+    from .tools.write import allowed_binary_media_types
 
-    return frozenset(ext for extensions in DEFAULT_ALLOWED_BINARY_MEDIA_TYPES.values() for ext in extensions)
+    return frozenset(ext for extensions in allowed_binary_media_types().values() for ext in extensions)
 
 
 def read_file(relative_path: str, *, extract: bool = False) -> tuple[str, dict]:

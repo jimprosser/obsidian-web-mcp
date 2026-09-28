@@ -5,14 +5,20 @@ as UTF-8. On main, vault_read returned its PDF syntax, the content extractors we
 asked, and vault_edit changed it: the stream length and xref offsets no longer matched
 and a strict reader rejected the file. The fixture is exactly such a PDF, and every case
 goes through the registered tool.
+
+The same holds for a type the operator adds through VAULT_EXTRA_BINARY_MEDIA_TYPES_JSON
+(#104): with .docx added, a real .docx is binary for reads and text writes too.
 """
 
 import asyncio
+import base64
+import io
 import json
+import zipfile
 
 import pytest
 
-from obsidian_vault_mcp import content_extractors, server
+from obsidian_vault_mcp import config, content_extractors, server
 
 
 def ascii_pdf(text: str) -> bytes:
@@ -128,3 +134,79 @@ def test_notes_are_unaffected(vault_dir):
     assert call_tool("vault_read", {"path": "n.md"})["content"] == "Der Betrag ist 1200.\n"
     call_tool("vault_edit", {"path": "n.md", "edits": [{"old_text": "1200", "new_text": "12000"}]})
     assert (vault_dir / "n.md").read_text(encoding="utf-8") == "Der Betrag ist 12000.\n"
+
+
+DOCX_TYPE = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+
+
+def real_docx() -> bytes:
+    """A minimal but real .docx: a zip with the three parts Word needs."""
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as docx:
+        docx.writestr("[Content_Types].xml",
+                      '<?xml version="1.0"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+                      '<Default Extension="xml" ContentType="application/xml"/></Types>')
+        docx.writestr("_rels/.rels", '<?xml version="1.0"?><Relationships/>')
+        docx.writestr("word/document.xml", '<?xml version="1.0"?><w:document><w:body>Angebot 1200 EUR</w:body></w:document>')
+    return buffer.getvalue()
+
+
+DOCX = real_docx()
+
+
+@pytest.fixture
+def docx_added(monkeypatch):
+    monkeypatch.setattr(config, "EXTRA_BINARY_MEDIA_TYPES",
+                        config.parse_extra_binary_media_types(json.dumps({DOCX_TYPE: [".docx"]})))
+
+
+@pytest.fixture
+def docx(vault_dir):
+    target = vault_dir / "offer.docx"
+    target.write_bytes(DOCX)
+    return target
+
+
+def test_control_without_the_setting_a_text_write_replaces_a_docx(docx):
+    """What #104 alone allows: .docx is not a binary type unless the operator adds it."""
+    result = call_tool("vault_write", {"path": "offer.docx", "content": "replaced by text\n"})
+
+    assert "error" not in result, result
+    assert docx.read_bytes() == b"replaced by text\n"
+
+
+@pytest.mark.parametrize("tool,arguments", [
+    ("vault_write", {"path": "offer.docx", "content": "replaced by text\n"}),
+    ("vault_write", {"path": "offer.docx", "content": "---\na: 1\n---\n", "merge_frontmatter": True}),
+    ("vault_edit", {"path": "offer.docx", "edits": [{"old_text": "1200", "new_text": "12000"}]}),
+    ("vault_append", {"path": "offer.docx", "content": "\nappended\n"}),
+    ("vault_batch_frontmatter_update", {"updates": [{"path": "offer.docx", "fields": {"status": "sent"}}]}),
+])
+def test_an_operator_added_type_is_binary_for_text_writes(docx, docx_added, tool, arguments):
+    result = call_tool(tool, arguments)
+
+    assert docx.read_bytes() == DOCX, f"{tool} changed the .docx: {result}"
+    assert "error" in json.dumps(result), result
+
+
+def test_a_text_write_cannot_create_an_operator_added_type(vault_dir, docx_added):
+    result = call_tool("vault_write", {"path": "new.docx", "content": "text\n"})
+
+    assert "binary file type" in result.get("error", ""), result
+    assert not (vault_dir / "new.docx").exists()
+
+
+def test_an_operator_added_type_reaches_the_extractors(docx, docx_added, extractor):
+    result = call_tool("vault_read", {"path": "offer.docx"})
+
+    assert result["content"].startswith("EXTRACTED"), result
+    assert extractor == ["offer.docx"]
+
+
+def test_binary_writes_of_an_operator_added_type_still_work(vault_dir, docx_added):
+    """Guard: the binary write path for the added type is unaffected."""
+    result = call_tool("vault_write_binary", {"path": "copy.docx", "media_type": DOCX_TYPE,
+                                              "data": base64.b64encode(DOCX).decode()})
+
+    assert result.get("created") is True, result
+    assert (vault_dir / "copy.docx").read_bytes() == DOCX
