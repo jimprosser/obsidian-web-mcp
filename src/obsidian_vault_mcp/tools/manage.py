@@ -2,6 +2,7 @@
 
 import logging
 
+from ..links import update_links_for_move
 from ..serialization import dumps
 from ..vault import list_directory, move_path, delete_path
 from ..write_events import fire_write
@@ -36,12 +37,25 @@ def vault_list(
 
 
 def vault_move(source: str, destination: str, create_dirs: bool = True) -> str:
-    """Move a file or directory within the vault."""
+    """Move or rename a file or directory within the vault.
+
+    Every reference to the moved note is repointed afterwards, the way Obsidian
+    does on a rename: a link that followed the note before the move follows it
+    after. The rewrite runs after the move and never undoes it, so if it fails
+    the summary says so and the move still stands.
+    """
     try:
         moved = move_path(source, destination, create_dirs=create_dirs)
         if moved:
             fire_write("moved", [source, destination])
-        return dumps({"source": source, "destination": destination, "moved": moved})
+        result = {"source": source, "destination": destination, "moved": moved}
+
+        if moved:
+            summary = update_links_for_move(source, destination)
+            result["links"] = summary
+            if summary["files_updated"]:
+                fire_write("updated", summary["files"])
+        return dumps(result)
     except ValueError as e:
         return dumps({"error": str(e), "source": source, "destination": destination})
     except Exception as e:
