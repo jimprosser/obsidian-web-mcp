@@ -13,7 +13,7 @@ from ..frontmatter_io import YAMLError
 
 from ..models import normalize_edit_aliases
 from ..serialization import dumps
-from ..vault import resolve_vault_path, read_file, write_bytes_atomic, write_file_atomic
+from ..vault import resolve_vault_path, read_file, write_bytes_atomic, write_file_atomic, find_heading_section
 from ..write_events import fire_write
 
 logger = logging.getLogger(__name__)
@@ -475,13 +475,156 @@ def vault_edit(path: str, edits: list[dict], dry_run: bool = False) -> str:
         })
 
 
+def vault_edit_section(path: str, heading: str, edits: list[dict], dry_run: bool = False) -> str:
+    """Like vault_edit, but each edit's old_text only needs to be unique within
+    the section under the exact ATX heading line `heading` (markers included) --
+    up to the next heading of the same or shallower level, or end of file.
+    """
+    try:
+        content, _ = read_file(path)
+        original_content = content
+
+        for index, edit in enumerate(edits):
+            normalized_edit, alias_error = _normalize_edit_aliases(edit)
+            if alias_error:
+                return dumps({
+                    "error": f"Edit {index}: {alias_error}",
+                    "path": path,
+                    "changed": False,
+                    "dry_run": dry_run,
+                    "diff": "",
+                    "edits_applied": 0,
+                    "size": len(original_content.encode("utf-8")),
+                })
+
+            old_text = normalized_edit.get("old_text", "")
+            new_text = normalized_edit.get("new_text", "")
+            replace_all = bool(normalized_edit.get("replace_all", False))
+
+            if not old_text:
+                return dumps({
+                    "error": f"Edit {index} has no old_text to match",
+                    "path": path,
+                    "changed": False,
+                    "dry_run": dry_run,
+                    "diff": "",
+                    "edits_applied": 0,
+                    "size": len(original_content.encode("utf-8")),
+                })
+
+            section_start, section_end = find_heading_section(content, heading)
+            section = content[section_start:section_end]
+            count = section.count(old_text)
+
+            if count == 0 or (count != 1 and not replace_all):
+                requirement = "at least once" if replace_all else "exactly once"
+                return dumps({
+                    "error": (
+                        f"Edit {index} old_text must match {requirement} within heading "
+                        f"{heading!r}; found {count} matches"
+                    ),
+                    "path": path,
+                    "changed": False,
+                    "dry_run": dry_run,
+                    "diff": "",
+                    "edits_applied": 0,
+                    "size": len(original_content.encode("utf-8")),
+                })
+
+            new_section = section.replace(old_text, new_text) if replace_all else section.replace(old_text, new_text, 1)
+            content = content[:section_start] + new_section + content[section_end:]
+
+        diff = _unified_diff(path, original_content, content)
+        size = len(content.encode("utf-8"))
+
+        if dry_run:
+            return dumps({
+                "path": path,
+                "changed": False,
+                "dry_run": True,
+                "diff": diff,
+                "edits_applied": len(edits),
+                "size": size,
+            })
+
+        changed = content != original_content
+        if changed:
+            write_file_atomic(path, content, create_dirs=False)
+            fire_write("updated", [path])
+
+        return dumps({
+            "path": path,
+            "changed": changed,
+            "dry_run": False,
+            "diff": diff,
+            "edits_applied": len(edits),
+            "size": size,
+        })
+    except ValueError as e:
+        return dumps({
+            "error": str(e),
+            "path": path,
+            "changed": False,
+            "dry_run": dry_run,
+            "diff": "",
+            "edits_applied": 0,
+            "size": 0,
+        })
+    except FileNotFoundError:
+        return dumps({
+            "error": f"File not found: {path}",
+            "path": path,
+            "changed": False,
+            "dry_run": dry_run,
+            "diff": "",
+            "edits_applied": 0,
+            "size": 0,
+        })
+    except Exception as e:
+        logger.error(f"vault_edit_section error for {path}: {e}")
+        return dumps({
+            "error": str(e),
+            "path": path,
+            "changed": False,
+            "dry_run": dry_run,
+            "diff": "",
+            "edits_applied": 0,
+            "size": 0,
+        })
+
+
+def _insert_at_section_end(existing_content: str, insert_at: int, content: str) -> str:
+    """Splice `content` in at `insert_at`, adding newlines so it doesn't run into
+    the surrounding text (matching Markdown convention: a blank line before the
+    next heading)."""
+    prefix = existing_content[:insert_at]
+    suffix = existing_content[insert_at:]
+
+    piece = content
+    if prefix and not prefix.endswith("\n"):
+        piece = "\n" + piece
+    if suffix and piece:
+        if not piece.endswith("\n\n"):
+            piece = piece + ("\n" if not piece.endswith("\n") else "") + "\n"
+
+    return prefix + piece + suffix
+
+
 def vault_append(
     path: str,
     content: str,
     separator: str = "\n\n",
     create_dirs: bool = True,
+    heading: str | None = None,
 ) -> str:
-    """Append content to a file without requiring the caller to send the full body."""
+    """Append content to a file without requiring the caller to send the full body.
+
+    With no heading, appends to end-of-file, creating the file (and parent dirs)
+    if it doesn't already exist. With a heading, appends at the end of that
+    heading's section instead -- right before the next heading of the same or
+    shallower level, or end of file -- and requires the file and heading to
+    already exist.
+    """
     try:
         resolve_vault_path(path)
 
@@ -489,10 +632,17 @@ def vault_append(
         try:
             existing_content, _ = read_file(path)
         except FileNotFoundError:
+            if heading is not None:
+                raise ValueError(
+                    f"Cannot append under heading {heading!r}: file does not exist: {path}"
+                )
             existing_content = ""
             created = True
 
-        if created or not existing_content:
+        if heading is not None:
+            _, insert_at = find_heading_section(existing_content, heading)
+            new_content = _insert_at_section_end(existing_content, insert_at, content)
+        elif created or not existing_content:
             new_content = content
         elif content:
             new_content = f"{existing_content}{separator}{content}"

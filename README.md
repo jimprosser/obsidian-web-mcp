@@ -172,7 +172,8 @@ Found a vulnerability? Please report it privately rather than opening a public i
 | `vault_request_upload_url` | Get a short-lived, single-use signed URL, then `POST` a file's raw bytes to it. For images and PDFs too large to send base64-encoded through `vault_write_binary`; the bytes never pass through the conversation. See [Signed uploads](#signed-uploads) |
 | `vault_write_binary` | Write an allowed binary file (image/PDF) to the vault from base64 content; enforces a media-type allowlist (declared type/extension, not byte-sniffed) and size cap, writes atomically |
 | `vault_edit` | Patch a file with ordered exact text replacements (token-efficient partial edits); supports dry-run diff previews, and an opt-in `replace_all` per edit for renaming a term across a note |
-| `vault_append` | Append content to the end of a file without resending the existing body; creates the file when missing |
+| `vault_edit_section` | Like `vault_edit`, but each edit's `old_text` only has to be unique within one heading's section (`heading` is the exact ATX heading line, markers included, e.g. `## Track 2`), so repeated text elsewhere in the note doesn't block the edit. Supports dry-run and `replace_all` within the section |
+| `vault_append` | Append content to the end of a file without resending the existing body; creates the file when missing. With `heading` set, appends at the end of that heading's section instead (the file and heading must already exist) |
 | `vault_batch_frontmatter_update` | Update YAML frontmatter fields on multiple files without touching body content |
 | `vault_search` | Full-text search across vault files, matching note names/paths as well as contents (uses ripgrep if available, falls back to Python) |
 | `vault_search_frontmatter` | Query the in-memory frontmatter index by field value, substring, or field existence |

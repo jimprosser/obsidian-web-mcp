@@ -235,7 +235,7 @@ def test_snapshot_path_stays_in_vault(vault_dir):
 # --- wiring: tools stay registered (wrapper preserved the schema) ---
 
 @pytest.mark.parametrize("name", [
-    "vault_write", "vault_edit", "vault_append", "vault_move", "vault_delete",
+    "vault_write", "vault_edit", "vault_edit_section", "vault_append", "vault_move", "vault_delete",
     "vault_read", "vault_search", "vault_canvas_add_node", "vault_daily_note_append",
     "vault_write_binary",
 ])

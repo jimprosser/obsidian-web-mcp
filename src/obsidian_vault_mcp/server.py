@@ -139,6 +139,7 @@ from .tools.write import (
     vault_append as _vault_append,
     vault_batch_frontmatter_update as _vault_batch_frontmatter_update,
     vault_edit as _vault_edit,
+    vault_edit_section as _vault_edit_section,
     vault_write as _vault_write,
     vault_write_binary as _vault_write_binary,
 )
@@ -173,6 +174,7 @@ from .models import (
     VaultRequestUploadUrlInput,
     VaultEditInput,
     VaultEditOperationInput,
+    VaultEditSectionInput,
     VaultAppendInput,
     VaultBatchReadInput,
     VaultBatchFrontmatterUpdateInput,
@@ -327,19 +329,44 @@ def vault_edit(path: str, edits: list[VaultEditOperationInput], dry_run: bool = 
 
 
 @mcp.tool(
-    name="vault_append",
+    name="vault_edit_section",
     description=(
-        "Append content to a vault file without sending the existing file body. Use this for token-efficient "
-        "additions; creates the file when it does not exist."
+        "Like vault_edit, but each edit's old_text only needs to be unique within one heading's section "
+        "instead of the whole file. `heading` must be the exact ATX heading line (markers included, e.g. "
+        "'## Track 2') and must be unique in the file; the section runs to the next heading of the same "
+        "or shallower level, or end of file."
     ),
     annotations={"readOnlyHint": False, "destructiveHint": True, "idempotentHint": False, "openWorldHint": False},
 )
-def vault_append(path: str, content: str, separator: str = "\n\n", create_dirs: bool = True) -> str:
+def vault_edit_section(path: str, heading: str, edits: list[dict], dry_run: bool = False) -> str:
+    """Patch a file, scoped to one heading's section, with exact text replacements."""
+    inp = VaultEditSectionInput(path=path, heading=heading, edits=edits, dry_run=dry_run)
+    if inp.dry_run:
+        # A dry run writes nothing; don't record it as a mutation.
+        return _vault_edit_section(inp.path, inp.heading, [edit.model_dump() for edit in inp.edits], inp.dry_run)
+    return run_audited(
+        "vault_edit_section",
+        lambda: _vault_edit_section(inp.path, inp.heading, [edit.model_dump() for edit in inp.edits], inp.dry_run),
+        path=inp.path,
+    )
+
+
+@mcp.tool(
+    name="vault_append",
+    description=(
+        "Append content to a vault file without sending the existing file body. Use this for token-efficient "
+        "additions; creates the file when it does not exist. With `heading` set (exact ATX heading line, "
+        "markers included), appends at the end of that heading's section instead of end-of-file; the file "
+        "and heading must already exist."
+    ),
+    annotations={"readOnlyHint": False, "destructiveHint": True, "idempotentHint": False, "openWorldHint": False},
+)
+def vault_append(path: str, content: str, separator: str = "\n\n", create_dirs: bool = True, heading: str | None = None) -> str:
     """Append content to a file."""
-    inp = VaultAppendInput(path=path, content=content, separator=separator, create_dirs=create_dirs)
+    inp = VaultAppendInput(path=path, content=content, separator=separator, create_dirs=create_dirs, heading=heading)
     return run_audited(
         "vault_append",
-        lambda: _vault_append(inp.path, inp.content, inp.separator, inp.create_dirs),
+        lambda: _vault_append(inp.path, inp.content, inp.separator, inp.create_dirs, inp.heading),
         path=inp.path,
     )
 

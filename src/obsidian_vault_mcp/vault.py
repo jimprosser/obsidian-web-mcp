@@ -2,6 +2,7 @@
 
 import fnmatch
 import os
+import re
 import shutil
 import stat
 import tempfile
@@ -265,6 +266,55 @@ def delete_path(relative_path: str) -> bool:
 
     shutil.move(str(path), str(dest))
     return True
+
+
+def _heading_level(line: str) -> int | None:
+    """Return the ATX heading level (1-6) of a line, or None if it isn't one."""
+    m = re.match(r"^(#{1,6})\s", line)
+    return len(m.group(1)) if m else None
+
+
+def find_heading_section(content: str, heading: str) -> tuple[int, int]:
+    """Locate the section body for an exact ATX heading line (e.g. "## Track 2").
+
+    `heading` must match a line in `content` exactly (after stripping surrounding
+    whitespace), markers included. Returns (body_start, body_end) character
+    offsets: body_start is right after the heading line, body_end is right
+    before the next heading of the same or shallower level (or end of file) --
+    i.e. the section includes any deeper-nested subheadings.
+
+    Raises ValueError if `heading` isn't a valid ATX heading line, isn't found,
+    or is found more than once.
+    """
+    heading = heading.strip()
+    level = _heading_level(heading)
+    if level is None:
+        raise ValueError(
+            f"heading must be an ATX heading line starting with '#' followed by a space: {heading!r}"
+        )
+
+    lines = content.splitlines(keepends=True)
+    matches = [i for i, line in enumerate(lines) if line.strip() == heading]
+
+    if not matches:
+        raise ValueError(f"Heading not found: {heading!r}")
+    if len(matches) > 1:
+        raise ValueError(
+            f"Heading {heading!r} matches {len(matches)} times -- heading text must be unique in the file"
+        )
+
+    start_line = matches[0]
+    body_start = sum(len(l) for l in lines[: start_line + 1])
+
+    end_line = len(lines)
+    for j in range(start_line + 1, len(lines)):
+        j_level = _heading_level(lines[j])
+        if j_level is not None and j_level <= level:
+            end_line = j
+            break
+
+    body_end = sum(len(l) for l in lines[:end_line])
+    return body_start, body_end
 
 
 def list_directory(
