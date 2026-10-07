@@ -27,7 +27,8 @@ from pathlib import Path
 from urllib.parse import quote, unquote
 
 from . import config
-from .vault import write_file_atomic
+from .tools.write import _unified_diff
+from .vault import resolve_vault_read_path, write_file_atomic
 
 logger = logging.getLogger(__name__)
 
@@ -59,18 +60,20 @@ def _strip_md(rel_path: str) -> str:
     return rel_path[:-3] if rel_path.endswith(".md") else rel_path
 
 
-def _basename_counts(pairs: list[tuple[str, str]]) -> dict[str, int]:
+def _basename_counts(pairs: list[tuple[str, str]], *, before_move: bool = False) -> dict[str, int]:
     """How many notes shared each basename BEFORE the move, for the ambiguity check.
 
     The move has already landed by the time we run, so counting the vault as it is
     now would miss the very collision we are guarding against: rename one of two
     `meeting.md` notes and the survivor looks unique. Undoing each pair restores
-    the pre-move picture.
+    the pre-move picture. A dry run counts before the move, so there is nothing to undo.
     """
     counts: dict[str, int] = {}
     for _, rel in _iter_markdown_files():
         stem = Path(rel).stem.lower()
         counts[stem] = counts.get(stem, 0) + 1
+    if before_move:
+        return counts
     for old, new in pairs:
         new_stem = Path(new).stem.lower()
         old_stem = Path(old).stem.lower()
@@ -150,21 +153,22 @@ def _relative_to(target_rel: str, linking_file_rel: str) -> str:
     return "/".join(ups + target_parts[common:])
 
 
-def _moved_pairs(source: str, destination: str) -> list[tuple[str, str]]:
+def _moved_pairs(source: str, destination: str, *, before_move: bool = False) -> list[tuple[str, str]]:
     """The (old_rel, new_rel) markdown files this move affects.
 
     A file move is one pair; a directory move is one pair per markdown file that
-    landed under the destination.
+    landed under the destination, or, for a dry run before the move, that sits
+    under the source.
     """
-    dest_path = config.VAULT_PATH / destination
-    if dest_path.is_dir():
+    moved_path = config.VAULT_PATH / (source if before_move else destination)
+    if moved_path.is_dir():
         pairs = []
-        for path in dest_path.rglob("*.md"):
+        for path in moved_path.rglob("*.md"):
             rel = path.relative_to(config.VAULT_PATH)
             if _is_excluded(rel.parts) or any(p.startswith(".") for p in rel.parts):
                 continue
-            inner = path.relative_to(dest_path).as_posix()
-            pairs.append((f"{source.rstrip('/')}/{inner}", rel.as_posix()))
+            inner = path.relative_to(moved_path).as_posix()
+            pairs.append((f"{source.rstrip('/')}/{inner}", (Path(destination) / inner).as_posix()))
         return pairs
     if destination.lower().endswith(".md"):
         return [(source, destination)]
@@ -246,45 +250,67 @@ def _rewrite_content(
     return content, rewrites, ambiguous
 
 
-def update_links_for_move(source: str, destination: str) -> dict:
+def update_links_for_move(source: str, destination: str, *, dry_run: bool = False) -> dict:
     """Repoint every link in the vault that referred to the moved path.
 
-    Returns a summary: the files changed, how many links were rewritten, and any bare-basename
-    links left alone because the basename is not unique. Never raises: a failure
-    to rewrite must not undo a move that already landed, so problems are logged
-    and reported in the summary.
+    Returns a summary: the files changed, how many links were rewritten, any bare-basename
+    links left alone because the basename is not unique, and any file whose write failed.
+    Never raises: a failure to rewrite must not undo a move that already landed, so
+    problems are logged and reported in the summary.
+
+    dry_run runs before the move and writes nothing: the summary names the files that
+    would change, and ``diffs`` holds a unified diff for each.
     """
-    summary = {"files_updated": 0, "links_updated": 0, "files": [], "ambiguous": []}
+    summary = {"files_updated": 0, "links_updated": 0, "files": [], "ambiguous": [], "failed": []}
+    if dry_run:
+        summary["diffs"] = {}
     try:
-        pairs = _moved_pairs(source, destination)
+        pairs = _moved_pairs(source, destination, before_move=dry_run)
         if not pairs:
             return summary
-        unique_basenames = _basename_counts(pairs)
-        moved_new_paths = {new for _, new in pairs}
+        unique_basenames = _basename_counts(pairs, before_move=dry_run)
+        moved_paths = {old if dry_run else new for old, new in pairs}
 
         for path, rel in _iter_markdown_files():
-            if rel in moved_new_paths:
+            if rel in moved_paths:
                 # A note may link to itself; its own links move with it and the
                 # target is the same file, so there is nothing to repoint.
                 continue
+            if path.is_symlink():
+                # The read paths' rule: a symlink may point outside the vault, and
+                # rewriting it would put that outside content into an ordinary vault file.
+                continue
             try:
+                # Refuses a hardlink, whose other name may sit outside the vault.
+                resolve_vault_read_path(rel)
                 if path.stat().st_size > config.MAX_CONTENT_SIZE:
                     continue
                 content = path.read_text(encoding="utf-8")
-            except (OSError, UnicodeDecodeError):
-                # Unreadable or not text: skipped on purpose, and counted nowhere,
-                # because a file we cannot read is a file we must not rewrite.
+            except (OSError, UnicodeDecodeError, ValueError):
+                # Unreadable, not text, or refused by the read guard: skipped on
+                # purpose, and counted nowhere, because a file we must not read is
+                # a file we must not rewrite.
                 continue
 
             new_content, rewrites, ambiguous = _rewrite_content(
                 content, rel, pairs, unique_basenames
             )
             summary["ambiguous"].extend(ambiguous)
-            if rewrites and new_content != content:
-                write_file_atomic(rel, new_content, create_dirs=False)
-                summary["files_updated"] += 1
-                summary["links_updated"] += rewrites
-                summary["files"].append(rel)
+            if not rewrites or new_content == content:
+                continue
+            if dry_run:
+                summary["diffs"][rel] = _unified_diff(rel, content, new_content)
+            else:
+                try:
+                    write_file_atomic(rel, new_content, create_dirs=False)
+                except Exception as e:
+                    # One bad file costs one file, not the rest of the pass.
+                    logger.error(f"update_links_for_move: write failed for {rel}: {e}")
+                    summary["failed"].append({"path": rel, "error": str(e)})
+                    continue
+            summary["files_updated"] += 1
+            summary["links_updated"] += rewrites
+            summary["files"].append(rel)
     except Exception as e:  # pragma: no cover - defensive, the move already landed
         logger.error(f"update_links_for_move error: {e}")
         summary["error"] = str(e)

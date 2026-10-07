@@ -216,13 +216,10 @@ def _place_atomic(relative_path: str, fill, create_dirs: bool, overwrite: bool) 
     return is_new
 
 
-def move_path(
-    source: str, destination: str, create_dirs: bool = True
-) -> bool:
-    """Move a file or directory from source to destination.
+def check_move(source: str, destination: str) -> tuple[Path, Path]:
+    """Validate a move without making it, raising exactly as move_path would.
 
-    Both paths are relative to the vault root. Raises if the destination
-    already exists.
+    Returns the resolved (source, destination).
     """
     src = resolve_vault_path(source)
     dst = resolve_vault_path(destination)
@@ -232,6 +229,19 @@ def move_path(
 
     if dst.exists():
         raise FileExistsError(f"Destination already exists: {destination}")
+
+    return src, dst
+
+
+def move_path(
+    source: str, destination: str, create_dirs: bool = True
+) -> bool:
+    """Move a file or directory from source to destination.
+
+    Both paths are relative to the vault root. Raises if the destination
+    already exists.
+    """
+    src, dst = check_move(source, destination)
 
     if create_dirs:
         dst.parent.mkdir(parents=True, exist_ok=True)
