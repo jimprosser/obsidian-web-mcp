@@ -9,6 +9,7 @@ from pathlib import Path
 import frontmatter
 
 from .. import config
+from ..content_extractors import DEFAULT_SEARCH_PATTERN, default_search_patterns
 from ..serialization import dumps
 from ..vault import resolve_vault_path, resolve_vault_read_path
 
@@ -18,16 +19,17 @@ logger = logging.getLogger(__name__)
 def _search_ripgrep(
     query: str,
     search_path: Path,
-    file_pattern: str,
+    file_pattern: list[str] | str,
     max_results: int,
     context_lines: int,
 ) -> list[dict]:
-    """Search using ripgrep for performance."""
+    """Search using ripgrep for performance. file_pattern: one glob or several (any match)."""
+    file_patterns = [file_pattern] if isinstance(file_pattern, str) else list(file_pattern)
     cmd = [
         "rg",
         "--json",
         f"--max-count={max_results}",
-        f"--glob={file_pattern}",
+        *(f"--glob={pattern}" for pattern in file_patterns),
         "-i",
         f"--context={context_lines}",
     ]
@@ -81,8 +83,10 @@ def _search_ripgrep(
     return matches
 
 
-def _iter_vault_files(search_path: Path, file_pattern: str):
-    """Yield files under search_path, honoring EXCLUDED_DIRS and the glob pattern.
+def _iter_vault_files(search_path: Path, file_pattern: list[str] | str):
+    """Yield files under search_path, honoring EXCLUDED_DIRS and the glob pattern(s).
+
+    file_pattern is one glob or several; a file matching any of them is yielded.
 
     Excluded and dot-prefixed directories are pruned without descending into
     them (a vault's .git can dwarf the vault itself), and symlinks are never
@@ -91,6 +95,8 @@ def _iter_vault_files(search_path: Path, file_pattern: str):
     """
     import fnmatch
     import os
+
+    file_patterns = [file_pattern] if isinstance(file_pattern, str) else list(file_pattern)
 
     def walk(directory):
         try:
@@ -104,7 +110,9 @@ def _iter_vault_files(search_path: Path, file_pattern: str):
                 continue
             if entry.is_dir(follow_symlinks=False):
                 yield from walk(entry.path)
-            elif entry.is_file(follow_symlinks=False) and fnmatch.fnmatch(entry.name, file_pattern):
+            elif entry.is_file(follow_symlinks=False) and any(
+                fnmatch.fnmatch(entry.name, pattern) for pattern in file_patterns
+            ):
                 yield Path(entry.path)
 
     yield from walk(search_path)
@@ -113,11 +121,11 @@ def _iter_vault_files(search_path: Path, file_pattern: str):
 def _search_python(
     query: str,
     search_path: Path,
-    file_pattern: str,
+    file_pattern: list[str] | str,
     max_results: int,
     context_lines: int,
 ) -> list[dict]:
-    """Fallback Python-based search."""
+    """Fallback Python-based search. file_pattern: one glob or several (any match)."""
     query_lower = query.lower()
     matches = []
 
@@ -196,11 +204,22 @@ def _get_frontmatter_excerpt(file_path: Path, max_keys: int = 3) -> dict | None:
 def vault_search(
     query: str,
     path_prefix: str | None = None,
-    file_pattern: str = "*.md",
+    file_pattern: str | None = None,
     max_results: int = 20,
     context_lines: int = 2,
 ) -> str:
-    """Search for text across vault file names and contents."""
+    """Search for text across vault file names and contents.
+
+    file_pattern=None means the default. Contents: notes plus the patterns extensions
+    registered (content_extractors.register_search_pattern). Names: notes only, because a
+    registered pattern usually names a derivative of a vault file (an OCR sidecar,
+    "scan.pdf.ocr.txt"), and matching those names would return a note and its sidecar
+    for every name query. An explicit file_pattern is used as given for both.
+    """
+    if file_pattern is not None:
+        content_patterns, name_pattern = [file_pattern], file_pattern
+    else:
+        content_patterns, name_pattern = default_search_patterns(), DEFAULT_SEARCH_PATTERN
     try:
         if path_prefix:
             search_path = resolve_vault_path(path_prefix)
@@ -210,16 +229,16 @@ def vault_search(
         if not search_path.is_dir():
             return dumps({"error": f"Search path is not a directory: {path_prefix}"})
 
-        name_candidates = _search_filenames(query, search_path, file_pattern, max_results)
+        name_candidates = _search_filenames(query, search_path, name_pattern, max_results)
 
         # Content matches keep a guaranteed share of the budget: a query that
         # is also a folder or date token can match many names, and those must
         # not starve the body hits clients relied on before name matching.
         content_budget = max_results - min(len(name_candidates), max_results // 2)
         if shutil.which("rg"):
-            content_matches = _search_ripgrep(query, search_path, file_pattern, content_budget, context_lines)
+            content_matches = _search_ripgrep(query, search_path, content_patterns, content_budget, context_lines)
         else:
-            content_matches = _search_python(query, search_path, file_pattern, content_budget, context_lines)
+            content_matches = _search_python(query, search_path, content_patterns, content_budget, context_lines)
 
         # Only content hits get the frontmatter excerpt. Name-only hits are
         # never read at all: the path locates the note, and reading it would
