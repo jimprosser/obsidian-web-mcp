@@ -15,7 +15,7 @@ pip install -e ".[dev]"
 pytest            # full suite must pass before you open a PR
 ```
 
-There is no CI on this repo. The test suite is the only gate, so a green local run is your evidence — say so in the PR.
+CI runs the same suite on every PR (`.github/workflows/test.yml`), and a first-time contributor's run waits for a maintainer to approve it. Run it locally first and say so in the PR.
 
 ## Scope and shape of a PR
 

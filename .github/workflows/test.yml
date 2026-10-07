@@ -12,10 +12,11 @@ jobs:
   pytest:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       # ripgrep so the search and hardlink tests run on the default backend instead of skipping
       - run: sudo apt-get update && sudo apt-get install -y ripgrep
-      - uses: astral-sh/setup-uv@v6
+      # setup-uv publishes no major-version tags since v8; pin the full version
+      - uses: astral-sh/setup-uv@v10.2.0
         with:
           python-version: "3.12"
       - run: uv run --extra dev pytest tests/ -q
