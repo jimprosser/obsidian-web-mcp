@@ -260,13 +260,12 @@ def _place_atomic(relative_path: str, fill, create_dirs: bool, overwrite: bool) 
     return is_new
 
 
-def move_path(
-    source: str, destination: str, create_dirs: bool = True
-) -> bool:
-    """Move a file or directory from source to destination.
+def check_move(source: str, destination: str, create_dirs: bool = True) -> tuple[Path, Path]:
+    """Validate a move without making it, so a dry run refuses what the move would.
 
-    Both paths are relative to the vault root. Raises if the destination
-    already exists.
+    Covers the move's own rules. A filesystem refusal (permissions, a file where a
+    parent directory should be) still surfaces only when the move runs.
+    Returns the resolved (source, destination).
     """
     src = resolve_vault_path(source)
     dst = resolve_vault_path(destination)
@@ -276,6 +275,25 @@ def move_path(
 
     if dst.exists():
         raise FileExistsError(f"Destination already exists: {destination}")
+
+    if src.is_dir() and src in dst.parents:
+        raise ValueError(f"Cannot move a directory into itself: {source} -> {destination}")
+
+    if not create_dirs and not dst.parent.is_dir():
+        raise FileNotFoundError(f"Destination directory does not exist: {Path(destination).parent}")
+
+    return src, dst
+
+
+def move_path(
+    source: str, destination: str, create_dirs: bool = True
+) -> bool:
+    """Move a file or directory from source to destination.
+
+    Both paths are relative to the vault root. Raises if the destination
+    already exists.
+    """
+    src, dst = check_move(source, destination, create_dirs)
 
     if create_dirs:
         dst.parent.mkdir(parents=True, exist_ok=True)

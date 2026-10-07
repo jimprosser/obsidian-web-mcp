@@ -289,6 +289,10 @@ class VaultMoveInput(BaseModel):
         default=True,
         description="Create destination parent directories if they don't exist",
     )
+    dry_run: bool = Field(
+        default=False,
+        description="Preview the link rewrites and their diffs without moving or writing anything",
+    )
 
 
 class VaultDeleteInput(BaseModel):

@@ -2,8 +2,9 @@
 
 import logging
 
+from ..links import update_links_for_move
 from ..serialization import dumps
-from ..vault import list_directory, move_path, delete_path
+from ..vault import check_move, list_directory, move_path, delete_path
 from ..write_events import fire_write
 
 logger = logging.getLogger(__name__)
@@ -35,13 +36,39 @@ def vault_list(
         return dumps({"error": str(e)})
 
 
-def vault_move(source: str, destination: str, create_dirs: bool = True) -> str:
-    """Move a file or directory within the vault."""
+def vault_move(source: str, destination: str, create_dirs: bool = True, dry_run: bool = False) -> str:
+    """Move or rename a file or directory within the vault.
+
+    Every reference to the moved note is repointed afterwards, the way Obsidian
+    does on a rename: a link that followed the note before the move follows it
+    after. The rewrite runs after the move and never undoes it, so if it fails
+    the summary says so and the move still stands.
+
+    dry_run moves nothing and writes nothing. It checks the move would be allowed
+    and returns the same links summary plus a diff for each file, so the caller
+    sees how many notes a move would edit before making it.
+    """
     try:
+        if dry_run:
+            check_move(source, destination, create_dirs)
+            return dumps({
+                "source": source,
+                "destination": destination,
+                "moved": False,
+                "dry_run": True,
+                "links": update_links_for_move(source, destination, dry_run=True),
+            })
         moved = move_path(source, destination, create_dirs=create_dirs)
         if moved:
             fire_write("moved", [source, destination])
-        return dumps({"source": source, "destination": destination, "moved": moved})
+        result = {"source": source, "destination": destination, "moved": moved}
+
+        if moved:
+            summary = update_links_for_move(source, destination)
+            result["links"] = summary
+            if summary["files_updated"]:
+                fire_write("updated", summary["files"])
+        return dumps(result)
     except ValueError as e:
         return dumps({"error": str(e), "source": source, "destination": destination})
     except Exception as e:
