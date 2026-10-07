@@ -177,14 +177,19 @@ def vault_write_binary(
 
 
 def _unified_diff(path: str, before: str, after: str) -> str:
-    """Return a compact unified diff for an edit preview or result."""
-    return "".join(difflib.unified_diff(
+    """Return a compact unified diff for an edit preview or result.
+
+    Every line ends in a newline, the headers and hunk markers included. A last line
+    with no newline of its own gets the standard marker, so the next line can't run
+    into it.
+    """
+    lines = difflib.unified_diff(
         before.splitlines(keepends=True),
         after.splitlines(keepends=True),
         fromfile=f"{path} before",
         tofile=f"{path} after",
-        lineterm="",
-    ))
+    )
+    return "".join(line if line.endswith("\n") else line + "\n\\ No newline at end of file\n" for line in lines)
 
 
 # A near-miss hint is only emitted when the closest line shares at least this

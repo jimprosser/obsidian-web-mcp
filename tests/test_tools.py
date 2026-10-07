@@ -65,6 +65,25 @@ def test_vault_edit_dry_run_returns_diff_without_writing(vault_dir):
     assert (vault_dir / "test-note.md").read_text() == before
 
 
+def test_vault_edit_diff_puts_each_header_on_its_own_line(vault_dir):
+    """The headers and the hunk marker each end in a newline, and a last line with
+    no newline is marked, so the diff reads like any other unified diff."""
+    (vault_dir / "plain.md").write_text("alpha\nbeta")
+
+    result = json.loads(vault_edit("plain.md", [{"old_text": "beta", "new_text": "gamma"}], dry_run=True))
+
+    assert result["diff"].splitlines() == [
+        "--- plain.md before",
+        "+++ plain.md after",
+        "@@ -1,2 +1,2 @@",
+        " alpha",
+        "-beta",
+        "\\ No newline at end of file",
+        "+gamma",
+        "\\ No newline at end of file",
+    ]
+
+
 def test_vault_edit_replaces_single_matching_fragment(vault_dir):
     """vault_edit changes only the requested fragment."""
     result = json.loads(vault_edit(
