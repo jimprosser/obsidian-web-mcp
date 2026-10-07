@@ -4,6 +4,7 @@ Covers the seam, not just the helper: every test drives `vault_move`, the tool a
 MCP client actually calls, so a disconnected wire fails here.
 """
 
+import asyncio
 import json
 import os
 
@@ -275,6 +276,8 @@ def test_dry_run_moves_and_writes_nothing(linked_vault):
         ("target.md", "renamed.md"),
         ("target.md", "archive/target.md"),
         ("projects", "archive/projects"),
+        ("./target.md", "./renamed.md"),
+        ("projects/", "archive/projects/"),
     ],
 )
 def test_dry_run_predicts_the_real_move(linked_vault, source, destination):
@@ -292,20 +295,59 @@ def test_dry_run_predicts_the_real_move(linked_vault, source, destination):
     assert preview["links"]["files"], "the case should rewrite something"
 
 
-def test_dry_run_of_a_move_that_would_fail_reports_the_error(linked_vault):
+def test_dot_slash_paths_match_like_plain_ones(linked_vault):
+    """`./target.md` passes the path guard, so it must match links the same way
+    `target.md` does, in the real move and in the dry run."""
+    preview = _move("./target.md", "./renamed.md", dry_run=True)
+    assert "+A markdown link [see](renamed.md)." in preview["links"]["diffs"]["linker.md"]
+
+    _move("./target.md", "./renamed.md")
+    assert "[see](renamed.md)" in (linked_vault / "linker.md").read_text()
+
+
+def test_dry_run_predicts_a_write_that_would_fail(linked_vault, monkeypatch):
+    """A rename to a longer name can push a file past the size limit. The real move
+    reports that file as failed, so the preview must too."""
+    monkeypatch.setattr(config, "MAX_CONTENT_SIZE", (linked_vault / "linker.md").stat().st_size)
+
+    preview = _move("target.md", "a-much-longer-name.md", dry_run=True)
+    real = _move("target.md", "a-much-longer-name.md")
+
+    assert [f["path"] for f in preview["links"]["failed"]] == ["linker.md"]
+    assert "linker.md" not in preview["links"]["diffs"]
+    expected = {k: v for k, v in preview["links"].items() if k != "diffs"}
+    assert expected == real["links"]
+
+
+@pytest.mark.parametrize(
+    "source, destination, kwargs, message",
+    [
+        ("target.md", "linker.md", {}, "Destination already exists"),
+        ("target.md", "missing/renamed.md", {"create_dirs": False}, "Destination directory does not exist"),
+        ("subfolder", "subfolder/inner", {}, "Cannot move a directory into itself"),
+    ],
+)
+def test_dry_run_refuses_what_the_move_would_refuse(linked_vault, source, destination, kwargs, message):
     before = _snapshot(linked_vault)
 
-    result = _move("target.md", "linker.md", dry_run=True)
+    preview = _move(source, destination, dry_run=True, **kwargs)
 
-    assert "Destination already exists" in result["error"]
+    assert message in preview["error"]
+    assert _snapshot(linked_vault) == before
+    assert "error" in _move(source, destination, **kwargs)
     assert _snapshot(linked_vault) == before
 
 
 def test_dry_run_reaches_the_registered_tool(linked_vault):
-    """The parameter is wired through the server tool and its input model."""
+    """The parameter is wired through the registered tool and its input model."""
     before = _snapshot(linked_vault)
 
-    result = json.loads(server.vault_move("target.md", "renamed.md", dry_run=True))
+    result = asyncio.run(
+        server.mcp.call_tool("vault_move", {"source": "target.md", "destination": "renamed.md", "dry_run": True})
+    )
+    if isinstance(result, tuple):
+        result = result[0]
+    result = json.loads("".join(getattr(block, "text", "") for block in result))
 
     assert result["dry_run"] is True
     assert "linker.md" in result["links"]["diffs"]

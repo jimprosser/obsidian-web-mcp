@@ -262,6 +262,8 @@ def update_links_for_move(source: str, destination: str, *, dry_run: bool = Fals
     would change, and ``diffs`` holds a unified diff for each.
     """
     summary = {"files_updated": 0, "links_updated": 0, "files": [], "ambiguous": [], "failed": []}
+    # Name both the way the walk names files: "a.md", never "./a.md" or "dir/".
+    source, destination = Path(source).as_posix(), Path(destination).as_posix()
     if dry_run:
         summary["diffs"] = {}
     try:
@@ -299,6 +301,14 @@ def update_links_for_move(source: str, destination: str, *, dry_run: bool = Fals
             if not rewrites or new_content == content:
                 continue
             if dry_run:
+                size = len(new_content.encode("utf-8"))
+                if size > config.MAX_CONTENT_SIZE:
+                    # write_file_atomic would refuse it; report what the real move would.
+                    summary["failed"].append({
+                        "path": rel,
+                        "error": f"Content size {size} bytes exceeds limit of {config.MAX_CONTENT_SIZE} bytes",
+                    })
+                    continue
                 summary["diffs"][rel] = _unified_diff(rel, content, new_content)
             else:
                 try:

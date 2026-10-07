@@ -50,7 +50,7 @@ def vault_move(source: str, destination: str, create_dirs: bool = True, dry_run:
     """
     try:
         if dry_run:
-            check_move(source, destination)
+            check_move(source, destination, create_dirs)
             return dumps({
                 "source": source,
                 "destination": destination,
