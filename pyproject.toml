@@ -1,6 +1,6 @@
 [project]
 name = "obsidian-web-mcp"
-version = "0.2.0"
+version = "0.4.0"
 description = "Secure remote MCP server for Obsidian vaults -- access your notes from Claude, your phone, or any MCP client, anywhere"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -16,6 +16,13 @@ dependencies = [
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
+]
+cloudflare-access = [
+    # mcp already ships pyjwt[crypto]>=2.10.1; this extra's job is the FLOOR, not the
+    # install. 2.13 preserves the JWKS cache on fetch errors; 2.14 adds redirect
+    # rejection and unknown-kid refresh rate-limiting. Below 2.14 all three regress.
+    "pyjwt>=2.14",
+    "cryptography>=42",
 ]
 
 [project.scripts]

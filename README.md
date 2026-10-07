@@ -39,13 +39,122 @@ This is a server that provides network access to your personal notes. Security i
 
 **A human logs in before any client is authorized.** Connecting a client uses the OAuth 2.0 authorization-code + PKCE flow, which opens a browser at `/oauth/authorize`. There, you must sign in with `VAULT_OAUTH_USERNAME` / `VAULT_OAUTH_PASSWORD` before the server issues an authorization code -- the password is required on every authorization. Every subsequent MCP tool call is then validated against a bearer token. No authorization code is issued to an unauthenticated visitor, and no request reaches a tool function without a valid token. **If `VAULT_OAUTH_PASSWORD` is not set, the server fails closed and refuses to authorize anyone** -- there is no anonymous auto-approve.
 
+**Failed logins and client registrations are rate-limited, globally.** After 10 failed password attempts within 15 minutes, `/oauth/authorize` refuses every login, the correct password included, until the window passes; `/oauth/register` accepts at most 20 registrations an hour. The trade-off: someone hammering the login can hold it closed for the owner for that long, but tokens already issued keep working, so connected clients are unaffected.
+
 **Your vault is never exposed directly to the internet.** The recommended deployment uses a Cloudflare Tunnel -- an outbound-only encrypted connection. Your machine opens no inbound ports, and the server itself binds to loopback (`127.0.0.1`) by default. The login above is the authentication boundary; you can additionally layer Cloudflare Access (SSO, device posture, IP restrictions) on top for defense in depth.
+
+### Cloudflare Access mode (opt-in)
+
+Instead of the built-in password login + static bearer token, you can hand
+authentication entirely to **Cloudflare Access**. Cloudflare authenticates the user at
+its edge (per-identity SSO / one-time-PIN) and, on every request it forwards through the
+tunnel, injects a signed `Cf-Access-Jwt-Assertion` header carrying the caller's identity.
+The server's only job is to verify that header.
+
+**Enable it** by setting **both** of these (both-or-neither — if either is unset the mode
+is off and the server behaves exactly as it does by default):
+
+| Setting | Description |
+|---------|-------------|
+| `VAULT_MCP_CF_ACCESS_TEAM_DOMAIN` | Your Cloudflare team domain, e.g. `myteam.cloudflareaccess.com` (a bare `myteam` or a full URL is accepted). |
+| `VAULT_MCP_CF_ACCESS_AUD` | The Access application **audience (AUD)** tag from the Cloudflare dashboard. |
+
+Install the extra:
+
+```bash
+pip install 'obsidian-web-mcp[cloudflare-access]'
+```
+
+The base install already pulls PyJWT (via `mcp`); the extra's job is to enforce the
+**version floor** (`pyjwt>=2.14`, where JWKS redirect rejection, unknown-kid refresh
+rate-limiting, and cache-preserve-on-fetch-error are all in place) and to add
+`cryptography` for RS256 verification.
+
+#### Setting up Cloudflare (Managed OAuth)
+
+This walkthrough exposes the server through a Cloudflare Tunnel and puts Cloudflare
+Access + Managed OAuth in front of it, so an MCP client (e.g. Claude) authenticates
+against Cloudflare and Cloudflare injects the `Cf-Access-Jwt-Assertion` header the server
+verifies. It also shows where the two settings above come from.
+
+1. **Create the Access application.** In the Cloudflare dashboard go to
+   **Access → Access Controls → Create new application → Self-hosted and private →
+   Private destinations**. Set the **subdomain** (e.g. `my-vault-mcp`), the **domain** to
+   one you own (`domain-you-own.com`), and leave the **path** empty. This is the public
+   hostname (`my-vault-mcp.domain-you-own.com`) that your Cloudflare Tunnel forwards to the
+   server on loopback.
+2. **Enable an identity provider.** For the simplest setup, use the built-in
+   **`onetimepin`** provider, which emails a one-time code — enable it under
+   **Access → Identity providers**. (Any other SSO provider works too.)
+3. **Restrict who can get in.** Add an Access **policy** that allows only your own email
+   address (an *Allow* rule with an `Emails` / `Include` condition). This is your
+   per-identity, revocable gate — kill it in the dashboard to cut off access, no redeploy.
+4. **Enable Managed OAuth.** On the application's **Advanced settings** tab, turn on
+   **Managed OAuth** (it is opt-in for self-hosted applications). In **Allowed redirect
+   URIs** — the allowlist for dynamically-registered OAuth clients; entries must use
+   `https` and may end in `/*` — add the Claude client callbacks:
+   - `https://claude.ai/api/mcp/auth_callback`
+   - `https://claude.com/api/mcp/auth_callback`
+5. **Set sensible token lifetimes** (also on **Advanced settings**). Cloudflare uses two
+   durations: **Access token lifetime** (how long each token authenticates a request;
+   default is short, 5–15 min) and **Grant session duration** (how long the refresh token
+   lives; Cloudflare suggests 1–2 weeks for agent/CLI use). Raise the **Grant session
+   duration** so clients are not forced to re-authenticate too often — the refresh happens
+   silently while Cloudflare re-evaluates your policy on each new token.
+6. **Copy the two server settings.** Take the **AUD** from the application's **AUD tag**
+   tab → `VAULT_MCP_CF_ACCESS_AUD`. Find your **team domain** under **Access → Settings**
+   (it looks like `something.cloudflareaccess.com`) → `VAULT_MCP_CF_ACCESS_TEAM_DOMAIN`.
+
+Cloudflare's own guidance confirms the origin's role here: for MCP applications, "the MCP
+server must validate the Access JWT sent in the `Cf-Access-Jwt-Assertion` header" — which
+is exactly what this mode does (RS256 signature against the team's rotating keys at
+`/cdn-cgi/access/certs`, plus `iss`/`aud`/`exp`). See Cloudflare's
+[Managed OAuth](https://developers.cloudflare.com/cloudflare-one/access-controls/applications/http-apps/managed-oauth/)
+and [Validate JWTs](https://developers.cloudflare.com/cloudflare-one/access-controls/applications/http-apps/authorization-cookie/validating-json/)
+docs for the authoritative reference.
+
+Also set `VAULT_MCP_ALLOWED_HOSTS` to that public hostname (e.g.
+`my-vault-mcp.domain-you-own.com`) — the transport's host-allowlist is still enforced in
+this mode. In Claude, add the MCP server using the public URL; Cloudflare's Managed OAuth
+handles the login and forwards authenticated requests to the origin.
+
+When the mode is **on**:
+
+- Every request (except the `/health` liveness probe) must carry a valid
+  `Cf-Access-Jwt-Assertion`. The server verifies its **signature, expiry, audience, and
+  issuer** against Cloudflare's published keys (`https://<team-domain>/cdn-cgi/access/certs`).
+  Anything missing, malformed, expired, wrong-signature, or wrong-audience is rejected
+  with `401`. It **fails closed** — there is no fallback to unauthenticated access or to
+  the static bearer.
+- The app's **own OAuth flow is not served**: the `/oauth/*` routes and the
+  `/.well-known/oauth-*` discovery endpoints are not mounted, and `VAULT_MCP_TOKEN` is not
+  accepted. Cloudflare is the sole auth authority, so there is no public password endpoint
+  to brute-force.
+- The audit log records the caller's **identity** instead of a shared-token hash: the
+  token's `email` claim, or for service tokens its `common_name` (their `sub` is empty),
+  falling back to `sub`. In this mode the audit record's `client_id` field is that
+  **plaintext identity** and `token_id_hash` is its hash.
+
+> **Run it behind Cloudflare — keep the origin unreachable directly.** The signature
+> proves the token is *authentic* (Cloudflare minted it for your team + AUD, and the
+> server rejects anything else); it does **not** prove the *request* transited Cloudflare.
+> An attacker cannot forge a token — they lack Cloudflare's signing key — but a valid,
+> unexpired assertion is just a bearer string. If one leaks (logs, a proxy, a compromised
+> client) or is replayed by a lower-trust user, hitting the origin directly would validate
+> it while bypassing Cloudflare's **Access policy** (per-identity allow-list, device
+> posture, IP rules), its **rate-limiting / bot protection**, and the containment of the
+> token's replay window. The edge is what enforces the policy; the origin only checks
+> authenticity. So keep the server on loopback behind the Cloudflare Tunnel (the default),
+> with `VAULT_MCP_FORWARDED_ALLOW_IPS` trusting only the local proxy — that, not the
+> signature check, is what makes the policy binding.
 
 **Path traversal is blocked at the filesystem layer.** Every file operation resolves paths against the vault root directory and rejects any attempt to escape it -- `..` traversal, symlink following, null byte injection, and dotfile access (`.obsidian`, `.git`, `.trash`) are all caught before they reach the filesystem. The server will never read or write outside your vault directory.
 
 **Writes are atomic.** Every file write goes to a temporary file first, then atomically replaces the target via `os.replace()`. This guarantees that neither Obsidian nor Obsidian Sync ever sees a partially-written file -- the operation either completes fully or doesn't happen at all.
 
 **Safety limits prevent abuse.** Writes are capped at 1MB per file, batch operations at 20 files per request, and search results at 50 matches. Deletions are soft -- files move to `.trash/` rather than being permanently removed, matching Obsidian's own behavior. The delete tool also requires an explicit `confirm=true` parameter as a safety gate.
+
+**The signed upload route is the one unauthenticated write path, it is off unless configured, and it is narrow.** It exists only when `VAULT_UPLOAD_URL_SECRET` is set. Only `POST /upload/<id>` with exactly one id segment skips the bearer check; the URL's HMAC signature is the authorization. The grant (id, signature, expiry, single use) is validated before a single body byte is read, the body streams to a temp file outside the vault and is cut off at the grant's size cap, and the grant is checked again immediately before the file is placed. `/upload` is reserved: `VAULT_MCP_PATH` cannot be mounted under it, and an extension route whose path is `/upload` or starts with `/upload/` is rejected at startup, literal or parameterized. Committed uploads are audited and fire write events; refused requests are only logged. The signature is redacted from the access log.
 
 **Hardlinked files are refused on read.** Files with more than one hardlink (`st_nlink > 1`) cannot be read or returned by text search, including frontmatter excerpts. Legitimate in-vault hardlinks are not supported.
 
@@ -59,12 +168,13 @@ Found a vulnerability? Please report it privately rather than opening a public i
 |------|-------------|
 | `vault_read` | Read a file, returning content, metadata, and parsed YAML frontmatter |
 | `vault_batch_read` | Read multiple files in one call; handles missing files gracefully |
-| `vault_write` | Write a file with optional frontmatter merging; creates parent dirs |
+| `vault_write` | Write a file with optional frontmatter merging; creates parent dirs; `overwrite: false` for create-only (never replaces, also under concurrent calls) |
+| `vault_request_upload_url` | Get a short-lived, single-use signed URL, then `POST` a file's raw bytes to it. For images and PDFs too large to send base64-encoded through `vault_write_binary`; the bytes never pass through the conversation. See [Signed uploads](#signed-uploads) |
 | `vault_write_binary` | Write an allowed binary file (image/PDF) to the vault from base64 content; enforces a media-type allowlist (declared type/extension, not byte-sniffed) and size cap, writes atomically |
-| `vault_edit` | Patch a file with ordered exact text replacements (token-efficient partial edits); supports dry-run diff previews |
+| `vault_edit` | Patch a file with ordered exact text replacements (token-efficient partial edits); supports dry-run diff previews, and an opt-in `replace_all` per edit for renaming a term across a note |
 | `vault_append` | Append content to the end of a file without resending the existing body; creates the file when missing |
 | `vault_batch_frontmatter_update` | Update YAML frontmatter fields on multiple files without touching body content |
-| `vault_search` | Full-text search across vault files (uses ripgrep if available, falls back to Python) |
+| `vault_search` | Full-text search across vault files, matching note names/paths as well as contents (uses ripgrep if available, falls back to Python) |
 | `vault_search_frontmatter` | Query the in-memory frontmatter index by field value, substring, or field existence |
 | `vault_list` | List directory contents with recursion depth, glob filtering, and file/dir toggles |
 | `vault_move` | Move or rename a file or directory within the vault, repointing the links that pointed at it the way Obsidian does on a rename |
@@ -119,8 +229,8 @@ All configuration is via environment variables:
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
 | `VAULT_PATH` | Yes | `~/Obsidian/MyVault` | Absolute path to your Obsidian vault directory |
-| `VAULT_MCP_TOKEN` | Yes | (none) | 256-bit bearer token validated on every MCP request |
-| `VAULT_OAUTH_PASSWORD` | **Yes** | (none) | Password for the interactive login at `/oauth/authorize`. **If unset, the server refuses to authorize any client (fail-closed).** |
+| `VAULT_MCP_TOKEN` | Yes¹ | (none) | 256-bit bearer token validated on every MCP request. ¹Not used (and not required) in [Cloudflare Access mode](#cloudflare-access-mode-opt-in). |
+| `VAULT_OAUTH_PASSWORD` | **Yes**¹ | (none) | Password for the interactive login at `/oauth/authorize`. **If unset, the server refuses to authorize any client (fail-closed).** ¹Not used in [Cloudflare Access mode](#cloudflare-access-mode-opt-in), where the app's own OAuth is not served. |
 | `VAULT_OAUTH_USERNAME` | No | `obsidian` | Username for the interactive login |
 | `VAULT_MCP_HOST` | No | `127.0.0.1` | Bind address. Loopback by default; set `0.0.0.0` only for deliberate LAN exposure |
 | `VAULT_MCP_PORT` | No | `8420` | Port the HTTP server listens on |
@@ -131,6 +241,8 @@ All configuration is via environment variables:
 | `VAULT_OAUTH_CLIENT_ID` | No | `vault-mcp-client` | Client ID for the headless `client_credentials` grant |
 | `VAULT_OAUTH_CLIENT_SECRET` | No | (none) | Only required for the headless `client_credentials` grant. The Claude/ChatGPT browser flow uses dynamic client registration and does **not** need this. |
 | `VAULT_OAUTH_REDIRECT_URIS` | No | (none) | Comma-separated allowlist of redirect URIs for the static `VAULT_OAUTH_CLIENT_ID` when using the browser flow. Dynamically-registered clients (Claude/ChatGPT) carry their own; leave unset unless you connect a static client through `/oauth/authorize`. |
+| `VAULT_MCP_CF_ACCESS_TEAM_DOMAIN` | No | (none) | Cloudflare team domain, e.g. `myteam.cloudflareaccess.com` (a bare `myteam` or a full URL is accepted). Set **together with** `VAULT_MCP_CF_ACCESS_AUD` to enable [Cloudflare Access mode](#cloudflare-access-mode-opt-in) (both-or-neither; if either is unset the mode is off). When on, the app's own OAuth routes are not served and `VAULT_MCP_TOKEN` / `VAULT_OAUTH_*` are unused — Cloudflare is the sole auth authority. **Validated at startup:** a malformed domain fails the server closed with a clear message. Requires the `cloudflare-access` extra (missing → fail closed at startup). |
+| `VAULT_MCP_CF_ACCESS_AUD` | No | (none) | Cloudflare Access application **audience (AUD)** tag (from the application's *AUD tag* tab). The second half of Cloudflare Access mode; see `VAULT_MCP_CF_ACCESS_TEAM_DOMAIN` above. |
 | `VAULT_DAILY_NOTES_FOLDER` | No | (none) | Folder for the daily-note tools; empty means the vault root |
 | `VAULT_DAILY_NOTES_FORMAT` | No | `%Y-%m-%d` | `strftime` pattern for the daily-note filename |
 | `VAULT_DAILY_NOTES_TEMPLATE` | No | (none) | `strftime` template prepended when a daily note is first created |
@@ -138,8 +250,27 @@ All configuration is via environment variables:
 | `VAULT_MCP_HEARTBEAT_INTERVAL` | No | `60` | Seconds between heartbeat pings. Must be a positive integer; a bad value fails closed at startup. Only used when `VAULT_MCP_HEARTBEAT_URL` is set. |
 | `VAULT_AUDIT_LOG_PATH` | No | (none) | Append-only JSONL audit log of vault mutations. When set, every mutation appends one record; empty disables auditing. The raw bearer token is never written -- only its SHA-256 hash. Must resolve **outside** the vault and be writable; otherwise the server **fails closed** at startup. See [Audit logging](#audit-logging). |
 | `VAULT_AUDIT_LOG_INCLUDE_READS` | No | `false` | Also record read/search operations (`1`/`true`/`yes`/`on`). Off by default; mutations are always logged once the audit log is enabled. |
+| `VAULT_EXTRA_BINARY_MEDIA_TYPES_JSON` | No | (none) | Extra media types for `vault_write_binary` and signed uploads, as a JSON object mapping a media type to its extensions, e.g. `{"application/vnd.openxmlformats-officedocument.wordprocessingml.document": [".docx"]}`. Only adds to the built-in images and PDF, never replaces them. **Validated at startup:** malformed JSON, a value that is not a list, an extension without a leading dot, or a text extension the write tools own (`.md`, `.markdown`, `.canvas`, `.base`, `.txt`) or `.svg` stops the server with the variable's name. |
+| `VAULT_UPLOAD_MAX_BYTES` | No | `100000000` | Largest file a signed upload URL can accept. Independent of the 10 MB `vault_write_binary` limit, because the body streams to disk instead of travelling base64-encoded through a tool argument. |
+| `VAULT_UPLOAD_URL_SECRET` | No | _(none)_ | **Master switch for signed uploads.** HMAC key for upload URLs. With it unset there is no upload tool, no upload route and no bearer-exempt path; there is no fallback to `VAULT_MCP_TOKEN`. |
+| `VAULT_UPLOAD_URL_TTL_SECONDS` | No | `900` | Default lifetime of an upload URL. |
+| `VAULT_UPLOAD_URL_MAX_TTL_SECONDS` | No | `3600` | Upper bound for a requested lifetime. |
+| `VAULT_UPLOAD_STAGING_DIR` | No | `~/.local/share/vault-mcp/uploads` | Where grants and in-flight bodies live, owner-only (0700). Must resolve outside the vault, or the server refuses to start. |
+
+With signed uploads enabled, the four settings above are validated at startup: a value that is not a positive integer, a maximum lifetime below the default lifetime, or a staging directory inside the vault stops the server with the variable's name.
 
 Generate secrets with: `python -c "import secrets; print(secrets.token_hex(32))"`
+
+## Signed uploads
+
+**Off by default.** The route answers without a bearer token, so it exists only once you set `VAULT_UPLOAD_URL_SECRET`. Upgrading the server does not turn it on.
+
+`vault_write_binary` carries a file base64-encoded inside a tool argument, so the file travels through the model's context. A few megabytes is more than clients carry in practice. For those files:
+
+1. The client calls `vault_request_upload_url(path, media_type, max_size_bytes)` and gets `upload_url`.
+2. It sends the raw bytes: `curl -X POST -H "Content-Type: application/pdf" --data-binary @file.pdf "<upload_url>"`.
+
+The URL is valid once, for the declared path, media type and size, until it expires. Multipart form uploads are refused; send the raw body. Set `VAULT_MCP_PUBLIC_URL` so the returned URL points at your public hostname. The signed URL is a credential while it lives: the access log shows the path with its query string redacted, and the server never logs the signature.
 
 ## Audit logging
 
@@ -389,6 +520,27 @@ Two things worth knowing:
   `vault_append`, `vault_batch_frontmatter_update` and `vault_write(merge_frontmatter=True)`
   read in order to write back and would otherwise replace the binary with its extracted text.
   With nothing registered, reads are byte-identical to stock.
+- **Extension tools join the audit log.** The built-in tools run through
+  `audit.run_audited(operation, func, **context)`, which records a mutation with before/after
+  size and checksum, and a read only when `VAULT_AUDIT_LOG_INCLUDE_READS` is on. An extension
+  tool gets the same treatment by declaring its name once, from `register_tools`:
+  `audit.register_audit_operation("my_tool", kind="mutation")` (or `kind="read"`), then
+  returning `run_audited("my_tool", work, path=path)`. Without the declaration the wrapper is a
+  passthrough, because the log only covers operation names it knows. A built-in name cannot
+  be re-registered, and registering a name twice with a different kind raises. `func` must
+  be synchronous: the record is written when it returns, so a coroutine is refused with
+  `TypeError` rather than logged before its work has run.
+
+#### Community extensions
+
+Extensions built on the seam by other people. They are not maintained or reviewed here;
+they run in-process with the server's full privileges, so read the code before you load one.
+"Tested against" is the lowest server version the extension's own suite was run against.
+
+| Extension | What it adds | Tested against |
+|---|---|---|
+| [obsidian-web-mcp-fts](https://github.com/sebastian-stadelmann/obsidian-web-mcp-fts) | `vault_fts_search`: ranked full-text search on SQLite FTS5 (BM25, stemming, further languages additive). Read-only, no routes; the index file must live outside the vault. | v0.3.0 |
+| [obsidian-vault-mcp-ext](https://github.com/mleitnercom/obsidian-vault-mcp-ext) | Template rendering (`{{var}}`, not full Templater), hybrid semantic search (FAISS + BM25, optional `[semantic]` extra), recurring-task materialisation, URL and file import (SSRF-hardened, off by default), markdown encoding repair and directory soft-delete, OCR for screenshots and scanned PDFs through the content-extractor seam. | v0.3.0 |
 
 ## VPS Setup With Cloudflare Origin TLS + Caddy Reverse Proxy
 

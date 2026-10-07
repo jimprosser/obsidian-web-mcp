@@ -1,8 +1,13 @@
 """Pydantic input models for obsidian-vault-mcp tool endpoints."""
 
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, StringConstraints, field_validator, model_validator
+
+# File content is written byte for byte. The models strip surrounding whitespace from their
+# string fields, which is right for paths and names and wrong for a note: stripped, every
+# note lost its trailing newline and a note starting with indented text lost the indent (#99).
+VerbatimText = Annotated[str, StringConstraints(strip_whitespace=False)]
 
 from .config import (
     CONTEXT_LINES,
@@ -39,7 +44,7 @@ class VaultWriteInput(BaseModel):
         min_length=1,
         max_length=500,
     )
-    content: str = Field(
+    content: VerbatimText = Field(
         ...,
         description="Full file content to write",
         max_length=MAX_CONTENT_SIZE,
@@ -51,6 +56,13 @@ class VaultWriteInput(BaseModel):
     merge_frontmatter: bool = Field(
         default=False,
         description="If true, merge YAML frontmatter with existing file's frontmatter instead of replacing",
+    )
+    overwrite: bool = Field(
+        default=True,
+        description=(
+            "If false, create only: an existing file is never replaced (also under concurrent "
+            "calls) and the call reports it instead"
+        ),
     )
 
 
@@ -118,6 +130,33 @@ def normalize_edit_aliases(data: Any) -> Any:
     return normalized
 
 
+class VaultRequestUploadUrlInput(BaseModel):
+    """Request a short-lived signed URL for a direct binary upload."""
+
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    path: str = Field(..., description="Relative path from vault root", min_length=1, max_length=500)
+    media_type: str = Field(
+        ...,
+        description="MIME type of the binary content; must be in the server's allowlist",
+        min_length=3,
+        max_length=200,
+    )
+    max_size_bytes: int = Field(
+        ...,
+        ge=1,
+        description="Maximum byte size the signed URL will accept (capped by VAULT_UPLOAD_MAX_BYTES)",
+    )
+    overwrite: bool = Field(default=False, description="Overwrite an existing file at the target path")
+    create_dirs: bool = Field(default=True, description="Create parent directories if they don't exist")
+    expected_sha256: str | None = Field(
+        default=None, description="Optional SHA-256 hex digest the uploaded bytes must match"
+    )
+    ttl_seconds: int | None = Field(
+        default=None, ge=1, description="Requested URL lifetime in seconds (clamped to the server max)"
+    )
+
+
 class VaultEditOperationInput(BaseModel):
     """Replace one exact text fragment inside a vault file."""
 
@@ -138,6 +177,13 @@ class VaultEditOperationInput(BaseModel):
         ...,
         description="Replacement text for old_text",
         max_length=MAX_CONTENT_SIZE,
+    )
+    replace_all: bool = Field(
+        default=False,
+        description=(
+            "Replace every occurrence of old_text instead of requiring exactly one. "
+            "Zero matches is still an error."
+        ),
     )
 
 
@@ -269,7 +315,7 @@ class VaultSearchInput(BaseModel):
 
     query: str = Field(
         ...,
-        description="Search string to find in file contents",
+        description="Search string to find in note names/paths and file contents",
         min_length=1,
         max_length=200,
     )

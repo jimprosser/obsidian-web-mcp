@@ -13,6 +13,7 @@ import time
 import urllib.parse
 import urllib.request
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
@@ -28,17 +29,15 @@ from .config import (
     VAULT_MCP_TOKEN,
     VAULT_PATH,
 )
+from . import config
 from .frontmatter_index import FrontmatterIndex
 from .audit import (
-    BATCH_OPERATIONS,
-    MUTATION_OPERATIONS,
+    run_audited,
     audit_enabled,
     audit_log_path,
     audit_path_inside_vault,
     audit_path_writable,
-    before_target_path,
     build_audit_record,
-    infer_target_path,
     should_audit_operation,
     snapshot_path,
     write_audit_record,
@@ -143,6 +142,12 @@ from .tools.write import (
     vault_write as _vault_write,
     vault_write_binary as _vault_write_binary,
 )
+from .tools.upload import (
+    commit_direct_upload,
+    upload_dir,
+    validate_upload_grant,
+    vault_request_upload_url as _vault_request_upload_url,
+)
 from .tools.search import vault_search as _vault_search, vault_search_frontmatter as _vault_search_frontmatter
 from .tools.manage import vault_list as _vault_list, vault_move as _vault_move, vault_delete as _vault_delete
 from .tools.canvas import (
@@ -165,6 +170,7 @@ from .models import (
     VaultReadInput,
     VaultWriteInput,
     VaultWriteBinaryInput,
+    VaultRequestUploadUrlInput,
     VaultEditInput,
     VaultEditOperationInput,
     VaultAppendInput,
@@ -184,111 +190,6 @@ from .models import (
 )
 
 
-def _parse_tool_result(result: str) -> dict:
-    """Parse a tool's JSON result into a dict, or {} when it is not a JSON object."""
-    try:
-        payload = json.loads(result)
-    except (ValueError, TypeError):
-        return {}
-    return payload if isinstance(payload, dict) else {}
-
-
-def _run_audited(operation: str, func, **context) -> str:
-    """Run a tool and emit audit records when auditing covers this operation.
-
-    A straight passthrough when auditing is off (no log path) or the operation is a read
-    and read-audit is disabled, so there is no cost on the default path. For mutations the
-    target is snapshotted (size + checksum) before and after; reads capture the target as
-    it is read. Batch mutations emit one record per file (see _run_audited_batch). An
-    audit-write failure is swallowed inside write_audit_record so the trail can never break
-    the tool result.
-    """
-    if not should_audit_operation(operation):
-        return func()
-
-    if operation in BATCH_OPERATIONS:
-        return _run_audited_batch(operation, func, context)
-
-    is_mutation = operation in MUTATION_OPERATIONS
-    before = snapshot_path(before_target_path(operation, context)) if is_mutation else None
-
-    try:
-        result = func()
-    except Exception:
-        write_audit_record(build_audit_record(
-            operation=operation,
-            target_path=infer_target_path(operation, context),
-            before=before,
-            operation_status="error",
-            error="tool exception",
-        ))
-        raise
-
-    parsed = _parse_tool_result(result)
-    target_path = infer_target_path(operation, context, parsed)
-    status = "error" if "error" in parsed else "success"
-    error = parsed.get("error") if status == "error" else None
-    if is_mutation:
-        record = build_audit_record(
-            operation=operation, target_path=target_path, before=before,
-            after=snapshot_path(target_path), operation_status=status, error=error,
-        )
-    else:
-        record = build_audit_record(
-            operation=operation, target_path=target_path,
-            before=snapshot_path(target_path), operation_status=status, error=error,
-        )
-    write_audit_record(record)
-    return result
-
-
-def _run_audited_batch(operation: str, func, context: dict) -> str:
-    """Audit a batch mutation as one record per file with correct per-file status.
-
-    The batch tools report per-file outcomes inside ``results`` (some files can fail while
-    the call as a whole "succeeds"), so a single top-level record would both hide partial
-    failures and lose per-file snapshots. Each file gets its own before/after snapshot and
-    its own operation_status.
-    """
-    paths = [p for p in (context.get("paths") or []) if isinstance(p, str) and p]
-    before_map = {p: snapshot_path(p) for p in paths}
-
-    try:
-        result = func()
-    except Exception:
-        for p in paths:
-            write_audit_record(build_audit_record(
-                operation=operation, target_path=p, before=before_map.get(p),
-                operation_status="error", error="tool exception",
-            ))
-        raise
-
-    parsed = _parse_tool_result(result)
-    items = parsed.get("results")
-    if not isinstance(items, list) or not items:
-        # A tool-level failure (e.g. validation) before any per-file work ran.
-        write_audit_record(build_audit_record(
-            operation=operation, target_path=paths or None,
-            operation_status="error" if "error" in parsed else "success",
-            error=parsed.get("error"),
-        ))
-        return result
-
-    for item in items:
-        if not isinstance(item, dict):
-            continue
-        path = item.get("path")
-        item_error = item.get("error")
-        item_status = "error" if item_error else "success"
-        before = before_map.get(path) if isinstance(path, str) else None
-        after = snapshot_path(path) if (item_status == "success" and isinstance(path, str)) else None
-        write_audit_record(build_audit_record(
-            operation=operation, target_path=path, before=before, after=after,
-            operation_status=item_status, error=item_error,
-        ))
-    return result
-
-
 @mcp.tool(
     name="vault_read",
     description="Read a file from the Obsidian vault, returning content, metadata, and parsed YAML frontmatter.",
@@ -297,7 +198,7 @@ def _run_audited_batch(operation: str, func, context: dict) -> str:
 def vault_read(path: str) -> str:
     """Read a file from the vault."""
     inp = VaultReadInput(path=path)
-    return _run_audited("vault_read", lambda: _vault_read(inp.path), path=inp.path)
+    return run_audited("vault_read", lambda: _vault_read(inp.path), path=inp.path)
 
 
 @mcp.tool(
@@ -308,37 +209,97 @@ def vault_read(path: str) -> str:
 def vault_batch_read(paths: list[str], include_content: bool = True) -> str:
     """Read multiple files at once."""
     inp = VaultBatchReadInput(paths=paths, include_content=include_content)
-    return _run_audited("vault_batch_read", lambda: _vault_batch_read(inp.paths, inp.include_content))
+    return run_audited("vault_batch_read", lambda: _vault_batch_read(inp.paths, inp.include_content))
 
 
 @mcp.tool(
     name="vault_write",
-    description="Write a file to the Obsidian vault. Supports frontmatter merging with existing files. Creates parent directories by default.",
+    description=(
+        "Write a file to the Obsidian vault. Supports frontmatter merging with existing files. "
+        "Creates parent directories by default. Replaces an existing file unless overwrite=false: "
+        "then it only creates, and an existing file is left untouched and reported, also when two "
+        "calls race. Use overwrite=false for a note that must not exist yet; if it reports the file "
+        "exists, choose another name rather than retrying with overwrite=true."
+    ),
     annotations={"readOnlyHint": False, "destructiveHint": True, "idempotentHint": False, "openWorldHint": False},
 )
-def vault_write(path: str, content: str, create_dirs: bool = True, merge_frontmatter: bool = False) -> str:
+def vault_write(
+    path: str,
+    content: str,
+    create_dirs: bool = True,
+    merge_frontmatter: bool = False,
+    overwrite: bool = True,
+) -> str:
     """Write a file to the vault."""
-    inp = VaultWriteInput(path=path, content=content, create_dirs=create_dirs, merge_frontmatter=merge_frontmatter)
-    return _run_audited(
+    inp = VaultWriteInput(
+        path=path, content=content, create_dirs=create_dirs,
+        merge_frontmatter=merge_frontmatter, overwrite=overwrite,
+    )
+    return run_audited(
         "vault_write",
-        lambda: _vault_write(inp.path, inp.content, inp.create_dirs, inp.merge_frontmatter),
+        lambda: _vault_write(inp.path, inp.content, inp.create_dirs, inp.merge_frontmatter, inp.overwrite),
         path=inp.path,
     )
 
 
 @mcp.tool(
     name="vault_write_binary",
-    description="Write an allowed binary file (image or PDF) to the Obsidian vault from base64-encoded content. Enforces a media-type/extension allowlist and a size cap; writes atomically.",
+    description="Write an allowed binary file (image, PDF, or a type the operator added) to the Obsidian vault from base64-encoded content. Enforces a media-type/extension allowlist and a size cap; writes atomically.",
     annotations={"readOnlyHint": False, "destructiveHint": True, "idempotentHint": False, "openWorldHint": False},
 )
 def vault_write_binary(path: str, data: str, media_type: str, overwrite: bool = False, create_dirs: bool = True) -> str:
     """Write a base64-encoded binary file to the vault."""
     inp = VaultWriteBinaryInput(path=path, data=data, media_type=media_type, overwrite=overwrite, create_dirs=create_dirs)
-    return _run_audited(
+    return run_audited(
         "vault_write_binary",
         lambda: _vault_write_binary(inp.path, inp.data, inp.media_type, inp.overwrite, inp.create_dirs),
         path=inp.path,
     )
+
+
+def register_upload_tool() -> None:
+    """Register vault_request_upload_url only when signed uploads are configured.
+
+    The tool hands out URLs for a route that answers without a bearer token. With
+    VAULT_UPLOAD_URL_SECRET unset that route does not exist, so the tool must not be
+    advertised either.
+    """
+    @mcp.tool(
+        name="vault_request_upload_url",
+        description=(
+            "Create a short-lived, single-use signed URL for uploading a binary file (image, PDF, or a type the operator added) "
+            "into the vault. The client POSTs the raw bytes to the URL with the matching Content-Type; "
+            "the bytes never pass through the conversation. Use it for files too large for "
+            "vault_write_binary's base64 argument."
+        ),
+        annotations={"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False, "openWorldHint": False},
+    )
+    def vault_request_upload_url(
+        path: str,
+        media_type: str,
+        max_size_bytes: int,
+        overwrite: bool = False,
+        create_dirs: bool = True,
+        expected_sha256: str | None = None,
+        ttl_seconds: int | None = None,
+    ) -> str:
+        """Return a short-lived signed direct-upload URL."""
+        inp = VaultRequestUploadUrlInput(
+            path=path,
+            media_type=media_type,
+            max_size_bytes=max_size_bytes,
+            overwrite=overwrite,
+            create_dirs=create_dirs,
+            expected_sha256=expected_sha256,
+            ttl_seconds=ttl_seconds,
+        )
+        return _vault_request_upload_url(
+            inp.path, inp.media_type, inp.max_size_bytes, inp.overwrite,
+            inp.create_dirs, inp.expected_sha256, inp.ttl_seconds,
+        )
+
+if config.signed_upload_enabled():
+    register_upload_tool()
 
 
 @mcp.tool(
@@ -358,7 +319,7 @@ def vault_edit(path: str, edits: list[VaultEditOperationInput], dry_run: bool = 
     if inp.dry_run:
         # A dry run writes nothing; don't record it as a mutation.
         return _vault_edit(inp.path, [edit.model_dump() for edit in inp.edits], inp.dry_run)
-    return _run_audited(
+    return run_audited(
         "vault_edit",
         lambda: _vault_edit(inp.path, [edit.model_dump() for edit in inp.edits], inp.dry_run),
         path=inp.path,
@@ -376,7 +337,7 @@ def vault_edit(path: str, edits: list[VaultEditOperationInput], dry_run: bool = 
 def vault_append(path: str, content: str, separator: str = "\n\n", create_dirs: bool = True) -> str:
     """Append content to a file."""
     inp = VaultAppendInput(path=path, content=content, separator=separator, create_dirs=create_dirs)
-    return _run_audited(
+    return run_audited(
         "vault_append",
         lambda: _vault_append(inp.path, inp.content, inp.separator, inp.create_dirs),
         path=inp.path,
@@ -391,7 +352,7 @@ def vault_append(path: str, content: str, separator: str = "\n\n", create_dirs: 
 def vault_batch_frontmatter_update(updates: list[dict]) -> str:
     """Batch update frontmatter fields."""
     inp = VaultBatchFrontmatterUpdateInput(updates=updates)
-    return _run_audited(
+    return run_audited(
         "vault_batch_frontmatter_update",
         lambda: _vault_batch_frontmatter_update(inp.updates),
         paths=[u.get("path") for u in inp.updates if isinstance(u, dict) and u.get("path")],
@@ -400,7 +361,7 @@ def vault_batch_frontmatter_update(updates: list[dict]) -> str:
 
 @mcp.tool(
     name="vault_search",
-    description="Search for text across vault files. Uses ripgrep if available, falls back to Python. Returns matching lines with context and frontmatter excerpts.",
+    description="Search for text across vault files, matching note names/paths as well as contents. Filename matches are returned first (match_type 'filename'), then content matches (match_type 'content') with context lines and frontmatter excerpts.",
     annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False},
 )
 def vault_search(
@@ -410,9 +371,9 @@ def vault_search(
     max_results: int = 20,
     context_lines: int = 2,
 ) -> str:
-    """Search vault file contents."""
+    """Search vault note names/paths and file contents."""
     inp = VaultSearchInput(query=query, path_prefix=path_prefix, file_pattern=file_pattern, max_results=max_results, context_lines=context_lines)
-    return _run_audited(
+    return run_audited(
         "vault_search",
         lambda: _vault_search(inp.query, inp.path_prefix, inp.file_pattern, inp.max_results, inp.context_lines),
     )
@@ -432,7 +393,7 @@ def vault_search_frontmatter(
 ) -> str:
     """Search by frontmatter fields."""
     inp = VaultSearchFrontmatterInput(field=field, value=value, match_type=match_type, path_prefix=path_prefix, max_results=max_results)
-    return _run_audited(
+    return run_audited(
         "vault_search_frontmatter",
         lambda: _vault_search_frontmatter(inp.field, inp.value, inp.match_type, inp.path_prefix, inp.max_results),
     )
@@ -452,7 +413,7 @@ def vault_list(
 ) -> str:
     """List vault directory contents."""
     inp = VaultListInput(path=path, depth=depth, include_files=include_files, include_dirs=include_dirs, pattern=pattern)
-    return _run_audited(
+    return run_audited(
         "vault_list",
         lambda: _vault_list(inp.path, inp.depth, inp.include_files, inp.include_dirs, inp.pattern),
         path=inp.path,
@@ -467,7 +428,7 @@ def vault_list(
 def vault_move(source: str, destination: str, create_dirs: bool = True) -> str:
     """Move a file or directory."""
     inp = VaultMoveInput(source=source, destination=destination, create_dirs=create_dirs)
-    return _run_audited(
+    return run_audited(
         "vault_move",
         lambda: _vault_move(inp.source, inp.destination, inp.create_dirs),
         source=inp.source,
@@ -483,7 +444,7 @@ def vault_move(source: str, destination: str, create_dirs: bool = True) -> str:
 def vault_delete(path: str, confirm: bool = False) -> str:
     """Delete a file (move to .trash/)."""
     inp = VaultDeleteInput(path=path, confirm=confirm)
-    return _run_audited(
+    return run_audited(
         "vault_delete",
         lambda: _vault_delete(inp.path, inp.confirm),
         path=inp.path,
@@ -498,7 +459,7 @@ def vault_delete(path: str, confirm: bool = False) -> str:
 def vault_canvas_read(path: str) -> str:
     """Read an Obsidian Canvas file."""
     inp = VaultCanvasReadInput(path=path)
-    return _run_audited("vault_canvas_read", lambda: _vault_canvas_read(inp.path), path=inp.path)
+    return run_audited("vault_canvas_read", lambda: _vault_canvas_read(inp.path), path=inp.path)
 
 
 @mcp.tool(
@@ -512,7 +473,7 @@ def vault_canvas_read(path: str) -> str:
 def vault_canvas_add_node(path: str, node: dict) -> str:
     """Append a node to a Canvas file."""
     inp = VaultCanvasAddNodeInput(path=path, node=node)
-    return _run_audited(
+    return run_audited(
         "vault_canvas_add_node",
         lambda: _vault_canvas_add_node(inp.path, inp.node.model_dump(exclude_none=True, mode="json")),
         path=inp.path,
@@ -531,7 +492,7 @@ def vault_canvas_add_node(path: str, node: dict) -> str:
 def vault_canvas_add_edge(path: str, edge: dict) -> str:
     """Append an edge to a Canvas file."""
     inp = VaultCanvasAddEdgeInput(path=path, edge=edge)
-    return _run_audited(
+    return run_audited(
         "vault_canvas_add_edge",
         lambda: _vault_canvas_add_edge(inp.path, inp.edge.model_dump(exclude_none=True, mode="json")),
         path=inp.path,
@@ -555,7 +516,7 @@ def vault_daily_note_path() -> str:
 )
 def vault_daily_note_read() -> str:
     """Read today's daily note."""
-    return _run_audited("vault_daily_note_read", _vault_daily_note_read)
+    return run_audited("vault_daily_note_read", _vault_daily_note_read)
 
 
 @mcp.tool(
@@ -566,7 +527,7 @@ def vault_daily_note_read() -> str:
 def vault_daily_note_append(content: str) -> str:
     """Append to today's daily note."""
     inp = VaultDailyNoteAppendInput(content=content)
-    return _run_audited(
+    return run_audited(
         "vault_daily_note_append",
         lambda: _vault_daily_note_append(inp.content),
         path=_daily_note_path(_today()),
@@ -625,6 +586,117 @@ def vault_analytics_findings(
     )
 
 
+_UPLOAD_CHUNK_LIMIT_MESSAGE = "Uploaded content exceeds the {cap} bytes this upload URL allows"
+
+
+async def direct_upload(request):
+    """Accept the bytes for a signed upload URL.
+
+    The order is the security property. The grant (id, signature, expiry, single use) is
+    validated before a single body byte is read, so a request without a valid URL costs
+    the server nothing. The body is then streamed into a temp file in the upload's
+    staging dir and cut off at the grant's cap; it is never held in memory. The commit
+    checks the grant again, validates size, type and checksum, and places the file.
+
+    Rejected grants are logged, not audited: an unauthenticated flood must not be able
+    to grow the audit log. Every attempt on a valid grant is audited by the commit.
+    """
+    import hashlib
+    import tempfile
+
+    import anyio
+    from starlette.responses import JSONResponse
+
+    upload_id = request.path_params["upload_id"]
+    expires = request.query_params.get("expires", "")
+    signature = request.query_params.get("signature", "")
+
+    grant, status = await anyio.to_thread.run_sync(validate_upload_grant, upload_id, expires, signature)
+    if status != 200:
+        logger.warning("Upload refused before reading the body: %s (%s)", upload_id, grant.get("error"))
+        return JSONResponse(grant, status_code=status)
+
+    cap = min(int(grant["max_size_bytes"]), config.VAULT_UPLOAD_MAX_BYTES)
+    too_large = {"error": _UPLOAD_CHUNK_LIMIT_MESSAGE.format(cap=cap), "upload_id": upload_id}
+    content_type = request.headers.get("content-type", "")
+    if content_type.split(";", 1)[0].strip().lower() == "multipart/form-data":
+        return JSONResponse(
+            {
+                "error": "Send the raw file bytes with the file's Content-Type (curl --data-binary), not multipart",
+                "upload_id": upload_id,
+            },
+            status_code=415,
+        )
+
+    content_length = request.headers.get("content-length")
+    if content_length is not None:
+        try:
+            if int(content_length) > cap:
+                return JSONResponse(too_large, status_code=413)
+        except ValueError:
+            return JSONResponse({"error": "Invalid Content-Length", "upload_id": upload_id}, status_code=400)
+
+    fd, part_name = tempfile.mkstemp(dir=upload_dir(upload_id), suffix=".part")
+    part = Path(part_name)
+    try:
+        digest = hashlib.sha256()
+        received = 0
+        with open(fd, "wb") as out:
+            async for chunk in request.stream():
+                received += len(chunk)
+                if received > cap:
+                    # Stop at the first chunk past the cap; a missing or understated
+                    # Content-Length buys no more than the grant allows.
+                    return JSONResponse(too_large, status_code=413)
+                digest.update(chunk)
+                await anyio.to_thread.run_sync(out.write, chunk)
+
+        result, status = await anyio.to_thread.run_sync(
+            commit_direct_upload, upload_id, part, digest.hexdigest(), content_type, expires, signature
+        )
+    finally:
+        part.unlink(missing_ok=True)
+
+    if "error" in result:
+        logger.warning("Upload rejected: %s (%s)", upload_id, result["error"])
+    else:
+        logger.info("Upload committed: %s -> %s (%s bytes)", upload_id, result["path"], result["size"])
+    return JSONResponse(result, status_code=status)
+
+
+class _RedactUploadSignature(logging.Filter):
+    """Keep signed upload URLs out of the access log.
+
+    A logged URL is a usable credential until it expires or is used, and a request refused
+    for a wrong Content-Type does not burn the grant. uvicorn's access record carries the
+    full path with query string as an argument; for anything under the upload prefix the
+    whole query string goes, rather than a pattern for "signature=". Matching the literal
+    key was bypassable: Starlette decodes query keys, so %73ignature=<sig> was accepted as
+    the signature and logged in full.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        args = record.args
+        if isinstance(args, tuple) and len(args) >= 3 and isinstance(args[2], str):
+            target = args[2]
+            path, sep, _query = target.partition("?")
+            if sep and (path == config.UPLOAD_ROUTE_PREFIX or path.startswith(config.UPLOAD_ROUTE_PREFIX + "/")):
+                record.args = args[:2] + (path + "?REDACTED",) + args[3:]
+        return True
+
+
+def uvicorn_log_config() -> dict:
+    """uvicorn's default logging config plus the signature redaction on the access log."""
+    import copy
+
+    from uvicorn.config import LOGGING_CONFIG
+
+    log_config = copy.deepcopy(LOGGING_CONFIG)
+    log_config.setdefault("filters", {})["redact_upload_signature"] = {"()": _RedactUploadSignature}
+    log_config["handlers"]["access"].setdefault("filters", []).append("redact_upload_signature")
+    return log_config
+
+
 def build_app(extensions=()):
     """Assemble the authenticated Starlette app served to clients.
 
@@ -642,7 +714,10 @@ def build_app(extensions=()):
     from starlette.routing import Route
 
     from .auth import BearerAuthMiddleware
+    from .cf_access import CloudflareAccessMiddleware, cf_access_enabled
     from .oauth import oauth_routes
+
+    cf_on = cf_access_enabled()
 
     app = mcp.streamable_http_app()
 
@@ -659,9 +734,13 @@ def build_app(extensions=()):
 
         app.routes.insert(0, Route("/", mcp_root_probe, methods=["GET", "HEAD"]))
 
-    # Mount OAuth routes (these are excluded from bearer auth via the middleware)
-    for route in oauth_routes:
-        app.routes.insert(0, route)
+    # Mount OAuth routes (excluded from bearer auth via the middleware) -- but NOT in
+    # Cloudflare Access mode: there, Cloudflare is the sole auth authority, so serving
+    # the app's own OAuth + /.well-known discovery would advertise a second, competing
+    # (unauthenticated-login) surface. Skip them entirely.
+    if not cf_on:
+        for route in oauth_routes:
+            app.routes.insert(0, route)
 
     # Health endpoint (bearer-exempt, see auth._AUTH_EXEMPT_PATHS). Surfaces audit status
     # so an operator can confirm the log is enabled and being written.
@@ -672,6 +751,13 @@ def build_app(extensions=()):
         return JSONResponse({"status": "ok", "audit": {"enabled": audit_enabled()}})
 
     app.routes.insert(0, Route("/health", health, methods=["GET"]))
+
+    # Signed direct upload, only when the operator set VAULT_UPLOAD_URL_SECRET. Without
+    # it the route does not exist and auth.is_signed_upload_request answers False, so an
+    # upgrade adds no unauthenticated write path. Bearer-exempt for exactly
+    # POST /upload/<id>: the HMAC signature in the URL is the authorization.
+    if config.signed_upload_enabled():
+        app.routes.insert(0, Route(f"{config.UPLOAD_ROUTE_PREFIX}/{{upload_id}}", direct_upload, methods=["POST"]))
 
     # Extension routes (e.g. a localhost search endpoint), added before the auth
     # middleware so they are bearer-protected like the MCP transport.
@@ -695,18 +781,17 @@ def build_app(extensions=()):
     ext_routes = [r for r in app.routes if id(r) not in before_ids]
 
     def _covers(route, method, path):
-        """Match enum for route vs (method, path); NONE if the probe can't run."""
+        """Match enum for route vs (method, path); reject uninspectable routes."""
         try:
             match, _ = route.matches(
                 {"type": "http", "method": method, "path": path, "headers": []}
             )
             return match
-        except Exception:
-            logger.warning(
-                "extension route %r could not be auth-checked; allowing "
-                "(trusted-extension model)", getattr(route, "path", route)
-            )
-            return Match.NONE
+        except Exception as exc:
+            route_path = getattr(route, "path", route)
+            raise ValueError(
+                f"extension route {route_path!r} could not be safely inspected"
+            ) from exc
 
     for r in ext_routes:
         # Footguns: a Mount can shadow an exempt prefix; a WebSocketRoute isn't covered
@@ -732,7 +817,29 @@ def build_app(extensions=()):
                     f"extension route {getattr(r, 'path', r)!r} covers auth-exempt "
                     f"{m} {p!r}; it would be served without bearer authentication"
                 )
-    app.add_middleware(BearerAuthMiddleware)
+        # The upload namespace belongs to the upload route. Probes alone cannot reserve
+        # it: a literal Route("/upload/export") matches no probe path, yet the exemption
+        # regex matches its path, so it would be served with neither a token nor a
+        # signature. The declared path is checked directly, and the probes stay for
+        # parameterized and mounted shapes.
+        declared = getattr(r, "path", "") or ""
+        if declared == config.UPLOAD_ROUTE_PREFIX or declared.startswith(config.UPLOAD_ROUTE_PREFIX + "/"):
+            raise ValueError(
+                f"extension route {declared!r} is under the reserved "
+                f"{config.UPLOAD_ROUTE_PREFIX!r} namespace of the signed upload route"
+            )
+        for probe in ("", "/probe-id", "/probe-id/deeper"):
+            if _covers(r, "POST", config.UPLOAD_ROUTE_PREFIX + probe) is not Match.NONE:
+                raise ValueError(
+                    f"extension route {getattr(r, 'path', r)!r} is under the reserved "
+                    f"{config.UPLOAD_ROUTE_PREFIX!r} namespace of the signed upload route"
+                )
+    # Cloudflare Access mode swaps the static-bearer middleware for CF JWT verification;
+    # the static bearer is never checked in that mode.
+    if cf_on:
+        app.add_middleware(CloudflareAccessMiddleware)
+    else:
+        app.add_middleware(BearerAuthMiddleware)
     return app
 
 
@@ -768,7 +875,28 @@ def serve(extensions=()):
         logger.error(f"Invalid configuration: {e}")
         sys.exit(1)
 
-    if not VAULT_MCP_TOKEN:
+    # Cloudflare Access mode: fail CLOSED on missing deps, warm the key set, and (below)
+    # suppress the static-token warning that is irrelevant when Cloudflare is the auth
+    # authority. A half-configured pair (exactly one of the two settings) fails startup
+    # in validate_config(), so this point is only reached with the mode fully on or off.
+    from .cf_access import (
+        cf_access_enabled,
+        require_dependencies,
+        team_domain,
+        warm_jwks,
+    )
+
+    cf_on = cf_access_enabled()
+    if cf_on:
+        try:
+            require_dependencies()
+        except Exception as e:
+            logger.error(str(e))
+            sys.exit(1)
+        logger.info("Cloudflare Access mode ENABLED (team: %s)", team_domain())
+        warm_jwks()
+
+    if not cf_on and not VAULT_MCP_TOKEN:
         logger.warning("VAULT_MCP_TOKEN is not set -- auth will reject all requests")
 
     # Fail CLOSED on a misconfigured audit log: if auditing is requested but the log path
@@ -832,7 +960,10 @@ def serve(extensions=()):
     # Build the Starlette app with auth middleware and OAuth endpoints
     try:
         app = build_app(extensions)
-        logger.info(f"Starting server on {VAULT_MCP_HOST}:{VAULT_MCP_PORT} with bearer auth + OAuth")
+        _auth_mode = "Cloudflare Access" if cf_on else "bearer auth + OAuth"
+        logger.info(
+            f"Starting server on {VAULT_MCP_HOST}:{VAULT_MCP_PORT} with {_auth_mode}"
+        )
     except Exception as e:
         # Fail CLOSED: never fall back to an unauthenticated server.
         logger.error(f"Could not build the authenticated app: {e}")
@@ -844,6 +975,7 @@ def serve(extensions=()):
         host=VAULT_MCP_HOST,
         port=VAULT_MCP_PORT,
         log_level="info",
+        log_config=uvicorn_log_config(),
         # Honor X-Forwarded-* ONLY from the trusted loopback proxy (Cloudflare
         # Tunnel / Caddy), never from arbitrary clients. Trusting "*" let any
         # caller spoof the advertised OAuth origin via X-Forwarded-Host.

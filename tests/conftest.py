@@ -6,6 +6,24 @@ from pathlib import Path
 
 import pytest
 
+# Signed uploads are off unless VAULT_UPLOAD_URL_SECRET is set, and the tool is registered
+# at import time, so the in-process suite needs the secret before obsidian_vault_mcp.server
+# is imported. The off-by-default behaviour is covered separately, in a child process
+# started without it (tests/test_signed_upload.py).
+os.environ.setdefault("VAULT_UPLOAD_URL_SECRET", "suite-upload-secret")
+
+
+@pytest.fixture(autouse=True)
+def fresh_oauth_brakes(monkeypatch):
+    """The login and registration brakes are process-wide by design (#97). Give every
+    test fresh ones, so a suite that registers many clients does not trip them."""
+    from obsidian_vault_mcp import oauth
+
+    monkeypatch.setattr(oauth, "_login_failures",
+                        oauth._SlidingLimit(oauth.LOGIN_FAILURE_LIMIT, oauth.LOGIN_FAILURE_WINDOW_SECONDS))
+    monkeypatch.setattr(oauth, "_registrations",
+                        oauth._SlidingLimit(oauth.REGISTRATION_LIMIT, oauth.REGISTRATION_WINDOW_SECONDS))
+
 
 @pytest.fixture
 def vault_dir(tmp_path, monkeypatch):

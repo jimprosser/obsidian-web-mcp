@@ -223,6 +223,9 @@ def test_patch_style_inputs_normalize_str_replace_aliases():
     assert dumped == {
         "old_text": "  keep me\n",
         "new_text": "\n  keep replacement  ",
+        # The all-occurrences opt-in (#83) defaults off, so an alias-only edit keeps the
+        # exactly-once behaviour.
+        "replace_all": False,
     }
 
 

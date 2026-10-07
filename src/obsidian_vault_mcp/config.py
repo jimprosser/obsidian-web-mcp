@@ -1,4 +1,6 @@
+import json
 import os
+import re
 from pathlib import Path
 
 # Vault configuration
@@ -80,6 +82,19 @@ VAULT_MCP_FORWARDED_ALLOW_IPS = os.environ.get("VAULT_MCP_FORWARDED_ALLOW_IPS", 
 # the server falls back to the per-request base_url. A trailing slash is ignored.
 VAULT_MCP_PUBLIC_URL = os.environ.get("VAULT_MCP_PUBLIC_URL", "").strip()
 
+# --- Cloudflare Access (optional, opt-in) ------------------------------------------
+# When BOTH of these are set, the server runs in "Cloudflare Access" mode: it trusts
+# Cloudflare to authenticate the caller at its edge (per-identity SSO / one-time-PIN)
+# and verifies the signed Cf-Access-Jwt-Assertion header Cloudflare injects on every
+# request forwarded through the tunnel. When either is empty the mode is OFF and
+# behaviour is identical to today (the app's own OAuth + static bearer). Both-or-neither,
+# mirroring the sibling telegram-catcher deployment.
+#   TEAM_DOMAIN: the Cloudflare team domain, e.g. "myteam.cloudflareaccess.com" (a bare
+#     "myteam" or a full URL is normalized in cf_access.team_domain()).
+#   AUD: the Access application audience (AUD) tag from the Cloudflare dashboard.
+VAULT_MCP_CF_ACCESS_TEAM_DOMAIN = os.environ.get("VAULT_MCP_CF_ACCESS_TEAM_DOMAIN", "").strip()
+VAULT_MCP_CF_ACCESS_AUD = os.environ.get("VAULT_MCP_CF_ACCESS_AUD", "").strip()
+
 
 def advertised_base_url(request_base_url: str) -> str:
     """Return the canonical origin to advertise, with no trailing slash.
@@ -155,6 +170,42 @@ VAULT_AUDIT_LOG_INCLUDE_READS = os.environ.get(
 # Safety limits
 MAX_CONTENT_SIZE = 1_000_000  # 1MB max write size
 MAX_BINARY_SIZE = 10_000_000  # 10MB max binary write size (images/PDFs run larger than text)
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, str(default)))
+    except ValueError:
+        return default
+
+
+# Signed direct upload (POST /upload/{id}). The route is bearer-exempt because the HMAC
+# signature in the URL is the authorization: single-use, short-lived, constant-time
+# compared, and checked before a single body byte is read. The body is streamed to a
+# temp file under the staging dir (outside the vault), so its cap is a disk bound, not a
+# memory bound, and can sit above MAX_BINARY_SIZE: this path exists for files too large
+# to travel base64-encoded through an MCP tool argument (vault_write_binary).
+VAULT_UPLOAD_URL_SECRET = os.environ.get("VAULT_UPLOAD_URL_SECRET", "").strip()
+VAULT_UPLOAD_URL_TTL_SECONDS = _env_int("VAULT_UPLOAD_URL_TTL_SECONDS", 900)
+VAULT_UPLOAD_URL_MAX_TTL_SECONDS = _env_int("VAULT_UPLOAD_URL_MAX_TTL_SECONDS", 3600)
+VAULT_UPLOAD_MAX_BYTES = _env_int("VAULT_UPLOAD_MAX_BYTES", 100_000_000)
+UPLOAD_STAGING_DIR = Path(os.environ.get(
+    "VAULT_UPLOAD_STAGING_DIR",
+    Path.home() / ".local" / "share" / "vault-mcp" / "uploads",
+))
+# The one path the upload route owns. Reserved in _validate_mcp_path and closed to
+# extension routes in build_app, so nothing else can be mounted under it.
+UPLOAD_ROUTE_PREFIX = "/upload"
+
+
+def signed_upload_enabled() -> bool:
+    """Whether the signed upload path exists at all.
+
+    Off unless the operator sets VAULT_UPLOAD_URL_SECRET. There is deliberately no
+    fallback to VAULT_MCP_TOKEN: upgrading must not turn on a new unauthenticated write
+    path, and the bearer token should not double as the URL-signing key.
+    """
+    return bool(VAULT_UPLOAD_URL_SECRET)
 MAX_BATCH_SIZE = 20           # Max files per batch operation
 MAX_SEARCH_RESULTS = 50       # Max results per search
 DEFAULT_SEARCH_RESULTS = 20
@@ -166,10 +217,6 @@ EXCLUDED_DIRS = {".obsidian", ".trash", ".git", ".DS_Store"}
 
 # Frontmatter index refresh interval (seconds)
 FRONTMATTER_INDEX_DEBOUNCE = 5.0
-
-# Rate limiting (requests per minute) -- track in-memory, enforce per-token
-RATE_LIMIT_READ = 100
-RATE_LIMIT_WRITE = 30
 
 
 def _validate_mcp_path(path: str) -> None:
@@ -207,7 +254,7 @@ def _validate_mcp_path(path: str) -> None:
     # Imported lazily: auth imports config, so a top-level import here would cycle.
     from .auth import _AUTH_EXEMPT_PATHS
 
-    reserved_prefixes = ("/oauth", "/.well-known")
+    reserved_prefixes = ("/oauth", "/.well-known", UPLOAD_ROUTE_PREFIX)
     collides = path in _AUTH_EXEMPT_PATHS or any(
         path == prefix or path.startswith(prefix + "/") for prefix in reserved_prefixes
     )
@@ -215,8 +262,68 @@ def _validate_mcp_path(path: str) -> None:
         raise ValueError(
             f"VAULT_MCP_PATH {path!r} collides with an authentication-exempt route; "
             "mounting there would serve the vault without auth. Choose a path that is "
-            "not /health and not under /oauth or /.well-known."
+            "not /health and not under /oauth, /.well-known or /upload."
         )
+
+
+# Extra binary media types (#100). Which file types a vault accepts through
+# vault_write_binary and the signed upload is the operator's call: a JSON object mapping a
+# media type to its extensions, e.g.
+#   {"application/vnd.openxmlformats-officedocument.wordprocessingml.document": [".docx"]}
+# It only ever adds to the built-in allowlist (tools/write.py), never replaces it. Parsed
+# leniently here (a bad value means no extras) and strictly in validate_config(), which
+# stops startup with the variable's name.
+VAULT_EXTRA_BINARY_MEDIA_TYPES_JSON = os.environ.get("VAULT_EXTRA_BINARY_MEDIA_TYPES_JSON", "").strip()
+
+# Extensions a binary write must never target: the text formats the other write tools own
+# (a note, a canvas, a base), so no configuration can point a binary write at a note path;
+# and SVG, excluded from the built-in list on purpose because it can carry active content.
+REFUSED_EXTRA_BINARY_EXTENSIONS = frozenset({".md", ".markdown", ".canvas", ".base", ".txt", ".svg"})
+
+_MEDIA_TYPE = re.compile(r"[a-z0-9][a-z0-9!#$&^_.+-]*/[a-z0-9][a-z0-9!#$&^_.+-]*")
+_EXTENSION = re.compile(r"\.[a-z0-9][a-z0-9_-]*")
+
+
+def parse_extra_binary_media_types(raw: str) -> dict[str, frozenset[str]]:
+    """Parse VAULT_EXTRA_BINARY_MEDIA_TYPES_JSON; raise ValueError naming what is wrong."""
+    name = "VAULT_EXTRA_BINARY_MEDIA_TYPES_JSON"
+    if not raw:
+        return {}
+    try:
+        data = json.loads(raw)
+    except ValueError as e:
+        raise ValueError(f"{name} is not valid JSON: {e}")
+    if not isinstance(data, dict):
+        raise ValueError(f"{name} must be a JSON object mapping a media type to a list of extensions")
+    parsed: dict[str, frozenset[str]] = {}
+    for media_type, extensions in data.items():
+        normalized_type = media_type.strip().lower()
+        if not _MEDIA_TYPE.fullmatch(normalized_type):
+            raise ValueError(f"{name}: {media_type!r} is not a media type of the form type/subtype")
+        if not isinstance(extensions, list) or not extensions:
+            raise ValueError(f"{name}: the value for {media_type!r} must be a non-empty list of extensions")
+        normalized = set()
+        for extension in extensions:
+            ext = extension.strip().lower() if isinstance(extension, str) else ""
+            if not _EXTENSION.fullmatch(ext):
+                raise ValueError(
+                    f"{name}: {extension!r} for {media_type!r} is not an extension; "
+                    "use a leading dot, e.g. '.docx'"
+                )
+            if ext in REFUSED_EXTRA_BINARY_EXTENSIONS:
+                raise ValueError(
+                    f"{name}: {ext} cannot be a binary type; it is a text format the write tools "
+                    "own, or excluded on purpose (.svg can carry active content)"
+                )
+            normalized.add(ext)
+        parsed[normalized_type] = frozenset(normalized)
+    return parsed
+
+
+try:
+    EXTRA_BINARY_MEDIA_TYPES = parse_extra_binary_media_types(VAULT_EXTRA_BINARY_MEDIA_TYPES_JSON)
+except ValueError:
+    EXTRA_BINARY_MEDIA_TYPES = {}  # validate_config() refuses to start with this value
 
 
 def validate_config() -> None:
@@ -226,3 +333,51 @@ def validate_config() -> None:
     CLOSED with a clear message instead of booting a broken or insecure server.
     """
     _validate_mcp_path(VAULT_MCP_PATH)
+    parse_extra_binary_media_types(os.environ.get("VAULT_EXTRA_BINARY_MEDIA_TYPES_JSON", "").strip())
+    if signed_upload_enabled():
+        _validate_upload_settings()
+    # Imported lazily: cf_access imports config, so a top-level import here would cycle.
+    # A no-op unless Cloudflare Access mode is on (both settings set).
+    from .cf_access import validate_cf_access_config
+    validate_cf_access_config()
+
+
+def _validate_upload_settings() -> None:
+    """Fail closed on the signed-upload settings, the way the heartbeat interval does.
+
+    The module-level parses fall back to the default on a bad value, which would silently
+    ignore VAULT_UPLOAD_MAX_BYTES=100MB. Here the raw environment is read again so a
+    typo, a non-positive value, or a staging directory inside the vault stops startup
+    with the variable's name.
+    """
+    for name, parsed in (
+        ("VAULT_UPLOAD_URL_TTL_SECONDS", VAULT_UPLOAD_URL_TTL_SECONDS),
+        ("VAULT_UPLOAD_URL_MAX_TTL_SECONDS", VAULT_UPLOAD_URL_MAX_TTL_SECONDS),
+        ("VAULT_UPLOAD_MAX_BYTES", VAULT_UPLOAD_MAX_BYTES),
+    ):
+        raw = os.environ.get(name, "").strip()
+        if raw:
+            try:
+                value = int(raw)
+            except ValueError:
+                raise ValueError(f"{name} must be an integer, got {raw!r}")
+        else:
+            value = parsed
+        if value <= 0:
+            raise ValueError(f"{name} must be a positive integer, got {value}")
+    if VAULT_UPLOAD_URL_MAX_TTL_SECONDS < VAULT_UPLOAD_URL_TTL_SECONDS:
+        raise ValueError(
+            "VAULT_UPLOAD_URL_MAX_TTL_SECONDS must not be smaller than "
+            f"VAULT_UPLOAD_URL_TTL_SECONDS ({VAULT_UPLOAD_URL_MAX_TTL_SECONDS} < "
+            f"{VAULT_UPLOAD_URL_TTL_SECONDS})"
+        )
+    staging = UPLOAD_STAGING_DIR.expanduser()
+    vault_root = VAULT_PATH.expanduser()
+    try:
+        staging.resolve().relative_to(vault_root.resolve())
+    except ValueError:
+        return
+    raise ValueError(
+        f"VAULT_UPLOAD_STAGING_DIR resolves inside the vault ({staging}); the vault tools "
+        "could reach the grants. Choose a path outside VAULT_PATH."
+    )

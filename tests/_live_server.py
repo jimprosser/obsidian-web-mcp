@@ -120,3 +120,19 @@ def call_tool_over_http(base_url: str, name: str, arguments: dict) -> dict:
                 return json.loads(text) if text.strip().startswith("{") else {"error": text, "isError": result.isError}
 
     return asyncio.run(run())
+
+
+def list_tools_over_http(base_url: str) -> list[str]:
+    """Tool names as a client sees them after initialize()."""
+    from mcp import ClientSession
+    from mcp.client.streamable_http import streamablehttp_client
+
+    async def run():
+        headers = {"Authorization": f"Bearer {TOKEN}"}
+        async with streamablehttp_client(f"{base_url}/", headers=headers) as (read, write, _):
+            async with ClientSession(read, write) as session:
+                await session.initialize()
+                listed = await session.list_tools()
+                return [tool.name for tool in listed.tools]
+
+    return asyncio.run(run())
