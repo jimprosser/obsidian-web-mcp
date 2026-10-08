@@ -261,6 +261,23 @@ With signed uploads enabled, the four settings above are validated at startup: a
 
 Generate secrets with: `python -c "import secrets; print(secrets.token_hex(32))"`
 
+## OAuth clients and tokens
+
+Each client that completes the OAuth flow gets its own access token, valid for one day, and a refresh token, valid for thirty days and replaced on every use. A refresh token that was already used is refused; the tokens issued since stay valid. Every client has the same full tool access as `VAULT_MCP_TOKEN`, which keeps working as before.
+
+Clients and tokens live in `oauth_state.sqlite3`, next to `oauth_clients.json` (`~/.local/share/vault-mcp/` by default). Secrets and tokens are stored as hashes only. Whenever the store opens, its directory is tightened to `0700` and the database file to `0600`. Keep that directory outside the vault and do not share it with other applications; the server does not check either.
+
+```bash
+vault-mcp-oauth clients list
+vault-mcp-oauth clients revoke <client-id>
+```
+
+Both print JSON and no secrets. A revoked client is refused by the running server on its next request, no restart needed. The client configured with `VAULT_OAUTH_CLIENT_ID` is listed once it has a token; its secret and redirect URIs stay in the environment, so the listing shows none.
+
+**Upgrading.** Whenever the store opens, it adds the clients from `oauth_clients.json` that it does not have yet. The file is only read, never changed or removed. From then on the database is the source of truth: editing a client in the JSON file has no effect, and a revoked client stays revoked. A client that connected before the upgrade holds `VAULT_MCP_TOKEN` itself, so revoking it takes effect only after that token is rotated.
+
+**Going back.** An earlier version reads `oauth_clients.json`, which this version never writes. Clients registered since the upgrade have to register again, and per-client tokens stop working.
+
 ## Signed uploads
 
 **Off by default.** The route answers without a bearer token, so it exists only once you set `VAULT_UPLOAD_URL_SECRET`. Upgrading the server does not turn it on.
@@ -280,7 +297,8 @@ searches are logged too when `VAULT_AUDIT_LOG_INCLUDE_READS` is on (off by defau
 reads are high-volume).
 
 Each record carries: `timestamp` (UTC), `token_id_hash` (SHA-256 of the bearer token -- the
-raw token is never written), `client_id` (a best-effort User-Agent hint), `operation`,
+raw token is never written), `client_id` (the OAuth client id for a per-client token,
+otherwise a best-effort User-Agent hint), `operation`,
 `target_path`, `size_before`/`size_after`, `checksum_before`/`checksum_after` (SHA-256),
 `request_id`, `operation_status`, and `error`. Example line:
 
@@ -418,6 +436,8 @@ src/obsidian_vault_mcp/
     frontmatter_index.py    # In-memory YAML frontmatter index with filesystem watcher
     models.py               # Pydantic input validation models
     oauth.py                # OAuth 2.0 authorization code flow with PKCE
+    oauth_admin.py          # vault-mcp-oauth: list and revoke OAuth clients
+    oauth_state.py          # SQLite store of OAuth clients and their tokens
     serialization.py        # JSON encoder for tool responses (dates, etc.)
     server.py               # FastMCP server setup, tool registration, entry point
     vault.py                # Core filesystem operations (path security, atomic writes)
