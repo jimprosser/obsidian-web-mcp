@@ -25,6 +25,19 @@ def fresh_oauth_brakes(monkeypatch):
                         oauth._SlidingLimit(oauth.REGISTRATION_LIMIT, oauth.REGISTRATION_WINDOW_SECONDS))
 
 
+@pytest.fixture(autouse=True)
+def isolated_oauth_state(tmp_path, monkeypatch):
+    """The OAuth store opens lazily at a path derived from OAUTH_CLIENTS_PATH. Point
+    that at a throwaway directory before anything opens it, so no test reads or writes
+    the real one, and close the store afterwards so the next test starts fresh."""
+    from obsidian_vault_mcp import config, oauth
+
+    oauth.close_oauth_state()
+    monkeypatch.setattr(config, "OAUTH_CLIENTS_PATH", tmp_path / "oauth-state" / "oauth_clients.json")
+    yield
+    oauth.close_oauth_state()
+
+
 @pytest.fixture
 def vault_dir(tmp_path, monkeypatch):
     """Create a temporary vault directory with sample files."""

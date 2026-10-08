@@ -11,6 +11,8 @@ from starlette.responses import JSONResponse
 from . import config
 from .config import VAULT_MCP_TOKEN
 from .context import reset_request_context, set_request_context
+from .oauth import canonical_resource, get_oauth_state, resource_matches
+from .oauth_state import TokenMetadata
 
 # Paths that don't require bearer auth (OAuth flow + health)
 _AUTH_EXEMPT_PATHS = {
@@ -64,6 +66,14 @@ def _www_authenticate(request: Request, error: str) -> str:
     return f'Bearer realm="mcp", resource_metadata="{resource_metadata}", error="{error}"'
 
 
+def _per_client_token(request: Request, token: str) -> TokenMetadata | None:
+    """A usable per-client OAuth token issued for this MCP endpoint, otherwise None."""
+    issued = get_oauth_state().lookup_access_token(token)
+    if issued is None or not resource_matches(issued.resource, canonical_resource(request)):
+        return None
+    return issued
+
+
 class BearerAuthMiddleware(BaseHTTPMiddleware):
     """Validates Bearer tokens on all requests except OAuth and health endpoints."""
 
@@ -97,20 +107,24 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
             )
 
         token = auth_header[7:]
-        # Constant-time compare: avoid leaking the token via response timing (#2).
-        if not hmac.compare_digest(token, VAULT_MCP_TOKEN):
+        # Constant-time compare: avoid leaking the token via response timing (#2). Bytes,
+        # because hmac.compare_digest raises on str that is not ASCII.
+        if hmac.compare_digest(token.encode(), VAULT_MCP_TOKEN.encode()):
+            # The static bearer names no client: a User-Agent-derived hint stands in.
+            client = request.headers.get("user-agent", "").strip()[:200] or None
+        elif (issued := _per_client_token(request, token)) is not None:
+            client = issued.client_id
+        else:
+            # One answer for every refused token, so it does not tell which kind failed.
             return JSONResponse(
                 {"error": "Invalid token"},
                 status_code=401,
                 headers={"WWW-Authenticate": _www_authenticate(request, "invalid_token")},
             )
 
-        # Thread the authenticated principal (plus a request id and best-effort client
-        # hint) to the tool layer for the audit log. The raw token never leaves this
-        # context; audit.build_audit_record stores only its SHA-256 hash. client_id is a
-        # User-Agent-derived hint -- it becomes a true per-client id if the static bearer
-        # token is ever replaced with per-client tokens.
-        client = request.headers.get("user-agent", "").strip()[:200] or None
+        # Thread the authenticated principal (plus a request id and the client) to the tool
+        # layer for the audit log. The raw token never leaves this context;
+        # audit.build_audit_record stores only its SHA-256 hash.
         ctx_token = set_request_context(principal=token, request_id=uuid.uuid4().hex, client=client)
         try:
             return await call_next(request)

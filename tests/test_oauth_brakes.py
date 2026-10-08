@@ -28,13 +28,11 @@ def clock(monkeypatch):
 
 @pytest.fixture
 def app(vault_dir, monkeypatch, tmp_path, clock):
-    oauth._clients.clear()
     oauth._auth_codes.clear()
     monkeypatch.setattr(config, "VAULT_OAUTH_USERNAME", "owner")
     monkeypatch.setattr(config, "VAULT_OAUTH_PASSWORD", "correct-horse")
     monkeypatch.setattr(config, "OAUTH_CLIENTS_PATH", tmp_path / "oauth_clients.json")
     yield TestClient(build_app(), base_url="https://vault.example")
-    oauth._clients.clear()
 
 
 def register(client):
@@ -117,14 +115,14 @@ def test_showing_the_form_is_not_limited(app):
 def test_registration_is_capped_and_nothing_more_is_saved(app, clock, tmp_path):
     for _ in range(oauth.REGISTRATION_LIMIT):
         assert register(app).status_code == 201
-    saved = (tmp_path / "oauth_clients.json").read_bytes()
+    saved = oauth.get_oauth_state().list_clients()
 
     refused = register(app)
 
     assert refused.status_code == 429 and refused.json()["error"] == "too_many_requests"
     assert int(refused.headers["Retry-After"]) > 0
-    assert (tmp_path / "oauth_clients.json").read_bytes() == saved
-    assert len(oauth._clients) == oauth.REGISTRATION_LIMIT
+    assert oauth.get_oauth_state().list_clients() == saved
+    assert len(saved) == oauth.REGISTRATION_LIMIT
 
     clock[0] += oauth.REGISTRATION_WINDOW_SECONDS + 1
     assert register(app).status_code == 201
