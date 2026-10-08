@@ -162,8 +162,9 @@ def test_exempt_paths_stay_exempt_with_a_real_query_string(real_app_client):
 import base64  # noqa: E402
 import hashlib  # noqa: E402
 import time  # noqa: E402
+from io import StringIO  # noqa: E402
 
-from obsidian_vault_mcp import oauth_state  # noqa: E402
+from obsidian_vault_mcp import oauth_admin, oauth_state  # noqa: E402
 
 LOOPBACK = "http://127.0.0.1:8420"
 REDIRECT = "https://app.example/cb"
@@ -228,13 +229,16 @@ def _stop_honouring(case, token, monkeypatch):
     if case == "other-resource":
         # The server now answers under another public URL, so it is another resource.
         monkeypatch.setattr(config, "VAULT_MCP_PUBLIC_URL", "https://other.example.xyz")
+    elif case == "revoked-by-cli":
+        client_id = oauth.get_oauth_state().lookup_access_token(token).client_id
+        assert oauth_admin.main(["clients", "revoke", client_id], stdout=StringIO()) == 0
     else:
         state = oauth.get_oauth_state()
         later = time.time() + oauth_state.ACCESS_TOKEN_TTL_SECONDS + 1
         monkeypatch.setattr(state, "_clock", lambda: later)
 
 
-@pytest.mark.parametrize("case", ["other-resource", "expired"])
+@pytest.mark.parametrize("case", ["other-resource", "revoked-by-cli", "expired"])
 def test_v1_token_is_refused_through_mcp(vault_dir, monkeypatch, case):
     monkeypatch.setattr(auth_module, "VAULT_MCP_TOKEN", "secret-token")
     monkeypatch.setattr(config, "VAULT_OAUTH_USERNAME", "obsidian")
