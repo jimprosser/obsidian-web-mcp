@@ -263,20 +263,23 @@ Generate secrets with: `python -c "import secrets; print(secrets.token_hex(32))"
 
 ## OAuth clients and tokens
 
-Each client that completes the OAuth flow gets its own access token, valid for one day, and a refresh token, valid for thirty days and replaced on every use. A refresh token that was already used is refused; the tokens issued since stay valid. Every client has the same full tool access as `VAULT_MCP_TOKEN`, which keeps working as before.
+Each client that completes the OAuth flow gets its own access token, valid for one day, and a refresh token, valid for thirty days and replaced on every use. A refresh token that was already used is refused; the tokens issued since stay valid. A client can read and write the vault, like `VAULT_MCP_TOKEN`, unless you make it read-only (below). `VAULT_MCP_TOKEN` keeps working as before.
 
 Clients and tokens live in `oauth_state.sqlite3`, next to `oauth_clients.json` (`~/.local/share/vault-mcp/` by default). Secrets and tokens are stored as hashes only. Whenever the store opens, its directory is tightened to `0700` and the database file to `0600`. Keep that directory outside the vault and do not share it with other applications; the server does not check either.
 
 ```bash
 vault-mcp-oauth clients list
 vault-mcp-oauth clients revoke <client-id>
+vault-mcp-oauth clients access <client-id> read|write
 ```
 
-Both print JSON and no secrets. A revoked client is refused by the running server on its next request, no restart needed. The client configured with `VAULT_OAUTH_CLIENT_ID` is listed once it has a token; its secret and redirect URIs stay in the environment, so the listing shows none.
+All three print JSON and no secrets. A revoked client is refused by the running server on its next request, no restart needed. The client configured with `VAULT_OAUTH_CLIENT_ID` is listed once it has a token; its secret and redirect URIs stay in the environment, so the listing shows none.
+
+**Read-only clients.** `clients access <client-id> read` limits a client to the tools that only read: every tool that changes the vault is refused with an error naming the reason, and nothing runs. That includes `vault_edit` and `vault_move` with `dry_run`, `vault_request_upload_url` (so the client gets no upload URL), and any extension tool that is not declared with `register_audit_operation(..., kind="read")`. `clients access <client-id> write` gives write back; `write` is the default for every client. A change takes effect on the client's next request, no restart needed. `VAULT_MCP_TOKEN` always has full access, so a client still holding it (see Upgrading) cannot be made read-only until that token is rotated. An upload URL issued before the change stays usable until it expires, as it does after a revocation. Extension HTTP routes, and extension tools that do not go through `run_audited`, are outside this check: limiting them is the extension's job. `clients list` shows each client's `access`.
 
 **Upgrading.** Whenever the store opens, it adds the clients from `oauth_clients.json` that it does not have yet. The file is only read, never changed or removed. From then on the database is the source of truth: editing a client in the JSON file has no effect, and a revoked client stays revoked. A client that connected before the upgrade holds `VAULT_MCP_TOKEN` itself, so revoking it takes effect only after that token is rotated.
 
-**Going back.** An earlier version reads `oauth_clients.json`, which this version never writes. Clients registered since the upgrade have to register again, and per-client tokens stop working.
+**Going back.** An earlier version reads `oauth_clients.json`, which this version never writes. Clients registered since the upgrade have to register again, and per-client tokens stop working. The version before read-only clients refuses to open the store this one upgraded, rather than give a read-only client write access; to go back to it anyway, run `sqlite3 oauth_state.sqlite3 "PRAGMA user_version = 1"`, and every client can write again.
 
 ## Signed uploads
 
@@ -436,7 +439,7 @@ src/obsidian_vault_mcp/
     frontmatter_index.py    # In-memory YAML frontmatter index with filesystem watcher
     models.py               # Pydantic input validation models
     oauth.py                # OAuth 2.0 authorization code flow with PKCE
-    oauth_admin.py          # vault-mcp-oauth: list and revoke OAuth clients
+    oauth_admin.py          # vault-mcp-oauth: list, revoke, set access of OAuth clients
     oauth_state.py          # SQLite store of OAuth clients and their tokens
     serialization.py        # JSON encoder for tool responses (dates, etc.)
     server.py               # FastMCP server setup, tool registration, entry point
@@ -556,7 +559,9 @@ Two things worth knowing:
   passthrough, because the log only covers operation names it knows. A built-in name cannot
   be re-registered, and registering a name twice with a different kind raises. `func` must
   be synchronous: the record is written when it returns, so a coroutine is refused with
-  `TypeError` rather than logged before its work has run.
+  `TypeError` rather than logged before its work has run. The declaration also decides what a
+  [read-only client](#oauth-clients-and-tokens) may call: only operations declared
+  `kind="read"`; anything else that goes through `run_audited` is refused to it.
 
 #### Community extensions
 

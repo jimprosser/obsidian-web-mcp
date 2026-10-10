@@ -105,13 +105,13 @@ def live_server(tmp_path: Path, vault: Path, extra_env: dict | None = None, boot
             proc.wait(timeout=15)
 
 
-def call_tool_over_http(base_url: str, name: str, arguments: dict) -> dict:
-    """Initialize an MCP session over streamable HTTP with the bearer token and call a tool."""
+def call_tool_over_http(base_url: str, name: str, arguments: dict, token: str = TOKEN) -> dict:
+    """Initialize an MCP session over streamable HTTP with a bearer token and call a tool."""
     from mcp import ClientSession
     from mcp.client.streamable_http import streamablehttp_client
 
     async def run():
-        headers = {"Authorization": f"Bearer {TOKEN}"}
+        headers = {"Authorization": f"Bearer {token}"}
         async with streamablehttp_client(f"{base_url}/", headers=headers) as (read, write, _):
             async with ClientSession(read, write) as session:
                 await session.initialize()

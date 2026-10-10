@@ -293,9 +293,16 @@ def register_upload_tool() -> None:
             expected_sha256=expected_sha256,
             ttl_seconds=ttl_seconds,
         )
-        return _vault_request_upload_url(
-            inp.path, inp.media_type, inp.max_size_bytes, inp.overwrite,
-            inp.create_dirs, inp.expected_sha256, inp.ttl_seconds,
+        # Through run_audited for its access check, not for the log: the name is not an
+        # audited operation (the upload itself is, as vault_upload), so a read-only client
+        # is refused the URL, and with it the one write path that takes no bearer token.
+        return run_audited(
+            "vault_request_upload_url",
+            lambda: _vault_request_upload_url(
+                inp.path, inp.media_type, inp.max_size_bytes, inp.overwrite,
+                inp.create_dirs, inp.expected_sha256, inp.ttl_seconds,
+            ),
+            path=inp.path,
         )
 
 if config.signed_upload_enabled():

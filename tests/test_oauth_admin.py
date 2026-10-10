@@ -1,4 +1,4 @@
-"""Tests for the vault-mcp-oauth command: list and revoke clients in the OAuth store."""
+"""Tests for the vault-mcp-oauth command: list, revoke and set the access of clients."""
 
 import json
 from importlib.metadata import entry_points
@@ -39,6 +39,7 @@ def test_clients_list_shows_every_client_with_its_state():
     assert by_id[kept]["revoked_at"] is None
     assert by_id[revoked]["revoked_at"] is not None
     assert by_id[kept]["redirect_uris"] == ["https://app.example/cb"]
+    assert by_id[kept]["access"] == "write"
     assert not [key for client in listed for key in client if "secret" in key]
 
 
@@ -73,6 +74,37 @@ def test_clients_revoke_reports_nothing_to_revoke(already_revoked):
     code, answer, _err = _run("clients", "revoke", client_id)
 
     assert (code, answer) == (1, {"client_id": client_id, "revoked": False})
+
+
+def test_clients_access_sets_the_level_the_client_tokens_carry():
+    client_id = _registered()
+    issued = oauth.get_oauth_state().issue_token_pair(client_id=client_id, resource=RESOURCE)
+
+    code, answer, _err = _run("clients", "access", client_id, "read")
+    _code, listed, _err = _run("clients", "list")
+
+    assert (code, answer) == (0, {"client_id": client_id, "access": "read"})
+    assert oauth.get_oauth_state().lookup_access_token(issued.access_token).access == "read"
+    assert [client["access"] for client in listed] == ["read"]
+    assert _run("clients", "access", client_id, "write")[:2] == (0, {"client_id": client_id, "access": "write"})
+    assert oauth.get_oauth_state().lookup_access_token(issued.access_token).access == "write"
+
+
+def test_clients_access_reports_an_unknown_client():
+    code, answer, _err = _run("clients", "access", "vault-mcp-unknown", "read")
+
+    assert (code, answer) == (1, {"client_id": "vault-mcp-unknown", "access": None})
+
+
+def test_clients_access_refuses_a_level_it_does_not_know(capsys):
+    client_id = _registered()
+
+    with pytest.raises(SystemExit) as exited:
+        _run("clients", "access", client_id, "admin")
+
+    assert exited.value.code == 2
+    assert "invalid choice" in capsys.readouterr().err
+    assert oauth.get_oauth_state().get_client(client_id).access == "write"
 
 
 def test_state_that_cannot_open_is_an_error(tmp_path, monkeypatch):

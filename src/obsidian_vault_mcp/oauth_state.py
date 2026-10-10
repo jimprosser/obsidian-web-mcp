@@ -22,11 +22,16 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 ACCESS_TOKEN_TTL_SECONDS = 24 * 60 * 60
 REFRESH_TOKEN_TTL_SECONDS = 30 * 24 * 60 * 60
+ACCESS_LEVELS = ("read", "write")
 
-_SCHEMA = """
+# What a client may do with the vault. Version 1 had no such column; adding it with this
+# default upgrades a store in place and leaves every client it holds with write access.
+_ACCESS_COLUMN = "access TEXT NOT NULL DEFAULT 'write' CHECK (access IN ('read', 'write'))"
+
+_SCHEMA = f"""
 CREATE TABLE IF NOT EXISTS clients (
     client_id TEXT PRIMARY KEY,
     secret_verifier BLOB,
@@ -34,7 +39,8 @@ CREATE TABLE IF NOT EXISTS clients (
     client_name TEXT NOT NULL,
     created_at REAL NOT NULL,
     last_authorized_at REAL,
-    revoked_at REAL
+    revoked_at REAL,
+    {_ACCESS_COLUMN}
 );
 CREATE TABLE IF NOT EXISTS client_redirect_uris (
     client_id TEXT NOT NULL REFERENCES clients(client_id) ON DELETE CASCADE,
@@ -94,6 +100,7 @@ class ClientMetadata:
     last_authorized_at: float | None
     revoked_at: float | None
     is_static: bool
+    access: str
 
 
 @dataclass(frozen=True)
@@ -111,6 +118,7 @@ class TokenMetadata:
     resource: str
     issued_at: float
     expires_at: float
+    access: str
 
 
 @dataclass(frozen=True)
@@ -239,6 +247,17 @@ class OAuthState:
             )
         return result.rowcount == 1
 
+    def set_client_access(self, client_id: str, access: str) -> bool:
+        """Set what a client may do; its tokens carry the level from their next use.
+        False if there is no such client."""
+        if access not in ACCESS_LEVELS:
+            raise ValueError(f"access must be one of {ACCESS_LEVELS}, got {access!r}")
+        with self._transaction() as connection:
+            result = connection.execute(
+                "UPDATE clients SET access = ? WHERE client_id = ?", (access, client_id)
+            )
+        return result.rowcount == 1
+
     def get_client(self, client_id: str) -> ClientMetadata | None:
         """Client by id, if any."""
         with self._lock:
@@ -291,9 +310,10 @@ class OAuthState:
         """Access and refresh token for a client the caller has just authorized."""
         now = self._clock()
         with self._transaction() as connection:
-            self._require_active_client(connection, client_id)
+            access = self._require_active_client(connection, client_id)
             issued = self._insert_tokens(
-                connection, client_id=client_id, resource=resource, now=now, with_refresh=True
+                connection, client_id=client_id, resource=resource, now=now,
+                with_refresh=True, access=access,
             )
             connection.execute(
                 "UPDATE clients SET last_authorized_at = ? WHERE client_id = ?",
@@ -305,9 +325,10 @@ class OAuthState:
         """Access token alone, for a client that authenticates with its own secret."""
         now = self._clock()
         with self._transaction() as connection:
-            self._require_active_client(connection, client_id)
+            access = self._require_active_client(connection, client_id)
             return self._insert_tokens(
-                connection, client_id=client_id, resource=resource, now=now, with_refresh=False
+                connection, client_id=client_id, resource=resource, now=now,
+                with_refresh=False, access=access,
             )
 
     def lookup_access_token(self, access_token: str) -> TokenMetadata | None:
@@ -318,7 +339,7 @@ class OAuthState:
         token_id, secret = parsed
         with self._lock:
             row = self._connection.execute(
-                "SELECT t.*, c.revoked_at AS client_revoked_at "
+                "SELECT t.*, c.revoked_at AS client_revoked_at, c.access AS client_access "
                 "FROM access_tokens AS t JOIN clients AS c USING (client_id) "
                 "WHERE t.token_id = ?",
                 (token_id,),
@@ -341,6 +362,8 @@ class OAuthState:
             resource=str(row["resource"]),
             issued_at=float(row["issued_at"]),
             expires_at=float(row["expires_at"]),
+            # The client's level now, not when the token was issued: a change applies at once.
+            access=str(row["client_access"]),
         )
 
     def redeem_refresh_token(
@@ -360,7 +383,7 @@ class OAuthState:
         with self._transaction() as connection:
             # Read after the wait for the store, so a token that expired meanwhile is refused.
             now = self._clock()
-            self._require_active_client(connection, client_id)
+            access = self._require_active_client(connection, client_id)
             row = connection.execute(
                 "SELECT * FROM refresh_tokens WHERE token_id = ?", (token_id,)
             ).fetchone()
@@ -388,17 +411,19 @@ class OAuthState:
                 (now, client_id),
             )
             return self._insert_tokens(
-                connection, client_id=client_id, resource=resource, now=now, with_refresh=True
+                connection, client_id=client_id, resource=resource, now=now,
+                with_refresh=True, access=access,
             )
 
     @staticmethod
-    def _require_active_client(connection: sqlite3.Connection, client_id: str) -> None:
-        """Refuse an unknown or revoked client."""
+    def _require_active_client(connection: sqlite3.Connection, client_id: str) -> str:
+        """Refuse an unknown or revoked client; otherwise its access level."""
         row = connection.execute(
-            "SELECT revoked_at FROM clients WHERE client_id = ?", (client_id,)
+            "SELECT revoked_at, access FROM clients WHERE client_id = ?", (client_id,)
         ).fetchone()
         if row is None or row["revoked_at"] is not None:
             raise InvalidClient("unknown or revoked client")
+        return str(row["access"])
 
     def _insert_tokens(
         self,
@@ -408,6 +433,7 @@ class OAuthState:
         resource: str,
         now: float,
         with_refresh: bool,
+        access: str,
     ) -> IssuedToken:
         """Store new tokens and return them."""
         # Access token
@@ -455,6 +481,7 @@ class OAuthState:
                 resource=resource,
                 issued_at=now,
                 expires_at=expires_at,
+                access=access,
             ),
             refresh_token=refresh_token,
         )
@@ -475,22 +502,21 @@ class OAuthState:
         self._connection.execute("PRAGMA synchronous = FULL")
 
     def _initialize_schema(self) -> None:
-        """Create the tables once."""
-        with self._lock:
-            version = int(self._connection.execute("PRAGMA user_version").fetchone()[0])
-            if version not in (0, SCHEMA_VERSION):
+        """Create the tables once, or upgrade the ones an older version created."""
+        # The version is read inside the write transaction: of two processes opening an
+        # old store at once (the server and vault-mcp-oauth), the second must find the
+        # upgrade done, not run it again.
+        with self._transaction() as connection:
+            version = int(connection.execute("PRAGMA user_version").fetchone()[0])
+            if version == 0:
+                for statement in _SCHEMA.split(";"):
+                    if statement.strip():
+                        connection.execute(statement)
+            elif version == 1:
+                connection.execute(f"ALTER TABLE clients ADD COLUMN {_ACCESS_COLUMN}")
+            elif version != SCHEMA_VERSION:
                 raise OAuthStateError(f"unsupported OAuth state schema version {version}")
-            script = (
-                "BEGIN IMMEDIATE;\n"
-                f"{_SCHEMA}\n"
-                f"PRAGMA user_version = {SCHEMA_VERSION};\n"
-                "COMMIT;\n"
-            )
-            try:
-                self._connection.executescript(script)
-            except BaseException:
-                self._connection.rollback()
-                raise
+            connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
 
     # --- Import of the JSON registry -----------------------------------------------------
 
@@ -636,4 +662,5 @@ def _client_from_row(row: sqlite3.Row, redirect_uris: tuple[str, ...]) -> Client
         ),
         revoked_at=float(row["revoked_at"]) if row["revoked_at"] is not None else None,
         is_static=bool(row["is_static"]),
+        access=str(row["access"]),
     )

@@ -346,7 +346,15 @@ def run_audited(operation: str, func, **context) -> str:
     ``func`` must be synchronous. An awaitable result raises TypeError on every path,
     including with auditing off, so the mistake shows in development and not first in a
     deployment that turns the log on.
+
+    This is also where a read-only client is stopped: a caller without write access may
+    run only operations whose kind is "read". Anything else, including an operation the
+    log does not know, is refused before ``func`` runs (fail closed).
     """
+    read_only = current_request_context().get("access", "write") != "write"
+    if read_only and operation_kind(operation) != "read":
+        return _refuse_read_only(operation, context)
+
     if not should_audit_operation(operation):
         return _call_synchronously(operation, func)
 
@@ -384,6 +392,19 @@ def run_audited(operation: str, func, **context) -> str:
         )
     write_audit_record(record)
     return result
+
+
+def _refuse_read_only(operation: str, context: dict) -> str:
+    """The error a read-only caller gets instead of the operation, recorded like its outcome."""
+    error = f"This client is read-only: {operation} is not a read operation, so it was refused"
+    if should_audit_operation(operation):
+        write_audit_record(build_audit_record(
+            operation=operation,
+            target_path=infer_target_path(operation, context) or context.get("paths"),
+            operation_status="error",
+            error=error,
+        ))
+    return dumps({"error": error})
 
 
 def _run_audited_batch(operation: str, func, context: dict) -> str:

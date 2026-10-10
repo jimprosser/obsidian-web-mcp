@@ -1,9 +1,9 @@
-"""The vault-mcp-oauth command: list and revoke OAuth clients in the local store.
+"""The vault-mcp-oauth command: list, revoke and set the access of OAuth clients.
 
 It opens the same store the server uses, beside OAUTH_CLIENTS_PATH, importing the legacy
 registry like every open, and it does so in Cloudflare Access mode too: this is local
-administration, not a served endpoint. A revocation takes effect on a running server at
-once, because every token lookup checks the client.
+administration, not a served endpoint. A revocation or an access change takes effect on
+a running server at once, because every token lookup reads the client.
 """
 
 from __future__ import annotations
@@ -16,7 +16,7 @@ from typing import TextIO
 
 from . import config
 from .oauth import _state_path
-from .oauth_state import ClientMetadata, OAuthState, OAuthStateError
+from .oauth_state import ACCESS_LEVELS, ClientMetadata, OAuthState, OAuthStateError
 
 
 # --- Arguments ---------------------------------------------------------------------------
@@ -25,14 +25,18 @@ from .oauth_state import ClientMetadata, OAuthState, OAuthStateError
 def _parser() -> argparse.ArgumentParser:
     """The command line of vault-mcp-oauth."""
     parser = argparse.ArgumentParser(
-        prog="vault-mcp-oauth", description="List and revoke OAuth clients of the vault MCP server."
+        prog="vault-mcp-oauth",
+        description="List, revoke and set the access of OAuth clients of the vault MCP server.",
     )
     resources = parser.add_subparsers(dest="resource", required=True)
     clients = resources.add_parser("clients", help="Registered OAuth clients")
     actions = clients.add_subparsers(dest="action", required=True)
-    actions.add_parser("list", help="List every client and whether it is revoked")
+    actions.add_parser("list", help="List every client, its access, and whether it is revoked")
     revoke = actions.add_parser("revoke", help="Revoke a client; its tokens stop working")
     revoke.add_argument("client_id")
+    access = actions.add_parser("access", help="Let a client only read the vault, or also write")
+    access.add_argument("client_id")
+    access.add_argument("level", choices=ACCESS_LEVELS)
     return parser
 
 
@@ -42,6 +46,7 @@ def _parser() -> argparse.ArgumentParser:
 def _client_payload(client: ClientMetadata) -> dict[str, object]:
     """A client as printed: metadata only, the store holds no secret to print."""
     return {
+        "access": client.access,
         "client_id": client.client_id,
         "client_name": client.client_name,
         "created_at": client.created_at,
@@ -73,6 +78,11 @@ def main(argv: list[str] | None = None, *, stdout: TextIO | None = None,
         if args.action == "list":
             _emit(output, [_client_payload(client) for client in state.list_clients()])
             return 0
+        if args.action == "access":
+            updated = state.set_client_access(args.client_id, args.level)
+            _emit(output, {"client_id": args.client_id, "access": args.level if updated else None})
+            # An unknown client has no access to set.
+            return 0 if updated else 1
         revoked = state.revoke_client(args.client_id)
         _emit(output, {"client_id": args.client_id, "revoked": revoked})
         # Nothing to revoke (unknown or already revoked) is not a success a script can build on.
