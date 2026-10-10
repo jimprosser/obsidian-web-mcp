@@ -350,26 +350,39 @@ def test_a_result_that_became_unreadable_is_dropped_at_query_time(semantic, vaul
 
 # --- the index files --------------------------------------------------------------------
 
+# The embeddings table as an index built before this extension has it: the layout it creates too.
+EMBEDDINGS_TABLE = (
+    "CREATE TABLE embeddings (path TEXT PRIMARY KEY, embedding BLOB, mtime REAL, "
+    "title TEXT, excerpt TEXT, updated_at REAL)"
+)
+
+
 def _mode(path: Path) -> int:
     return stat.S_IMODE(path.stat().st_mode)
 
 
 def test_the_index_is_owner_only_and_tightens_a_looser_one(vault_dir, fake_model):
     db = config.VAULT_SEMANTIC_DB_PATH
-    # An earlier, looser install: directory 0755, database and its WAL files 0644.
+    # An earlier, looser install that left its files behind: directory 0755, database 0644,
+    # and a WAL that still holds writes, 0644 too. (SQLite recreates empty leftovers with
+    # the database's mode by itself; a WAL with content it keeps, mode and all.)
     db.parent.mkdir(parents=True)
     os.chmod(db.parent, 0o755)
-    with sqlite3.connect(db) as conn:
-        conn.execute("PRAGMA journal_mode=WAL")
-    for path in (db, Path(f"{db}-wal"), Path(f"{db}-shm")):
-        path.touch()
-        os.chmod(path, 0o644)
-
-    with running() as s:
-        s.changed(vault_dir / "test-note.md")  # a write, so the WAL is in use
-        assert _mode(db.parent) == 0o700
+    earlier = sqlite3.connect(db)
+    earlier.execute("PRAGMA journal_mode=WAL")
+    earlier.execute(EMBEDDINGS_TABLE)
+    earlier.commit()
+    try:
         for path in (db, Path(f"{db}-wal"), Path(f"{db}-shm")):
-            assert _mode(path) == 0o600, path
+            assert path.stat().st_size > 0, path
+            os.chmod(path, 0o644)
+
+        with running():
+            assert _mode(db.parent) == 0o700
+            for path in (db, Path(f"{db}-wal"), Path(f"{db}-shm")):
+                assert _mode(path) == 0o600, path
+    finally:
+        earlier.close()
 
 
 def test_a_new_index_is_created_owner_only(vault_dir, fake_model):
@@ -390,10 +403,7 @@ def test_an_existing_index_is_reused_without_embedding_again(vault_dir, fake_mod
     mtime = (vault_dir / "test-note.md").stat().st_mtime
     vector = _semantic_fake.WordEncoder().encode("test note").astype("float32").tobytes()
     with sqlite3.connect(db) as conn:
-        conn.execute(
-            "CREATE TABLE embeddings (path TEXT PRIMARY KEY, embedding BLOB, mtime REAL, "
-            "title TEXT, excerpt TEXT, updated_at REAL)"
-        )
+        conn.execute(EMBEDDINGS_TABLE)
         conn.execute(
             "INSERT INTO embeddings VALUES (?, ?, ?, ?, ?, ?)",
             ("test-note.md", vector, mtime, "Kept title", "kept excerpt", 1.0),
