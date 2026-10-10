@@ -167,12 +167,8 @@ VAULT_AUDIT_LOG_INCLUDE_READS = os.environ.get(
     "VAULT_AUDIT_LOG_INCLUDE_READS", ""
 ).strip().lower() in {"1", "true", "yes", "on"}
 
-# Semantic search (opt-in). VAULT_SEMANTIC_SEARCH turns on vault_semantic_search: every
-# note embedded with sentence-transformers and kept in a SQLite index at
-# VAULT_SEMANTIC_DB_PATH. Needs the `semantic` extra. Off by default, and while it is off
-# nothing under obsidian_vault_mcp.semantic is imported. The index holds an excerpt of every
-# note, so it must live outside the vault; it is kept 0600 in a 0700 directory, by default
-# the one that holds the OAuth state. Both are checked in validate_config().
+# Semantic search (opt-in; needs the `semantic` extra). The index holds an excerpt of every
+# note, so it must resolve outside the vault. Both settings are checked in validate_config().
 VAULT_SEMANTIC_SEARCH = os.environ.get("VAULT_SEMANTIC_SEARCH", "").strip()
 VAULT_SEMANTIC_DB_PATH = Path(os.environ.get(
     "VAULT_SEMANTIC_DB_PATH",

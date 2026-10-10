@@ -1,14 +1,7 @@
 """SemanticExtension: the built-in extension behind vault_semantic_search.
 
 server.serve() adds it ahead of the operator's own extensions when VAULT_SEMANTIC_SEARCH is
-on, once require_dependencies() has found the `semantic` extra. It uses the same seam a
-downstream extension would:
-
-register_tools         -> add vault_semantic_search, declared to the audit log as a read
-before_indexes_start   -> load the model, bring the index up to date, and attach its
-                          listener to the frontmatter index BEFORE that starts watching
-after_indexes_start    -> start the reconcile loop
-shutdown               -> stop the reconcile loop + close the embedding DB
+on and require_dependencies() has found the `semantic` extra.
 """
 
 import logging
@@ -23,16 +16,12 @@ from .index import EmbeddingIndex
 
 logger = logging.getLogger(__name__)
 
-# Result-count and score bounds for the tool.
 MAX_SEMANTIC_RESULTS = 20
 DEFAULT_SEMANTIC_RESULTS = 10
 DEFAULT_MIN_SCORE = 0.3
 
-# Self-healing floor under the file watcher. The macOS FSEvents emitter can die silently
-# (watchdog raises "Cannot add watch ... it is already scheduled" and the emitter returns
-# before reading events), after which no change reaches the index for the life of the
-# process. Re-running the idempotent reconcile on this interval turns a dead watcher into
-# bounded staleness instead of an index that never changes again.
+# The floor under the file watcher: watchdog's macOS FSEvents emitter can die silently
+# ("Cannot add watch ... already scheduled"), and nothing would reach the index again.
 RECONCILE_INTERVAL = 600.0
 
 _DESCRIPTION = (
@@ -90,7 +79,6 @@ class SemanticExtension(Extension):
         self._reconcile: threading.Thread | None = None
 
     def register_tools(self, mcp) -> None:
-        # A read, so it is recorded when VAULT_AUDIT_LOG_INCLUDE_READS is on, like vault_search.
         register_audit_operation("vault_semantic_search", kind="read")
         index = self._index
 
@@ -117,9 +105,8 @@ class SemanticExtension(Extension):
             return run_audited("vault_semantic_search", lambda: _vault_semantic_search(index, inp))
 
     def before_indexes_start(self, frontmatter_index) -> None:
-        # Load the model and reconcile first, then attach the listener BEFORE the
-        # frontmatter index starts watching, so no change is missed between build and attach.
         self._index.start()
+        # Attached before the frontmatter index starts watching, so no change is missed.
         frontmatter_index.add_change_listener(self._index.on_file_changed)
 
     def after_indexes_start(self, frontmatter_index) -> None:
@@ -130,9 +117,6 @@ class SemanticExtension(Extension):
         logger.info("Semantic search enabled (reconcile every %.0fs)", RECONCILE_INTERVAL)
 
     def _reconcile_forever(self) -> None:
-        # wait() blocks for the interval and returns False; it returns True only once
-        # shutdown() sets the event, which ends the loop. A pass that raises is logged and
-        # the loop keeps going, so one bad pass never stalls the floor.
         while not self._stop.wait(RECONCILE_INTERVAL):
             try:
                 self._index.reconcile()

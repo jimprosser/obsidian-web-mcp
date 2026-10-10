@@ -1,13 +1,12 @@
 """Embedding index for vault_semantic_search.
 
-Each .md note is embedded whole with sentence-transformers (all-MiniLM-L6-v2) and the vector
-is stored in SQLite, so the index survives restarts. A query is embedded the same way and
-compared against every stored vector: brute-force cosine similarity, fast enough for a
-personal vault of a few thousand notes.
+Each .md note is embedded whole with sentence-transformers (all-MiniLM-L6-v2) and stored in
+SQLite, so the index survives restarts. A query is compared against every stored vector
+(brute-force cosine similarity), fast enough for a personal vault of a few thousand notes.
 
-Every file the index reads passes the read tools' guard (see _readable_note), and every
-result passes it again before it is returned. The database holds an excerpt of every note,
-so it is created 0600 in a 0700 directory.
+Every file the index reads passes the read tools' guard (_readable_note), and so does every
+result before it is returned. The database holds an excerpt of every note, so it is created
+0600 in a 0700 directory.
 """
 
 import logging
@@ -25,9 +24,20 @@ from ..vault import resolve_vault_read_path
 
 logger = logging.getLogger(__name__)
 
-# The model and the table layout below are the index's compatibility contract: an index
-# written with them is reused as it is. Changing either means embedding every note again.
+# The model and the table layout are the index's compatibility contract: an index written
+# with them is reused as it is. Changing either means embedding every note again.
 EMBEDDING_MODEL = "all-MiniLM-L6-v2"
+
+# Two reads of one note can be in flight at once (overlapping watcher callbacks, a reconcile
+# pass); whichever lands last, the row keeps the newer one.
+_UPSERT = """
+    INSERT INTO embeddings (path, embedding, mtime, title, excerpt, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?)
+    ON CONFLICT(path) DO UPDATE SET
+        embedding = excluded.embedding, mtime = excluded.mtime, title = excluded.title,
+        excerpt = excluded.excerpt, updated_at = excluded.updated_at
+    WHERE excluded.mtime >= embeddings.mtime
+"""
 
 
 def _blob_to_vector(blob: bytes) -> np.ndarray:
@@ -51,7 +61,6 @@ def _extract_excerpt(content: str, max_sentences: int = 3) -> str:
     """Extract opening sentences from content body (after frontmatter)."""
     lines = content.split("\n")
 
-    # Skip YAML frontmatter
     body_start = 0
     if lines and lines[0].strip() == "---":
         for i in range(1, len(lines)):
@@ -59,7 +68,6 @@ def _extract_excerpt(content: str, max_sentences: int = 3) -> str:
                 body_start = i + 1
                 break
 
-    # Collect non-empty, non-heading lines
     sentences = []
     for line in lines[body_start:]:
         stripped = line.strip()
@@ -78,16 +86,13 @@ def _readable_note(rel: str) -> Path | None:
     """The note's resolved path when the index may read it, otherwise None.
 
     The read tools' guard (resolve_vault_read_path: nothing outside the vault, no dot
-    components, no hardlinks) plus the rules of vault_search's walk, which skips excluded
-    directories and never follows a symlink. Applying the walk's rules here too means a
-    change event cannot bring in a file the walk would never surface. Only .md notes up to
-    MAX_CONTENT_SIZE are indexed. Checked on every read and again on every result.
+    components, no hardlinks) plus the rules of vault_search's walk: no excluded directory,
+    no symlink anywhere below the root. Only .md notes up to MAX_CONTENT_SIZE.
     """
     if Path(rel).suffix != ".md" or config.EXCLUDED_DIRS & set(Path(rel).parts):
         return None
     try:
         path = resolve_vault_read_path(rel)
-        # Resolved anywhere but at its own vault path: a symlink somewhere below the root.
         if path != config.VAULT_PATH.resolve() / rel:
             return None
         if path.stat().st_size > config.MAX_CONTENT_SIZE:
@@ -100,8 +105,8 @@ def _readable_note(rel: str) -> Path | None:
 def _tighten_files(db_path: Path) -> None:
     """Create the database 0600 in a 0700 directory, the way the OAuth store does.
 
-    SQLite gives the WAL and shared-memory files it creates the database's mode. Ones an
-    earlier, looser install left behind are tightened here as well.
+    SQLite creates the WAL and shared-memory files with the database's mode, but keeps the
+    mode of ones an earlier, looser install left behind, so those are tightened here.
     """
     db_path.parent.mkdir(parents=True, exist_ok=True)
     os.chmod(db_path.parent, 0o700)
@@ -116,9 +121,8 @@ class EmbeddingIndex:
 
     def __init__(self) -> None:
         self._model = None
+        # Guards self._db, which stop() closes and clears while callbacks may be in flight.
         self._lock = threading.Lock()
-        # Serializes reconcile passes so a periodic run and the startup run never overlap
-        # (the DB connection and the stale set are shared state).
         self._reconcile_lock = threading.Lock()
         self._db: sqlite3.Connection | None = None
 
@@ -126,7 +130,8 @@ class EmbeddingIndex:
         """Open the database, load the embedding model, and bring the index up to date."""
         t0 = time.monotonic()
 
-        db_path = config.VAULT_SEMANTIC_DB_PATH.expanduser()
+        # Resolved first, so a symlinked path tightens the real directory and WAL files.
+        db_path = config.VAULT_SEMANTIC_DB_PATH.expanduser().resolve()
         _tighten_files(db_path)
         self._db = sqlite3.connect(str(db_path), check_same_thread=False)
         self._db.execute("PRAGMA journal_mode=WAL")
@@ -151,22 +156,20 @@ class EmbeddingIndex:
         self.reconcile()
 
     def stop(self) -> None:
-        """Close the SQLite database."""
-        if self._db is not None:
-            self._db.close()
-            self._db = None
+        """Close the database. Work still in flight then finds it closed and does nothing."""
+        with self._lock:
+            if self._db is not None:
+                self._db.close()
+                self._db = None
 
     def reconcile(self) -> None:
-        """Embed any notes new or modified since the last pass; drop ones gone or refused.
+        """Embed notes new or modified since the last pass; drop ones gone or refused.
 
-        Idempotent and safe to call repeatedly: at startup, on the periodic floor, or after
-        a missed event. Non-overlapping: a second concurrent call returns immediately
-        rather than racing the first on the shared DB.
+        Safe to call repeatedly; a call made while a pass is running returns at once.
         """
         if self._db is None or self._model is None:
             return
         if not self._reconcile_lock.acquire(blocking=False):
-            logger.debug("reconcile already running; skipping overlapping pass")
             return
         try:
             self._reconcile_impl()
@@ -176,86 +179,81 @@ class EmbeddingIndex:
     def _reconcile_impl(self) -> None:
         t0 = time.monotonic()
 
-        cursor = self._db.execute("SELECT path, mtime FROM embeddings")
-        db_mtimes = {row[0]: row[1] for row in cursor.fetchall()}
+        with self._lock:
+            if self._db is None:
+                return
+            db_mtimes = dict(self._db.execute("SELECT path, mtime FROM embeddings").fetchall())
 
         to_embed = []
         current_paths = set()
-
         for file_path in _iter_vault_files(config.VAULT_PATH, "*.md"):
             rel = str(file_path.relative_to(config.VAULT_PATH))
             path = _readable_note(rel)
             if path is None:
                 continue
             try:
-                file_mtime = path.stat().st_mtime
+                mtime = path.stat().st_mtime
             except OSError:
                 continue
             current_paths.add(rel)
-            if rel not in db_mtimes or file_mtime > db_mtimes[rel]:
-                to_embed.append((rel, path, file_mtime))
+            if rel not in db_mtimes or mtime > db_mtimes[rel]:
+                to_embed.append((rel, path, mtime))
 
-        # Remove entries for notes that are gone or no longer readable (an index built
-        # without the read guard can hold either). current_paths was snapshotted above, so
-        # re-check under the lock: a note that became readable mid-pass (a live event may
-        # already have embedded it) must not be dropped.
-        stale = set(db_mtimes.keys()) - current_paths
+        # Rows for notes gone or now refused (an index built without the guard can hold
+        # those). current_paths is a snapshot, so re-check: a note that became readable
+        # mid-pass stays.
+        stale = set(db_mtimes) - current_paths
+        removed = 0
         if stale:
-            removed = 0
             with self._lock:
+                if self._db is None:
+                    return
                 for rel in stale:
-                    if _readable_note(rel) is not None:
-                        continue
-                    self._db.execute("DELETE FROM embeddings WHERE path = ?", (rel,))
-                    removed += 1
+                    if _readable_note(rel) is None:
+                        self._db.execute("DELETE FROM embeddings WHERE path = ?", (rel,))
+                        removed += 1
                 self._db.commit()
-            if removed:
-                logger.info("Removed %d stale embedding entries", removed)
 
-        if not to_embed:
-            elapsed = time.monotonic() - t0
-            logger.info("Embedding index up to date (%d files, %.2fs)", len(current_paths), elapsed)
-            return
+        embedded = self._ingest(to_embed)
+        logger.info(
+            "Embedding index reconciled in %.2fs: %d embedded, %d removed, %d notes",
+            time.monotonic() - t0, embedded, removed, len(current_paths),
+        )
 
-        # Batch embed
+    def _ingest(self, notes: list[tuple[str, Path, float]]) -> int:
+        """Read, embed and store notes the read guard admitted, given as (rel, path, mtime).
+
+        The one way content enters the index, for the watcher and reconcile alike. Returns
+        how many notes were embedded.
+        """
         contents = []
-        metadata = []
-        for rel, path, file_mtime in to_embed:
+        rows = []
+        for rel, path, mtime in notes:
             try:
-                content = path.read_text(encoding="utf-8")
+                with open(path, "rb") as f:
+                    data = f.read(config.MAX_CONTENT_SIZE + 1)
+                # The note can grow between the guard's size check and this read.
+                if len(data) > config.MAX_CONTENT_SIZE:
+                    continue
+                content = data.decode("utf-8")
             except (UnicodeDecodeError, OSError):
                 continue
             contents.append(content)
-            metadata.append((rel, file_mtime, _extract_title(content, rel), _extract_excerpt(content)))
+            rows.append((rel, mtime, _extract_title(content, rel), _extract_excerpt(content)))
+        if not contents:
+            return 0
 
-        if contents:
-            vectors = self._model.encode(contents, show_progress_bar=False, normalize_embeddings=True)
-            written = 0
-            with self._lock:
-                for i, (rel, file_mtime, title, excerpt) in enumerate(metadata):
-                    # Lost-update guard: content was read and encoded OUTSIDE the lock, so
-                    # a live on_file_changed() may have landed a newer version meanwhile.
-                    # Skip if the stored row is already at least as new as what this pass read.
-                    row = self._db.execute(
-                        "SELECT mtime FROM embeddings WHERE path = ?", (rel,)
-                    ).fetchone()
-                    if row is not None and row[0] is not None and row[0] >= file_mtime:
-                        continue
-                    self._db.execute(
-                        "INSERT OR REPLACE INTO embeddings (path, embedding, mtime, title, excerpt, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
-                        (rel, _vector_to_blob(vectors[i]), file_mtime, title, excerpt, time.time()),
-                    )
-                    written += 1
-                self._db.commit()
-
-            elapsed = time.monotonic() - t0
-            logger.info(
-                "Embedding index reconciled: %d written, %d total files in %.2fs",
-                written, len(current_paths), elapsed,
-            )
+        vectors = self._model.encode(contents, show_progress_bar=False, normalize_embeddings=True)
+        with self._lock:
+            if self._db is None:
+                return 0
+            for (rel, mtime, title, excerpt), vector in zip(rows, vectors):
+                self._db.execute(_UPSERT, (rel, _vector_to_blob(vector), mtime, title, excerpt, time.time()))
+            self._db.commit()
+        return len(contents)
 
     def on_file_changed(self, abs_path_str: str, exists: bool) -> None:
-        """Mirror one change the frontmatter index's watcher saw (its change listener)."""
+        """The frontmatter index's change listener: mirror one change into this index."""
         if self._db is None or self._model is None:
             return
 
@@ -264,32 +262,20 @@ class EmbeddingIndex:
         except ValueError:
             return
 
-        # Gone, or no longer readable (now a hardlink or a symlink, too large): drop the row.
         path = _readable_note(rel) if exists else None
         if path is None:
+            # Gone, or no longer readable (now a hardlink or a symlink, too large).
             with self._lock:
-                self._db.execute("DELETE FROM embeddings WHERE path = ?", (rel,))
-                self._db.commit()
+                if self._db is not None:
+                    self._db.execute("DELETE FROM embeddings WHERE path = ?", (rel,))
+                    self._db.commit()
             return
 
         try:
-            # The mtime is taken before the read, as in reconcile, so an edit landing
-            # between the two is picked up by the next pass rather than masked by it.
-            file_mtime = path.stat().st_mtime
-            content = path.read_text(encoding="utf-8")
-        except (UnicodeDecodeError, OSError):
+            mtime = path.stat().st_mtime
+        except OSError:
             return
-
-        title = _extract_title(content, rel)
-        excerpt = _extract_excerpt(content)
-        vector = self._model.encode(content, show_progress_bar=False, normalize_embeddings=True)
-
-        with self._lock:
-            self._db.execute(
-                "INSERT OR REPLACE INTO embeddings (path, embedding, mtime, title, excerpt, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
-                (rel, _vector_to_blob(vector), file_mtime, title, excerpt, time.time()),
-            )
-            self._db.commit()
+        self._ingest([(rel, path, mtime)])
 
     def search(
         self,
@@ -310,9 +296,10 @@ class EmbeddingIndex:
         query_vec = self._model.encode(query, show_progress_bar=False, normalize_embeddings=True)
 
         with self._lock:
+            if self._db is None:
+                return []
             if path_prefix:
-                # Escape LIKE wildcards so a prefix containing % or _ is matched
-                # literally (a leading-edge prefix, not a broadened pattern).
+                # Escape LIKE wildcards so a prefix containing % or _ is matched literally.
                 escaped = (
                     path_prefix.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
                 )

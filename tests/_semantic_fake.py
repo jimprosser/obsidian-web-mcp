@@ -17,6 +17,9 @@ import numpy as np
 
 DIM = 256
 
+# Every text handed to the encoder, in order: what the index actually read. Tests clear it.
+ENCODED: list[str] = []
+
 
 class WordEncoder:
     def __init__(self, *args, **kwargs):
@@ -25,6 +28,7 @@ class WordEncoder:
     def encode(self, texts, show_progress_bar=False, normalize_embeddings=True):
         single = isinstance(texts, str)
         items = [texts] if single else list(texts)
+        ENCODED.extend(items)
         out = np.zeros((len(items), DIM), dtype=np.float32)
         for row, text in enumerate(items):
             for word in re.findall(r"[a-z0-9]+", text.lower()):

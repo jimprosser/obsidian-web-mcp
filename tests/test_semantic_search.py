@@ -247,81 +247,159 @@ def test_out_of_bounds_arguments_are_refused(semantic, arguments):
 # --- what the index may read -------------------------------------------------------------
 
 SECRET = "hunter2"
+REFUSED_KINDS = [
+    "outside_symlink", "inside_symlink", "symlinked_dir", "outside_hardlink",
+    "inside_hardlink", "excluded_dir", "dot_dir", "oversize",
+]
 
 
-def _refused(kind: str, vault: Path, outside: Path, name: str) -> list[str]:
-    """Create a note the read guard refuses; return the vault paths that must never surface."""
+def _refused(kind: str, vault: Path, outside: Path, name: str) -> tuple[list[str], list[str]]:
+    """Create a note the read guard refuses.
+
+    Returns the vault paths that must never be read or surface, and the readable notes the
+    setup also created (an in-vault symlink's target), which a reconcile rightly embeds.
+    """
     content = f"quokka {SECRET}\n"
     if kind == "outside_symlink":
         target = outside / f"{name}-outside.md"
         target.write_text(content, encoding="utf-8")
         (vault / f"{name}.md").symlink_to(target)
-        return [f"{name}.md"]
+        return [f"{name}.md"], []
     if kind == "inside_symlink":
         target = vault / f"{name}-target.md"
         target.write_text("quokka\n", encoding="utf-8")
         (vault / f"{name}.md").symlink_to(target)
-        return [f"{name}.md"]
+        return [f"{name}.md"], [f"{name}-target.md"]
     if kind == "symlinked_dir":
         real = outside / f"{name}-dir"
         real.mkdir()
         (real / "note.md").write_text(content, encoding="utf-8")
         (vault / f"{name}-dir").symlink_to(real)
-        return [f"{name}-dir/note.md"]
+        return [f"{name}-dir/note.md"], []
     if kind == "outside_hardlink":
         source = outside / f"{name}-outside.md"
         source.write_text(content, encoding="utf-8")
         os.link(source, vault / f"{name}.md")
-        return [f"{name}.md"]
+        return [f"{name}.md"], []
     if kind == "inside_hardlink":
         (vault / f"{name}-twin.md").write_text(content, encoding="utf-8")
         os.link(vault / f"{name}-twin.md", vault / f"{name}.md")
-        return [f"{name}.md", f"{name}-twin.md"]
+        return [f"{name}.md", f"{name}-twin.md"], []
     if kind == "excluded_dir":
         # A name without a dot, so this is the EXCLUDED_DIRS rule and not the dot rule
         # (the built-in exclusions all start with a dot; dot_dir covers those).
         (vault / "Private").mkdir(exist_ok=True)
         (vault / "Private" / f"{name}.md").write_text(content, encoding="utf-8")
-        return [f"Private/{name}.md"]
+        return [f"Private/{name}.md"], []
     if kind == "dot_dir":
         (vault / ".hidden").mkdir(exist_ok=True)
         (vault / ".hidden" / f"{name}.md").write_text(content, encoding="utf-8")
-        return [f".hidden/{name}.md"]
+        return [f".hidden/{name}.md"], []
     if kind == "oversize":
         padding = "quokka " * (config.MAX_CONTENT_SIZE // 7 + 1)
         (vault / f"{name}.md").write_text(f"{content}{padding}", encoding="utf-8")
-        return [f"{name}.md"]
+        return [f"{name}.md"], []
     raise AssertionError(kind)
 
 
-@pytest.mark.parametrize(
-    "kind",
-    ["outside_symlink", "inside_symlink", "symlinked_dir", "outside_hardlink",
-     "inside_hardlink", "excluded_dir", "dot_dir", "oversize"],
-)
-def test_refused_files_are_never_indexed_or_returned(vault_dir, tmp_path, fake_model, monkeypatch, kind):
+@pytest.mark.parametrize("kind", REFUSED_KINDS)
+@pytest.mark.parametrize("via", ["watcher", "reconcile"])
+def test_refused_files_are_never_read_indexed_or_returned(vault_dir, tmp_path, fake_model, monkeypatch, kind, via):
+    """Each call site on its own: the watcher's events alone, or a reconcile pass alone."""
     monkeypatch.setattr(config, "EXCLUDED_DIRS", config.EXCLUDED_DIRS | {"Private"})
     outside = tmp_path / "outside"
     outside.mkdir()
-    (vault_dir / "control.md").write_text("quokka habitat\n", encoding="utf-8")
-    refused = _refused(kind, vault_dir, outside, "early")  # there when the index first builds
 
     with running() as s:
-        late = _refused(kind, vault_dir, outside, "late")  # arrives while it runs
-        for rel in late:
-            s.changed(vault_dir / rel)  # the watcher's path
-        s.reconcile()  # the periodic floor's path
-        result = s.search(query="quokka", min_score=0.0, max_results=20)
+        _semantic_fake.ENCODED.clear()
+        (vault_dir / "control.md").write_text("quokka habitat\n", encoding="utf-8")
+        refused, readable = _refused(kind, vault_dir, outside, "new")
+        if via == "watcher":
+            for rel in ["control.md", *refused]:
+                s.changed(vault_dir / rel)
+            embeddable = ["control.md"]
+        else:
+            s.reconcile()
+            embeddable = ["control.md", *readable]
 
-        assert "control.md" in _paths(result), "negative control: the query finds a readable note"
-        for rel in refused + late:
-            assert rel not in _paths(result), rel
-            assert rel not in _indexed_paths(), rel
+        # Exactly the readable notes reached the encoder; the control shows this path reads.
+        assert sorted(_semantic_fake.ENCODED) == sorted(
+            (vault_dir / rel).read_text(encoding="utf-8") for rel in embeddable
+        )
+        indexed = _indexed_paths()
+        assert "control.md" in indexed
+        assert not set(refused) & indexed, refused
+
+        result = s.search(query="quokka", min_score=0.0, max_results=20)
+        assert "control.md" in _paths(result)
+        assert not set(refused) & set(_paths(result)), refused
         assert SECRET not in json.dumps(result)
 
 
+@pytest.mark.parametrize("via", ["watcher", "reconcile"])
+def test_a_note_that_grows_past_the_cap_after_its_check_is_not_embedded(semantic, vault_dir, monkeypatch, via):
+    from obsidian_vault_mcp.semantic import index
+
+    note = vault_dir / "growing.md"
+    note.write_text("quokka\n", encoding="utf-8")
+    check = index._readable_note
+
+    def check_then_grow(rel):
+        """The real check, then another writer grows the note before it is read."""
+        path = check(rel)
+        if rel == "growing.md" and path is not None:
+            with open(note, "a", encoding="utf-8") as f:
+                f.write(f"{SECRET} " + "x" * config.MAX_CONTENT_SIZE)
+        return path
+
+    monkeypatch.setattr(index, "_readable_note", check_then_grow)
+    _semantic_fake.ENCODED.clear()
+    semantic.changed(note) if via == "watcher" else semantic.reconcile()
+
+    assert not any(SECRET in text for text in _semantic_fake.ENCODED)
+    assert "growing.md" not in _indexed_paths()
+
+
+def test_an_older_read_never_replaces_a_newer_row(semantic, vault_dir):
+    note = vault_dir / "plans.md"
+
+    def deliver(title: str, mtime: float) -> str:
+        note.write_text(f"# {title}\n\nocelot plans\n", encoding="utf-8")
+        os.utime(note, (mtime, mtime))
+        semantic.changed(note)
+        with sqlite3.connect(config.VAULT_SEMANTIC_DB_PATH) as conn:
+            return conn.execute("SELECT title FROM embeddings WHERE path = 'plans.md'").fetchone()[0]
+
+    now = time.time()
+    assert deliver("Newer", now) == "Newer"
+    # A callback that read an earlier version of the note lands after the newer one.
+    assert deliver("Older", now - 60) == "Newer"
+    assert deliver("Newest", now + 60) == "Newest", "negative control: a newer read does replace"
+
+
+@pytest.mark.parametrize("via", ["watcher", "reconcile"])
+def test_work_in_flight_when_the_index_stops_ends_quietly(semantic, vault_dir, monkeypatch, via):
+    index = semantic.ext._index
+    encode = index._model.encode
+
+    def encode_then_stop(*args, **kwargs):
+        vectors = encode(*args, **kwargs)
+        index.stop()  # shutdown lands while this note is being embedded
+        return vectors
+
+    monkeypatch.setattr(index._model, "encode", encode_then_stop)
+    note = vault_dir / "late.md"
+    note.write_text("okapi\n", encoding="utf-8")
+
+    # Called directly: the frontmatter index would log a listener's exception and carry on.
+    index.on_file_changed(str(note), True) if via == "watcher" else index.reconcile()
+
+    assert index._db is None
+    assert "late.md" not in _indexed_paths()
+
+
 @pytest.mark.parametrize("cleanup", ["watcher", "reconcile"])
-@pytest.mark.parametrize("how", ["hardlinked", "symlinked_out", "deleted"])
+@pytest.mark.parametrize("how", ["hardlinked", "symlinked_out", "grew_past_cap", "deleted"])
 def test_a_result_that_became_unreadable_is_dropped_at_query_time(semantic, vault_dir, tmp_path, how, cleanup):
     note = vault_dir / "plans.md"
     note.write_text("ocelot plans\n", encoding="utf-8")
@@ -336,14 +414,17 @@ def test_a_result_that_became_unreadable_is_dropped_at_query_time(semantic, vaul
         outside.write_text("ocelot plans\n", encoding="utf-8")
         note.unlink()
         note.symlink_to(outside)
+    elif how == "grew_past_cap":
+        with open(note, "a", encoding="utf-8") as f:
+            f.write("x" * config.MAX_CONTENT_SIZE)
     else:
         note.unlink()
 
     assert "plans.md" in _indexed_paths()
     assert _paths(semantic.search(query="ocelot")) == []
 
-    # Then the row itself goes, whichever path notices first: the file still exists in two
-    # of the three cases, so "gone from disk" alone would keep it.
+    # Then the row itself goes, whichever path notices first: the file still exists in three
+    # of the four cases, so "gone from disk" alone would keep it.
     semantic.changed(note) if cleanup == "watcher" else semantic.reconcile()
     assert "plans.md" not in _indexed_paths()
 
@@ -361,25 +442,50 @@ def _mode(path: Path) -> int:
     return stat.S_IMODE(path.stat().st_mode)
 
 
-def test_the_index_is_owner_only_and_tightens_a_looser_one(vault_dir, fake_model):
-    db = config.VAULT_SEMANTIC_DB_PATH
-    # An earlier, looser install that left its files behind: directory 0755, database 0644,
-    # and a WAL that still holds writes, 0644 too. (SQLite recreates empty leftovers with
-    # the database's mode by itself; a WAL with content it keeps, mode and all.)
+def _db_files(db: Path) -> tuple[Path, Path, Path]:
+    return db, Path(f"{db}-wal"), Path(f"{db}-shm")
+
+
+def _leftover_install(db: Path) -> sqlite3.Connection:
+    """An earlier, looser install that left its files behind: directory 0755, database 0644,
+    and a WAL that still holds writes, 0644 too. (SQLite recreates empty leftovers with the
+    database's mode by itself; a WAL with content it keeps, mode and all.) Returned open,
+    which keeps that WAL in place."""
     db.parent.mkdir(parents=True)
     os.chmod(db.parent, 0o755)
-    earlier = sqlite3.connect(db)
-    earlier.execute("PRAGMA journal_mode=WAL")
-    earlier.execute(EMBEDDINGS_TABLE)
-    earlier.commit()
-    try:
-        for path in (db, Path(f"{db}-wal"), Path(f"{db}-shm")):
-            assert path.stat().st_size > 0, path
-            os.chmod(path, 0o644)
+    conn = sqlite3.connect(db)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute(EMBEDDINGS_TABLE)
+    conn.commit()
+    for path in _db_files(db):
+        assert path.stat().st_size > 0, path
+        os.chmod(path, 0o644)
+    return conn
 
+
+def test_the_index_is_owner_only_and_tightens_a_looser_one(vault_dir, fake_model):
+    db = config.VAULT_SEMANTIC_DB_PATH
+    earlier = _leftover_install(db)
+    try:
         with running():
             assert _mode(db.parent) == 0o700
-            for path in (db, Path(f"{db}-wal"), Path(f"{db}-shm")):
+            for path in _db_files(db):
+                assert _mode(path) == 0o600, path
+    finally:
+        earlier.close()
+
+
+def test_a_symlinked_index_path_tightens_the_real_files(vault_dir, fake_model, tmp_path, monkeypatch):
+    real = tmp_path / "real-index" / "embeddings.db"
+    earlier = _leftover_install(real)
+    link = tmp_path / "links" / "embeddings.db"
+    link.parent.mkdir()
+    link.symlink_to(real)
+    monkeypatch.setattr(config, "VAULT_SEMANTIC_DB_PATH", link)
+    try:
+        with running():
+            assert _mode(real.parent) == 0o700
+            for path in _db_files(real):
                 assert _mode(path) == 0o600, path
     finally:
         earlier.close()
@@ -391,7 +497,7 @@ def test_a_new_index_is_created_owner_only(vault_dir, fake_model):
 
     with running():
         assert _mode(db.parent) == 0o700
-        for path in (db, Path(f"{db}-wal"), Path(f"{db}-shm")):
+        for path in _db_files(db):
             assert _mode(path) == 0o600, path
 
 

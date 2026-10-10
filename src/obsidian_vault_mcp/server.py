@@ -902,9 +902,7 @@ def serve(extensions=()):
     if not cf_on and not VAULT_MCP_TOKEN:
         logger.warning("VAULT_MCP_TOKEN is not set -- auth will reject all requests")
 
-    # Semantic search (opt-in): fail CLOSED when it is on but the extra is missing, then add
-    # the built-in extension ahead of the operator's own. While it is off, nothing under
-    # .semantic is imported and the tool does not exist.
+    # Semantic search is opt-in: fail CLOSED without its extra; while off, import nothing of it.
     if config.semantic_search_enabled():
         from .semantic import require_dependencies
         try:
