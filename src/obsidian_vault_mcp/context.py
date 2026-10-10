@@ -2,9 +2,9 @@
 
 The middleware records, per authenticated request, the principal (the bearer token), a
 generated request id, a best-effort client hint, and the caller's access level. The audit
-module reads them when building a record, and run_audited refuses every operation but a
-read to a caller without write access. It lives in its own module so auth.py (the writer)
-and audit.py (the reader) share one ContextVar without importing each other.
+module reads them when building a record, and refuses every operation but a read to a
+caller without write access. It lives in its own module so auth.py (the writer) and
+audit.py (the reader) share one ContextVar without importing each other.
 """
 
 from __future__ import annotations

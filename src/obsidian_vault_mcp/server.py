@@ -33,6 +33,7 @@ from . import config
 from .frontmatter_index import FrontmatterIndex
 from .audit import (
     run_audited,
+    read_only_refusal,
     audit_enabled,
     audit_log_path,
     audit_path_inside_vault,
@@ -108,8 +109,24 @@ async def lifespan(server):
     yield {"frontmatter_index": frontmatter_index}
 
 
+class AccessCheckedFastMCP(FastMCP):
+    """FastMCP that refuses a read-only caller every tool but a read, at dispatch.
+
+    Every tool call passes here, built-in or extension, whether or not the tool goes
+    through run_audited. The refusal goes through the tool's own result conversion, so
+    the client gets it exactly as it would get a tool's {"error": ...} answer.
+    """
+
+    async def call_tool(self, name: str, arguments: dict):
+        tool = self._tool_manager.get_tool(name)
+        refusal = read_only_refusal(name, arguments) if tool is not None else None
+        if refusal is not None:
+            return tool.fn_metadata.convert_result(refusal)
+        return await super().call_tool(name, arguments)
+
+
 # Create the MCP server
-mcp = FastMCP(
+mcp = AccessCheckedFastMCP(
     "obsidian_web_mcp",
     stateless_http=True,
     json_response=True,
@@ -293,16 +310,9 @@ def register_upload_tool() -> None:
             expected_sha256=expected_sha256,
             ttl_seconds=ttl_seconds,
         )
-        # Through run_audited for its access check, not for the log: the name is not an
-        # audited operation (the upload itself is, as vault_upload), so a read-only client
-        # is refused the URL, and with it the one write path that takes no bearer token.
-        return run_audited(
-            "vault_request_upload_url",
-            lambda: _vault_request_upload_url(
-                inp.path, inp.media_type, inp.max_size_bytes, inp.overwrite,
-                inp.create_dirs, inp.expected_sha256, inp.ttl_seconds,
-            ),
-            path=inp.path,
+        return _vault_request_upload_url(
+            inp.path, inp.media_type, inp.max_size_bytes, inp.overwrite,
+            inp.create_dirs, inp.expected_sha256, inp.ttl_seconds,
         )
 
 if config.signed_upload_enabled():

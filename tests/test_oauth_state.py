@@ -741,3 +741,24 @@ def test_two_stores_opening_a_version_1_file_at_once_upgrade_it_once(state_path)
     for store in stores:
         store.close()
     holder.close()
+
+
+def test_store_set_back_to_version_1_upgrades_again_with_its_access_levels(state_path):
+    state = _open(state_path)
+    reader = state.register_client([REDIRECT]).client.client_id
+    writer = state.register_client([REDIRECT]).client.client_id
+    state.set_client_access(reader, "read")
+    state.close()
+    # What README "Going back" tells an operator to do before running the version before.
+    connection = sqlite3.connect(state_path)
+    connection.execute("PRAGMA user_version = 1")
+    connection.close()
+
+    reopened = _open(state_path)
+
+    assert reopened.get_client(reader).access == "read"
+    assert reopened.get_client(writer).access == "write"
+    reopened.close()
+    connection = sqlite3.connect(state_path)
+    assert connection.execute("PRAGMA user_version").fetchone()[0] == 2
+    connection.close()

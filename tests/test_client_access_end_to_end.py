@@ -7,7 +7,7 @@ stub between the token and the tool.
 
 The server carries an extension so the fail-closed rule is tested where it matters: an
 operation the audit log does not know is refused to a read-only client, and one it
-declared as a read is not.
+declared as a read is not, whether or not the tool goes through run_audited.
 """
 
 import json
@@ -30,6 +30,7 @@ from obsidian_vault_mcp.vault import resolve_vault_path, write_file_atomic
 class AccessExtension(Extension):
     def register_tools(self, mcp):
         register_audit_operation("e2e_read", kind="read")
+        register_audit_operation("e2e_bypass_read", kind="read")
 
         @mcp.tool(name="e2e_read")
         def e2e_read(path: str) -> str:
@@ -43,6 +44,16 @@ class AccessExtension(Extension):
                 write_file_atomic(path, content)
                 return json.dumps({"path": path})
             return run_audited("e2e_undeclared", work, path=path)
+
+        # These two never call run_audited: only the check at tool dispatch can stop them.
+        @mcp.tool(name="e2e_bypass_write")
+        def e2e_bypass_write(path: str, content: str) -> str:
+            write_file_atomic(path, content)
+            return json.dumps({"path": path})
+
+        @mcp.tool(name="e2e_bypass_read")
+        def e2e_bypass_read(path: str) -> str:
+            return json.dumps({"path": path, "size": resolve_vault_path(path).stat().st_size})
 
 
 EXTENSIONS = [AccessExtension()]
@@ -135,6 +146,47 @@ def test_read_only_client_is_refused_an_operation_not_declared_as_a_read(server)
     assert _refused(undeclared), undeclared
     assert not (server["vault"] / "undeclared.md").exists()
     assert declared_read == {"path": "declared.md", "size": 2}
+
+
+def test_read_only_client_is_refused_an_undeclared_tool_that_skips_run_audited(server):
+    note = server["vault"] / "bypassed.md"
+    note.write_text("# Original\n")
+    _client_id, token = _read_only_client(server)
+
+    undeclared = _call(server, "e2e_bypass_write", {"path": "bypassed.md", "content": "x\n"}, token)
+    declared_read = _call(server, "e2e_bypass_read", {"path": "bypassed.md"}, token)
+
+    assert _refused(undeclared), undeclared
+    assert note.read_text() == "# Original\n"
+    assert declared_read == {"path": "bypassed.md", "size": len("# Original\n")}
+
+
+def test_read_only_client_keeps_the_built_in_reads_that_skip_run_audited(server):
+    _client_id, token = _read_only_client(server)
+
+    path = _call(server, "vault_daily_note_path", {}, token)
+    summary = _call(server, "vault_analytics_summary", {}, token)
+    findings = _call(server, "vault_analytics_findings", {"category": "frontmatter_missing"}, token)
+
+    assert "error" not in path and path["path"].endswith(".md"), path
+    assert "error" not in summary and "examples" in summary, summary
+    assert "error" not in findings and findings["category"] == "frontmatter_missing", findings
+
+
+def test_read_only_client_is_refused_dry_runs_of_edit_and_move(server):
+    (server["vault"] / "dry.md").write_text("# Dry\n")
+    _client_id, token = _read_only_client(server)
+
+    edit = _call(server, "vault_edit", {
+        "path": "dry.md", "edits": [{"old_text": "# Dry", "new_text": "# Wet"}], "dry_run": True,
+    }, token)
+    move = _call(server, "vault_move", {
+        "source": "dry.md", "destination": "moved.md", "dry_run": True,
+    }, token)
+
+    # The refusal is the whole answer: no preview of the edit or of the link rewrites.
+    assert _refused(edit) and set(edit) == {"error"}, edit
+    assert _refused(move) and set(move) == {"error"}, move
 
 
 def test_access_change_applies_to_the_next_request_without_a_restart(server):

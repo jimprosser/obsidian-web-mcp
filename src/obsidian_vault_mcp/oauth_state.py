@@ -513,7 +513,11 @@ class OAuthState:
                     if statement.strip():
                         connection.execute(statement)
             elif version == 1:
-                connection.execute(f"ALTER TABLE clients ADD COLUMN {_ACCESS_COLUMN}")
+                # A store set back to version 1 to run the version before (README, "Going
+                # back") still has the column, with every client's level in it.
+                columns = {row["name"] for row in connection.execute("PRAGMA table_info(clients)")}
+                if "access" not in columns:
+                    connection.execute(f"ALTER TABLE clients ADD COLUMN {_ACCESS_COLUMN}")
             elif version != SCHEMA_VERSION:
                 raise OAuthStateError(f"unsupported OAuth state schema version {version}")
             connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")

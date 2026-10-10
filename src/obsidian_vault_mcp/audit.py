@@ -56,6 +56,11 @@ READ_OPERATIONS = {
     "vault_list",
     "vault_canvas_read",
     "vault_daily_note_read",
+    # Not run through run_audited, so never in the log; named here so that a read-only
+    # client may call them.
+    "vault_daily_note_path",
+    "vault_analytics_summary",
+    "vault_analytics_findings",
 }
 
 # Mutations whose result reports per-file outcomes; audited one record per file.
@@ -347,13 +352,13 @@ def run_audited(operation: str, func, **context) -> str:
     including with auditing off, so the mistake shows in development and not first in a
     deployment that turns the log on.
 
-    This is also where a read-only client is stopped: a caller without write access may
-    run only operations whose kind is "read". Anything else, including an operation the
-    log does not know, is refused before ``func`` runs (fail closed).
+    A read-only caller is refused anything but a read before ``func`` runs. MCP tool calls
+    are already checked at dispatch (server.AccessCheckedFastMCP); this second check covers
+    callers that are not tools, such as an extension route.
     """
-    read_only = current_request_context().get("access", "write") != "write"
-    if read_only and operation_kind(operation) != "read":
-        return _refuse_read_only(operation, context)
+    refusal = read_only_refusal(operation, context)
+    if refusal is not None:
+        return refusal
 
     if not should_audit_operation(operation):
         return _call_synchronously(operation, func)
@@ -394,8 +399,16 @@ def run_audited(operation: str, func, **context) -> str:
     return result
 
 
-def _refuse_read_only(operation: str, context: dict) -> str:
-    """The error a read-only caller gets instead of the operation, recorded like its outcome."""
+def read_only_refusal(operation: str, context: dict) -> str | None:
+    """None when the caller may run the operation; otherwise the error it gets instead.
+
+    A caller without write access may run only operations whose kind is "read". Anything
+    else, including an operation the log does not know, is refused (fail closed), and the
+    refusal is recorded like the operation's outcome when the operation is audited.
+    """
+    may_write = current_request_context().get("access", "write") == "write"
+    if may_write or operation_kind(operation) == "read":
+        return None
     error = f"This client is read-only: {operation} is not a read operation, so it was refused"
     if should_audit_operation(operation):
         write_audit_record(build_audit_record(
