@@ -376,20 +376,29 @@ def test_a_note_restored_with_an_older_mtime_is_embedded_again(semantic, vault_d
     assert _title("plans.md") == "Restored"
 
 
-def test_a_reconcile_pass_never_replaces_a_newer_watcher_row(semantic, vault_dir):
-    """A pass that read the note before a watcher event stored a newer read loses."""
+def test_reconcile_catches_a_restore_the_watcher_missed_and_a_late_stale_write(semantic, vault_dir):
+    """mtime is not a version: any row whose mtime differs from the file's is re-embedded."""
     note = vault_dir / "plans.md"
+    index = semantic.ext._index
     now = time.time()
-    note.write_text("# Newer\n\nocelot plans\n", encoding="utf-8")
+    note.write_text("# Current\n\nocelot plans\n", encoding="utf-8")
     os.utime(note, (now, now))
     semantic.changed(note)
-    index = semantic.ext._index
 
-    note.write_text("# Snapshot\n\nocelot plans\n", encoding="utf-8")
-    index._ingest([("plans.md", note, now - 60)], newer_only=True)
-    assert _title("plans.md") == "Newer"
-    index._ingest([("plans.md", note, now + 60)], newer_only=True)
-    assert _title("plans.md") == "Snapshot", "negative control: a newer pass does replace"
+    # Restored from a backup, older mtime, and no watcher event.
+    note.write_text("# Restored\n\nocelot plans\n", encoding="utf-8")
+    os.utime(note, (now - 60, now - 60))
+    index.reconcile()
+    assert _title("plans.md") == "Restored"
+
+    # A slow read of other content lands late, stamped with an mtime the file no longer has.
+    note.write_text("# Stale\n\nocelot plans\n", encoding="utf-8")
+    index._ingest([("plans.md", note, now + 60)])
+    note.write_text("# Restored\n\nocelot plans\n", encoding="utf-8")
+    os.utime(note, (now - 60, now - 60))
+    assert _title("plans.md") == "Stale"
+    index.reconcile()
+    assert _title("plans.md") == "Restored"
 
 
 @pytest.mark.parametrize("via", ["watcher", "reconcile"])

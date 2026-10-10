@@ -35,11 +35,11 @@ _UPSERT = """
         embedding = excluded.embedding, mtime = excluded.mtime, title = excluded.title,
         excerpt = excluded.excerpt, updated_at = excluded.updated_at
 """
-# A reconcile pass reads a snapshot and embeds slowly; a watcher event can store a newer
-# read of the same note meanwhile, which the pass must not replace. The watcher itself
-# always stores what it read: a note restored with an older mtime is still a change, and
-# an older callback that lands late is healed by the next pass (the file's mtime is newer).
-_UPSERT_IF_NEWER = _UPSERT + "    WHERE excluded.mtime >= embeddings.mtime\n"
+# Every write stores what it read, with the mtime it read. A read that lands after a newer
+# one (a slow reconcile pass, a late watcher callback) leaves a row whose mtime differs from
+# the file's, and the next pass re-embeds any such note, so the index converges within one
+# interval whatever the order. An mtime is not a version: a note restored from a backup
+# goes back in time, which is why the pass compares for difference, not for newer.
 
 
 def _blob_to_vector(blob: bytes) -> np.ndarray:
@@ -198,12 +198,12 @@ class EmbeddingIndex:
             except OSError:
                 continue
             current_paths.add(rel)
-            if rel not in db_mtimes or mtime > db_mtimes[rel]:
+            if rel not in db_mtimes or mtime != db_mtimes[rel]:
                 to_embed.append((rel, path, mtime))
 
         # Rows for notes gone or now refused (an index built without the guard can hold
-        # those). current_paths is a snapshot, so re-check: a note that became readable
-        # mid-pass stays.
+        # those). One that is readable again by now comes back with its watcher event or
+        # the next pass.
         stale = set(db_mtimes) - current_paths
         removed = 0
         if stale:
@@ -211,18 +211,17 @@ class EmbeddingIndex:
                 if self._db is None:
                     return
                 for rel in stale:
-                    if _readable_note(rel) is None:
-                        self._db.execute("DELETE FROM embeddings WHERE path = ?", (rel,))
-                        removed += 1
+                    self._db.execute("DELETE FROM embeddings WHERE path = ?", (rel,))
+                    removed += 1
                 self._db.commit()
 
-        embedded = self._ingest(to_embed, newer_only=True)
+        embedded = self._ingest(to_embed)
         logger.info(
             "Embedding index reconciled in %.2fs: %d embedded, %d removed, %d notes",
             time.monotonic() - t0, embedded, removed, len(current_paths),
         )
 
-    def _ingest(self, notes: list[tuple[str, Path, float]], *, newer_only: bool = False) -> int:
+    def _ingest(self, notes: list[tuple[str, Path, float]]) -> int:
         """Read, embed and store notes the read guard admitted, given as (rel, path, mtime).
 
         The one way content enters the index, for the watcher and reconcile alike. Returns
@@ -250,7 +249,7 @@ class EmbeddingIndex:
             if self._db is None:
                 return 0
             for (rel, mtime, title, excerpt), vector in zip(rows, vectors):
-                self._db.execute(_UPSERT_IF_NEWER if newer_only else _UPSERT, (rel, _vector_to_blob(vector), mtime, title, excerpt, time.time()))
+                self._db.execute(_UPSERT, (rel, _vector_to_blob(vector), mtime, title, excerpt, time.time()))
             self._db.commit()
         return len(contents)
 
