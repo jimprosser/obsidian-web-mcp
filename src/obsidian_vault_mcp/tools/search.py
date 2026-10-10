@@ -49,7 +49,14 @@ def _search_ripgrep(
     except (subprocess.TimeoutExpired, FileNotFoundError):
         return []
 
-    matches = []
+    # ripgrep streams one event per line: "begin", then "context" and "match" events,
+    # then "end". A match's trailing context arrives after the match event, so the
+    # block cannot be assembled while streaming: collect the lines rg emitted per file,
+    # then cut each match's window out of them. Before this, every "context" event was
+    # dropped and match_context held the bare matching line, while _search_python
+    # returned the surrounding lines (#39).
+    emitted: dict[str, dict[int, str]] = {}
+    hits: list[tuple[str, int]] = []
 
     for line in result.stdout.splitlines():
         try:
@@ -57,28 +64,44 @@ def _search_ripgrep(
         except json.JSONDecodeError:
             continue
 
-        if data.get("type") == "match":
-            match_data = data["data"]
-            file_path = match_data["path"]["text"]
-            try:
-                rel_path = str(Path(file_path).relative_to(config.VAULT_PATH))
-                # rg has already read the bytes. A refusal must discard its match,
-                # not fall back to the line in the JSON event.
-                resolve_vault_read_path(rel_path)
-            except (ValueError, OSError):
-                continue
+        if data.get("type") not in ("match", "context"):
+            continue
+        event = data["data"]
+        line_number = event.get("line_number")
+        # A hit in a binary file carries {"bytes": ...} and no usable line: skip it.
+        line_text = event.get("lines", {}).get("text")
+        if line_number is None or line_text is None:
+            continue
+        file_path = event["path"]["text"]
+        # "\r\n" too: _search_python splits with str.splitlines, which drops both.
+        emitted.setdefault(file_path, {})[line_number] = line_text.rstrip("\r\n")
+        if data["type"] == "match":
+            hits.append((file_path, line_number))
 
-            line_number = match_data["line_number"]
-            line_text = match_data["lines"]["text"].rstrip("\n")
+    matches = []
 
-            matches.append({
-                "path": rel_path,
-                "line_number": line_number,
-                "match_context": line_text,
-            })
+    for file_path, line_number in hits:
+        try:
+            rel_path = str(Path(file_path).relative_to(config.VAULT_PATH))
+            # rg has already read the bytes. A refusal must discard its match,
+            # not fall back to the line in the JSON event.
+            resolve_vault_read_path(rel_path)
+        except (ValueError, OSError):
+            continue
 
-            if len(matches) >= max_results:
-                break
+        # The same window as _search_python's lines[i - n : i + n + 1]. Neighbours that
+        # don't exist (start or end of the file) are left out, not padded.
+        lines = emitted[file_path]
+        window = [lines[n] for n in range(line_number - context_lines, line_number + context_lines + 1) if n in lines]
+
+        matches.append({
+            "path": rel_path,
+            "line_number": line_number,
+            "match_context": "\n".join(window),
+        })
+
+        if len(matches) >= max_results:
+            break
 
     return matches
 
