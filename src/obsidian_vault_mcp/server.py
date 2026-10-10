@@ -16,6 +16,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp.exceptions import ToolError
 from mcp.server.transport_security import TransportSecuritySettings
 
 from .config import (
@@ -113,15 +114,19 @@ class AccessCheckedFastMCP(FastMCP):
     """FastMCP that refuses a read-only caller every tool but a read, at dispatch.
 
     Every tool call passes here, built-in or extension, whether or not the tool goes
-    through run_audited. The refusal goes through the tool's own result conversion, so
-    the client gets it exactly as it would get a tool's {"error": ...} answer.
+    through run_audited. The refusal goes through the tool's own result conversion, so a
+    tool that answers with text gives it as its usual {"error": ...} answer; a tool whose
+    output schema cannot carry that text gives it as a protocol-level tool error.
     """
 
     async def call_tool(self, name: str, arguments: dict):
         tool = self._tool_manager.get_tool(name)
         refusal = read_only_refusal(name, arguments) if tool is not None else None
         if refusal is not None:
-            return tool.fn_metadata.convert_result(refusal)
+            try:
+                return tool.fn_metadata.convert_result(refusal)
+            except Exception:
+                raise ToolError(json.loads(refusal)["error"]) from None
         return await super().call_tool(name, arguments)
 
 

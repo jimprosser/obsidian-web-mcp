@@ -51,6 +51,12 @@ class AccessExtension(Extension):
             write_file_atomic(path, content)
             return json.dumps({"path": path})
 
+        # Structured output: its schema cannot carry the {"error": ...} text a refusal is.
+        @mcp.tool(name="e2e_structured_write")
+        def e2e_structured_write(path: str, content: str) -> dict[str, str]:
+            write_file_atomic(path, content)
+            return {"path": path}
+
         @mcp.tool(name="e2e_bypass_read")
         def e2e_bypass_read(path: str) -> str:
             return json.dumps({"path": path, "size": resolve_vault_path(path).stat().st_size})
@@ -159,6 +165,18 @@ def test_read_only_client_is_refused_an_undeclared_tool_that_skips_run_audited(s
     assert _refused(undeclared), undeclared
     assert note.read_text() == "# Original\n"
     assert declared_read == {"path": "bypassed.md", "size": len("# Original\n")}
+
+
+def test_refusal_of_a_structured_output_tool_still_names_the_reason(server):
+    note = server["vault"] / "structured.md"
+    note.write_text("# Original\n")
+    _client_id, token = _read_only_client(server)
+
+    answer = _call(server, "e2e_structured_write", {"path": "structured.md", "content": "x\n"}, token)
+
+    assert answer.get("isError") is True, answer
+    assert answer["error"].startswith("This client is read-only"), answer
+    assert note.read_text() == "# Original\n"
 
 
 def test_read_only_client_keeps_the_built_in_reads_that_skip_run_audited(server):
