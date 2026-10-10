@@ -42,11 +42,11 @@ VAULT_OAUTH_PASSWORD = os.environ.get("VAULT_OAUTH_PASSWORD", "")
 # browser authorization-code flow (it can still use the client_credentials grant).
 VAULT_OAUTH_REDIRECT_URIS = [u.strip() for u in os.environ.get("VAULT_OAUTH_REDIRECT_URIS", "").split(",") if u.strip()]
 
-# Where the dynamically-registered OAuth client registry is persisted. The registry is
-# otherwise in-memory and wiped on every restart, which breaks already-connected MCP
-# clients (they replay a client_id the restarted server no longer knows). Persisting it
-# keeps connectors working across restarts. It holds per-client secrets, so it is written
-# with 0600 perms (see oauth._save_clients). Override with OAUTH_CLIENTS_PATH.
+# The legacy JSON registry of dynamically-registered OAuth clients. OAuth state now lives
+# in oauth_state.sqlite3 beside it, which imports this file on every open and never writes
+# it (see oauth_state.py); clients therefore keep working across restarts and upgrades.
+# The directory holds per-client secret hashes and tokens, so it is kept 0700 and the
+# files 0600. Override with OAUTH_CLIENTS_PATH.
 OAUTH_CLIENTS_PATH = Path(os.environ.get(
     "OAUTH_CLIENTS_PATH",
     Path.home() / ".local" / "share" / "vault-mcp" / "oauth_clients.json",

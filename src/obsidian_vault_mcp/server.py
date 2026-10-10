@@ -902,6 +902,19 @@ def serve(extensions=()):
     if not cf_on and not VAULT_MCP_TOKEN:
         logger.warning("VAULT_MCP_TOKEN is not set -- auth will reject all requests")
 
+    # Open the OAuth store before serving, so the legacy registry import and the file
+    # modes happen at startup rather than on the first request. Not in Cloudflare Access
+    # mode: no OAuth route or bearer check is mounted there, so it would only leave files
+    # behind. Fail CLOSED: an OAuth server that cannot keep its clients must not start.
+    if not cf_on:
+        from .oauth import close_oauth_state, get_oauth_state
+        try:
+            get_oauth_state()
+        except Exception as e:
+            logger.error(f"Could not open the OAuth state: {e}")
+            sys.exit(1)
+        atexit.register(close_oauth_state)
+
     # Fail CLOSED on a misconfigured audit log: if auditing is requested but the log path
     # is not writable, refuse to start rather than silently dropping mutation records.
     if audit_enabled() and not audit_path_writable():
