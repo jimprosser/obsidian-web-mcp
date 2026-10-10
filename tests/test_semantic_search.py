@@ -278,8 +278,11 @@ def _refused(kind: str, vault: Path, outside: Path, name: str) -> list[str]:
         os.link(vault / f"{name}-twin.md", vault / f"{name}.md")
         return [f"{name}.md", f"{name}-twin.md"]
     if kind == "excluded_dir":
-        (vault / ".obsidian" / f"{name}.md").write_text(content, encoding="utf-8")
-        return [f".obsidian/{name}.md"]
+        # A name without a dot, so this is the EXCLUDED_DIRS rule and not the dot rule
+        # (the built-in exclusions all start with a dot; dot_dir covers those).
+        (vault / "Private").mkdir(exist_ok=True)
+        (vault / "Private" / f"{name}.md").write_text(content, encoding="utf-8")
+        return [f"Private/{name}.md"]
     if kind == "dot_dir":
         (vault / ".hidden").mkdir(exist_ok=True)
         (vault / ".hidden" / f"{name}.md").write_text(content, encoding="utf-8")
@@ -296,7 +299,8 @@ def _refused(kind: str, vault: Path, outside: Path, name: str) -> list[str]:
     ["outside_symlink", "inside_symlink", "symlinked_dir", "outside_hardlink",
      "inside_hardlink", "excluded_dir", "dot_dir", "oversize"],
 )
-def test_refused_files_are_never_indexed_or_returned(vault_dir, tmp_path, fake_model, kind):
+def test_refused_files_are_never_indexed_or_returned(vault_dir, tmp_path, fake_model, monkeypatch, kind):
+    monkeypatch.setattr(config, "EXCLUDED_DIRS", config.EXCLUDED_DIRS | {"Private"})
     outside = tmp_path / "outside"
     outside.mkdir()
     (vault_dir / "control.md").write_text("quokka habitat\n", encoding="utf-8")
@@ -316,8 +320,9 @@ def test_refused_files_are_never_indexed_or_returned(vault_dir, tmp_path, fake_m
         assert SECRET not in json.dumps(result)
 
 
+@pytest.mark.parametrize("cleanup", ["watcher", "reconcile"])
 @pytest.mark.parametrize("how", ["hardlinked", "symlinked_out", "deleted"])
-def test_a_result_that_became_unreadable_is_dropped_at_query_time(semantic, vault_dir, tmp_path, how):
+def test_a_result_that_became_unreadable_is_dropped_at_query_time(semantic, vault_dir, tmp_path, how, cleanup):
     note = vault_dir / "plans.md"
     note.write_text("ocelot plans\n", encoding="utf-8")
     semantic.changed(note)
@@ -336,6 +341,11 @@ def test_a_result_that_became_unreadable_is_dropped_at_query_time(semantic, vaul
 
     assert "plans.md" in _indexed_paths()
     assert _paths(semantic.search(query="ocelot")) == []
+
+    # Then the row itself goes, whichever path notices first: the file still exists in two
+    # of the three cases, so "gone from disk" alone would keep it.
+    semantic.changed(note) if cleanup == "watcher" else semantic.reconcile()
+    assert "plans.md" not in _indexed_paths()
 
 
 # --- the index files --------------------------------------------------------------------
