@@ -360,21 +360,36 @@ def test_a_note_that_grows_past_the_cap_after_its_check_is_not_embedded(semantic
     assert "growing.md" not in _indexed_paths()
 
 
-def test_an_older_read_never_replaces_a_newer_row(semantic, vault_dir):
-    note = vault_dir / "plans.md"
+def _title(rel: str) -> str:
+    with sqlite3.connect(config.VAULT_SEMANTIC_DB_PATH) as conn:
+        return conn.execute("SELECT title FROM embeddings WHERE path = ?", (rel,)).fetchone()[0]
 
-    def deliver(title: str, mtime: float) -> str:
+
+def test_a_note_restored_with_an_older_mtime_is_embedded_again(semantic, vault_dir):
+    note = vault_dir / "plans.md"
+    now = time.time()
+    for title, mtime in (("Newer", now), ("Restored", now - 60)):
         note.write_text(f"# {title}\n\nocelot plans\n", encoding="utf-8")
         os.utime(note, (mtime, mtime))
         semantic.changed(note)
-        with sqlite3.connect(config.VAULT_SEMANTIC_DB_PATH) as conn:
-            return conn.execute("SELECT title FROM embeddings WHERE path = 'plans.md'").fetchone()[0]
 
+    assert _title("plans.md") == "Restored"
+
+
+def test_a_reconcile_pass_never_replaces_a_newer_watcher_row(semantic, vault_dir):
+    """A pass that read the note before a watcher event stored a newer read loses."""
+    note = vault_dir / "plans.md"
     now = time.time()
-    assert deliver("Newer", now) == "Newer"
-    # A callback that read an earlier version of the note lands after the newer one.
-    assert deliver("Older", now - 60) == "Newer"
-    assert deliver("Newest", now + 60) == "Newest", "negative control: a newer read does replace"
+    note.write_text("# Newer\n\nocelot plans\n", encoding="utf-8")
+    os.utime(note, (now, now))
+    semantic.changed(note)
+    index = semantic.ext._index
+
+    note.write_text("# Snapshot\n\nocelot plans\n", encoding="utf-8")
+    index._ingest([("plans.md", note, now - 60)], newer_only=True)
+    assert _title("plans.md") == "Newer"
+    index._ingest([("plans.md", note, now + 60)], newer_only=True)
+    assert _title("plans.md") == "Snapshot", "negative control: a newer pass does replace"
 
 
 @pytest.mark.parametrize("via", ["watcher", "reconcile"])
