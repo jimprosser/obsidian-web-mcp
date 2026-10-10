@@ -352,14 +352,9 @@ def run_audited(operation: str, func, **context) -> str:
     including with auditing off, so the mistake shows in development and not first in a
     deployment that turns the log on.
 
-    A read-only caller is refused anything but a read before ``func`` runs. MCP tool calls
-    are already checked at dispatch (server.AccessCheckedFastMCP); this second check covers
-    callers that are not tools, such as an extension route.
+    A read-only caller never gets here for anything but a read: every MCP tool call is
+    checked at dispatch first (server.AccessCheckedFastMCP).
     """
-    refusal = read_only_refusal(operation, context)
-    if refusal is not None:
-        return refusal
-
     if not should_audit_operation(operation):
         return _call_synchronously(operation, func)
 
