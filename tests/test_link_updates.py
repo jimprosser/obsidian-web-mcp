@@ -111,13 +111,134 @@ def test_directory_move_repoints_each_note_inside(vault_dir):
     assert result["links"]["links_updated"] == 1
 
 
-def test_moved_note_keeps_its_own_links(linked_vault):
-    """A note that links to itself is not rewritten out from under itself."""
-    (linked_vault / "self.md").write_text("Points at [[self]] and [[target]].\n")
-    _move("self.md", "renamed-self.md")
+def test_renamed_note_repoints_its_own_self_links(linked_vault):
+    """#110: a self-link follows the rename, the way Obsidian rewrites it."""
+    (linked_vault / "self.md").write_text(
+        "Points at [[self]], [[self#Top]], [me](self.md) and [[target]].\n"
+    )
+
+    result = _move("self.md", "renamed-self.md")
 
     body = (linked_vault / "renamed-self.md").read_text()
-    assert body == "Points at [[self]] and [[target]].\n"
+    assert body == (
+        "Points at [[renamed-self]], [[renamed-self#Top]], [me](renamed-self.md) and [[target]].\n"
+    )
+    assert "renamed-self.md" in result["links"]["files"]
+
+
+def test_moved_note_keeps_its_relative_links_resolving(vault_dir):
+    """#110: a move to another depth re-expresses the note's relative links from its new
+    folder, and leaves alone every link whose reading is not clear."""
+    vault = config.VAULT_PATH
+    (vault / "notes" / "archive").mkdir(parents=True)
+    (vault / "assets").mkdir()
+    (vault / "assets" / "pic.png").write_bytes(b"png")
+    for name in ("b.md", "both.md", "notes/sibling.md", "notes/both.md"):
+        (vault / name).write_text("x\n")
+    (vault / "notes" / "a.md").write_text(
+        "[b](../b.md) [s](sibling.md) [s2](./sibling.md#Part) ![p](../assets/pic.png)\n"
+        "[root](b.md) [either](both.md) [gone](../missing.md) [web](https://x.example/b.md)\n"
+    )
+
+    result = _move("notes/a.md", "notes/archive/a.md")
+
+    assert (vault / "notes" / "archive" / "a.md").read_text() == (
+        "[b](../../b.md) [s](../sibling.md) [s2](../sibling.md#Part) ![p](../../assets/pic.png)\n"
+        "[root](b.md) [either](both.md) [gone](../missing.md) [web](https://x.example/b.md)\n"
+    )
+    assert result["links"]["files"] == ["notes/archive/a.md"]
+    assert result["links"]["links_updated"] == 4
+
+
+def test_directory_move_keeps_inner_notes_linked(vault_dir):
+    """#110: notes inside a moved folder keep their links to each other and to the
+    files that moved with them, and their links out of the folder follow the new place."""
+    vault = config.VAULT_PATH
+    (vault / "notes" / "proj").mkdir(parents=True)
+    (vault / "archive").mkdir()
+    (vault / "notes" / "b.md").write_text("x\n")
+    (vault / "notes" / "proj" / "s.md").write_text("x\n")
+    (vault / "notes" / "proj" / "p.png").write_bytes(b"png")
+    (vault / "notes" / "proj" / "a.md").write_text(
+        "[[notes/proj/s]] [[s]] [s](s.md) ![p](p.png) [b](../b.md)\n"
+    )
+
+    result = _move("notes/proj", "archive/proj")
+
+    assert (vault / "archive" / "proj" / "a.md").read_text() == (
+        "[[archive/proj/s]] [[s]] [s](s.md) ![p](p.png) [b](../../notes/b.md)\n"
+    )
+    assert result["links"]["files"] == ["archive/proj/a.md"]
+    assert result["links"]["links_updated"] == 2
+
+
+def test_explicit_relative_link_is_not_read_from_the_root(vault_dir):
+    """`./p/b.md` in `p/a.md` names `p/p/b.md`, never the root reading `p/b.md`."""
+    vault = config.VAULT_PATH
+    (vault / "p" / "p").mkdir(parents=True)
+    (vault / "archive").mkdir()
+    (vault / "p" / "b.md").write_text("x\n")
+    (vault / "p" / "p" / "b.md").write_text("x\n")
+    (vault / "p" / "a.md").write_text("[b](./p/b.md) [sib](./b.md)\n")
+
+    result = _move("p", "archive/p")
+
+    assert (vault / "archive" / "p" / "a.md").read_text() == "[b](./p/b.md) [sib](./b.md)\n"
+    assert result["links"]["links_updated"] == 0
+
+
+def test_explicit_relative_link_in_a_note_that_stays_put(vault_dir):
+    """The same rule for a note that did not move: `./p/b.md` in `p/x.md` is not `p/b.md`."""
+    vault = config.VAULT_PATH
+    (vault / "p" / "p").mkdir(parents=True)
+    (vault / "p" / "b.md").write_text("x\n")
+    (vault / "p" / "p" / "b.md").write_text("x\n")
+    (vault / "p" / "x.md").write_text("[b](./p/b.md) [moved](./b.md) [rooted](/./p/b.md)\n")
+
+    _move("p/b.md", "p/c.md")
+
+    assert (vault / "p" / "x.md").read_text() == (
+        "[b](./p/b.md) [moved](./c.md) [rooted](p/c.md)\n"
+    )
+
+
+def test_link_above_the_vault_root_is_left_alone(vault_dir):
+    vault = config.VAULT_PATH
+    (vault / "notes").mkdir()
+    (vault / "b.md").write_text("x\n")
+    (vault / "notes" / "a.md").write_text("[out](../../b.md)\n")
+
+    _move("notes/a.md", "a.md")
+
+    assert (vault / "a.md").read_text() == "[out](../../b.md)\n"
+
+
+def test_a_note_differing_only_in_case_is_not_the_moved_one(vault_dir):
+    vault = config.VAULT_PATH
+    (vault / "b").mkdir()
+    (vault / "b" / "a.md").write_text("![x](./x.png)\n")
+    if (vault / "b" / "A.md").exists():
+        pytest.skip("case-insensitive filesystem")
+    (vault / "b" / "x.png").write_bytes(b"png")
+    # Read from the root note's folder, `./x.png` would name this one instead.
+    (vault / "x.png").write_bytes(b"png")
+    (vault / "a.md").write_text("root\n")
+
+    result = _move("a.md", "b/A.md")
+
+    assert (vault / "b" / "a.md").read_text() == "![x](./x.png)\n"
+    assert "b/a.md" not in result["links"]["files"]
+
+
+def test_dry_run_shows_the_moved_note_under_its_new_path(linked_vault):
+    (linked_vault / "subfolder" / "self.md").write_text("[[self]] [t](../target.md)\n")
+
+    preview = _move("subfolder/self.md", "subfolder/deeper/renamed.md", dry_run=True)
+    real = _move("subfolder/self.md", "subfolder/deeper/renamed.md")
+
+    assert list(preview["links"]["diffs"]) == ["subfolder/deeper/renamed.md"]
+    assert "+[[renamed]] [t](../../target.md)" in preview["links"]["diffs"]["subfolder/deeper/renamed.md"]
+    assert {k: v for k, v in preview["links"].items() if k != "diffs"} == real["links"]
 
 
 def test_unreadable_file_is_skipped_not_mangled(linked_vault):
