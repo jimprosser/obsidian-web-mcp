@@ -176,6 +176,7 @@ Found a vulnerability? Please report it privately rather than opening a public i
 | `vault_batch_frontmatter_update` | Update YAML frontmatter fields on multiple files without touching body content |
 | `vault_search` | Full-text search across vault files, matching note names/paths as well as contents (uses ripgrep if available, falls back to Python) |
 | `vault_search_frontmatter` | Query the in-memory frontmatter index by field value, substring, or field existence |
+| `vault_semantic_search` | **Off by default.** Find notes by meaning rather than keyword, ranked by similarity, with each note's title and an excerpt; runs a local embedding model. See [Semantic search](#semantic-search) |
 | `vault_list` | List directory contents with recursion depth, glob filtering, and file/dir toggles |
 | `vault_move` | Move or rename a file or directory within the vault, repointing the links that pointed at it the way Obsidian does on a rename; `dry_run` previews the link rewrites with a diff per file |
 | `vault_delete` | Soft-delete a file by moving it to `.trash/` (requires explicit confirmation) |
@@ -256,6 +257,8 @@ All configuration is via environment variables:
 | `VAULT_UPLOAD_URL_TTL_SECONDS` | No | `900` | Default lifetime of an upload URL. |
 | `VAULT_UPLOAD_URL_MAX_TTL_SECONDS` | No | `3600` | Upper bound for a requested lifetime. |
 | `VAULT_UPLOAD_STAGING_DIR` | No | `~/.local/share/vault-mcp/uploads` | Where grants and in-flight bodies live, owner-only (0700). Must resolve outside the vault, or the server refuses to start. |
+| `VAULT_SEMANTIC_SEARCH` | No | off | **Master switch for [semantic search](#semantic-search).** `1`/`true`/`yes`/`on` adds `vault_semantic_search`. Needs the `semantic` extra; without it the server refuses to start. Any value other than on or off (`0`/`false`/`no`/`off`) stops startup with the variable's name. |
+| `VAULT_SEMANTIC_DB_PATH` | No | `~/.local/share/vault-mcp/embeddings.db` | The semantic-search index (SQLite), kept `0600` in a `0700` directory. Must resolve outside the vault, or the server refuses to start. Only used when `VAULT_SEMANTIC_SEARCH` is on. |
 
 With signed uploads enabled, the four settings above are validated at startup: a value that is not a positive integer, a maximum lifetime below the default lifetime, or a staging directory inside the vault stops the server with the variable's name.
 
@@ -320,6 +323,27 @@ partial failure is never recorded as a whole-batch success. The unauthenticated 
 endpoint reports only `{"status": "ok", "audit": {"enabled": <bool>}}` — it deliberately does
 not expose the log path or write counters (which would leak host filesystem layout and a
 vault-activity side-channel to anonymous callers over the tunnel).
+
+## Semantic search
+
+**Off by default.** `vault_semantic_search` finds notes by meaning rather than by keyword: a query for "what should I feed my dog" finds a note about puppy kibble that uses none of those words. `vault_search` stays the tool for exact text.
+
+Install the `semantic` extra and switch it on:
+
+```bash
+pip install -e ".[semantic]"     # or: uv sync --extra semantic
+export VAULT_SEMANTIC_SEARCH=1
+```
+
+The extra brings in sentence-transformers and PyTorch, several hundred megabytes. With the switch on and the extra missing, the server refuses to start and names the install command. With the switch off, none of it is imported.
+
+- **The model** is `all-MiniLM-L6-v2`, run locally in the server process: notes and queries never leave the machine. It is downloaded from Hugging Face on the first start and cached under `~/.cache/huggingface`. Once it is cached, `HF_HUB_OFFLINE=1` keeps the server from contacting the Hub at all.
+- **The index** is built at startup, before the server starts serving. The first start embeds every note, which takes a while on a large vault; later starts embed only notes that changed. After that it follows the same file watcher as the frontmatter index, and a full reconcile every ten minutes catches anything the watcher missed. It reads notes through the same guard as `vault_read`: `.md` notes only, nothing in excluded or dot-directories, no symlinks, no hardlinks, nothing over 1 MB. Every result passes that guard again before it is returned.
+- **The database** is SQLite at `VAULT_SEMANTIC_DB_PATH` (default `~/.local/share/vault-mcp/embeddings.db`). It holds a vector, the title and a short excerpt of every note, so it is created `0600` and its directory is tightened to `0700`; by default that is the directory that holds the OAuth state. The path must resolve outside the vault, or the server refuses to start.
+- **Results** carry each note's `path`, a similarity `score` (0-1), its `title` and an `excerpt`. `min_score` (default 0.3) and `path_prefix` narrow them; `max_results` is 10 by default, at most 20.
+- **Audit.** A call is a read: it is recorded when `VAULT_AUDIT_LOG_INCLUDE_READS` is on, like `vault_search`. The query itself is not logged.
+
+**Limitation: only the start of each note counts.** Each note is embedded whole, as one vector, and the model reads only roughly its first 256 tokens (a couple of hundred words, frontmatter included). A long note is found by what it opens with; text further down does not affect its ranking. Use `vault_search` for that.
 
 ## Connecting to Claude
 
@@ -439,6 +463,7 @@ src/obsidian_vault_mcp/
     oauth_admin.py          # vault-mcp-oauth: list and revoke OAuth clients
     oauth_state.py          # SQLite store of OAuth clients and their tokens
     serialization.py        # JSON encoder for tool responses (dates, etc.)
+    semantic/               # Optional semantic search (VAULT_SEMANTIC_SEARCH): embedding index + extension
     server.py               # FastMCP server setup, tool registration, entry point
     vault.py                # Core filesystem operations (path security, atomic writes)
     tools/

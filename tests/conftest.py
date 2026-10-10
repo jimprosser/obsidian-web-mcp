@@ -38,6 +38,18 @@ def isolated_oauth_state(tmp_path, monkeypatch):
     oauth.close_oauth_state()
 
 
+@pytest.fixture(autouse=True)
+def isolated_semantic_search(tmp_path, monkeypatch):
+    """Semantic search is read from the environment at import, and its index defaults to the
+    real ~/.local/share/vault-mcp/embeddings.db. Off here unless a test switches it on, and
+    pointed at a throwaway file, so an exported VAULT_SEMANTIC_SEARCH cannot turn it on in
+    every serve() test and no test reaches a developer's own index."""
+    from obsidian_vault_mcp import config
+
+    monkeypatch.setattr(config, "VAULT_SEMANTIC_SEARCH", "")
+    monkeypatch.setattr(config, "VAULT_SEMANTIC_DB_PATH", tmp_path / "semantic" / "embeddings.db")
+
+
 @pytest.fixture
 def vault_dir(tmp_path, monkeypatch):
     """Create a temporary vault directory with sample files."""
