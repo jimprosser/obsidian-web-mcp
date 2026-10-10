@@ -23,6 +23,7 @@ caller instead, so a human can look.
 
 import logging
 import re
+from collections.abc import Callable
 from pathlib import Path
 from urllib.parse import quote, unquote
 
@@ -90,8 +91,11 @@ def _normalize_target(target: str) -> str:
     return _strip_md(t).lower()
 
 
-def _collapse(path: str) -> str:
-    """Collapse '.' and '..' segments textually, never touching the filesystem."""
+def _collapse(path: str, *, clamp: bool = True) -> str:
+    """Collapse '.' and '..' segments textually, never touching the filesystem.
+
+    With clamp=False, a path that climbs above the vault root collapses to ''.
+    """
     parts: list[str] = []
     for part in path.split("/"):
         if part in ("", "."):
@@ -99,6 +103,8 @@ def _collapse(path: str) -> str:
         if part == "..":
             if parts:
                 parts.pop()
+            elif not clamp:
+                return ""
             continue
         parts.append(part)
     return "/".join(parts)
@@ -109,17 +115,26 @@ def _md_url_candidates(url: str, linking_file_rel: str) -> list[str]:
 
     Obsidian writes these either from the vault root or relative to the linking
     note, depending on a setting, and the text alone cannot tell them apart, so
-    both readings come back and the caller matches whichever one moved. Anything
-    with a scheme, or a fragment-only target, is not a vault path at all.
+    both readings come back and the caller matches whichever one moved. A `./` or
+    `../` prefix settles it: only the relative reading comes back. Anything with a
+    scheme, or a fragment-only target, is not a vault path at all.
     """
     if not url or url.startswith("#") or _SCHEME.match(url):
         return []
     path_part = url.split("#", 1)[0]
     if not path_part:
         return []
-    decoded = unquote(path_part).replace("\\", "/").lstrip("/")
+    decoded = unquote(path_part).replace("\\", "/")
+    explicit = decoded.startswith(("./", "../"))
+    decoded = decoded.lstrip("/")
     base = Path(linking_file_rel).parent.as_posix()
-    readings = [decoded] if base in ("", ".") else [decoded, f"{base}/{decoded}"]
+    if base in ("", "."):
+        readings = [decoded]
+    elif explicit:
+        # The prefix says relative outright, so there is no root reading to try.
+        readings = [f"{base}/{decoded}"]
+    else:
+        readings = [decoded, f"{base}/{decoded}"]
 
     candidates = []
     for reading in readings:
@@ -153,6 +168,41 @@ def _relative_to(target_rel: str, linking_file_rel: str) -> str:
     return "/".join(ups + target_parts[common:])
 
 
+def _after_move(rel: str, source: str, destination: str) -> str:
+    """Where a vault path sits after the move: under the destination if it sat under the source."""
+    if rel == source:
+        return destination
+    if rel.startswith(source + "/"):
+        return f"{destination}/{rel[len(source) + 1:]}"
+    return rel
+
+
+def _relative_link_target(url: str, linking_file_rel: str, existed: Callable[[str], bool]) -> str | None:
+    """The vault path a markdown link names from its note's folder, when that reading is clear.
+
+    A `./` or `../` prefix says so outright. An unprefixed path can also be read from the
+    vault root, so it counts only when the note's folder holds the file and the root does
+    not. A note at the root has only the one reading, which still resolves from the root
+    wherever the note goes, so it is left alone.
+    Either way the file must have existed: like Obsidian, a link that resolved to
+    nothing is left alone.
+    """
+    if not url or url.startswith("#") or _SCHEME.match(url):
+        return None
+    decoded = unquote(url.split("#", 1)[0]).replace("\\", "/")
+    explicit = decoded.startswith(("./", "../"))
+    base = Path(linking_file_rel).parent.as_posix()
+    if not decoded or decoded.startswith("/") or (base == "." and not explicit):
+        return None
+    # A link that climbs above the vault root never named a vault file.
+    target = _collapse(f"{base}/{decoded}", clamp=False)
+    if not target or not existed(target):
+        return None
+    if not explicit and existed(_collapse(decoded, clamp=False)):
+        return None
+    return target
+
+
 def _moved_pairs(source: str, destination: str, *, before_move: bool = False) -> list[tuple[str, str]]:
     """The (old_rel, new_rel) markdown files this move affects.
 
@@ -180,8 +230,15 @@ def _rewrite_content(
     linking_file_rel: str,
     pairs: list[tuple[str, str]],
     unique_basenames: dict[str, int],
+    moved_to: str | None = None,
+    relink: Callable[[str], str | None] | None = None,
 ) -> tuple[str, int, list[str]]:
-    """Return (new_content, links_rewritten, ambiguous_targets_left_alone)."""
+    """Return (new_content, links_rewritten, ambiguous_targets_left_alone).
+
+    linking_file_rel is where the note sat when its links were written. A note that was
+    itself moved passes moved_to, its new place, and relink, which repoints a relative
+    markdown link at a file that did not move.
+    """
     rewrites = 0
     ambiguous: list[str] = []
 
@@ -218,8 +275,10 @@ def _rewrite_content(
                 return match.group(0)
             replacement = Path(new_rel).stem
 
-        rewrites += 1
-        return f"{match.group('embed')}[[{replacement}{match.group('tail')}]]"
+        rewritten = f"{match.group('embed')}[[{replacement}{match.group('tail')}]]"
+        if rewritten != match.group(0):
+            rewrites += 1
+        return rewritten
 
     def mdlink(match: re.Match) -> str:
         nonlocal rewrites
@@ -235,15 +294,22 @@ def _rewrite_content(
                 decoded = unquote(url.split("#", 1)[0]).replace("\\", "/")
                 was_relative = index == 1 or decoded.startswith(("./", "../"))
                 break
+        if new_rel is None and relink is not None:
+            new_rel = relink(url)
+            was_relative = True
         if new_rel is None:
             return match.group(0)
-        target_path = _relative_to(new_rel, linking_file_rel) if was_relative else new_rel
+        target_path = _relative_to(new_rel, moved_to or linking_file_rel) if was_relative else new_rel
+        if url.startswith("./") and not target_path.startswith("../"):
+            target_path = f"./{target_path}"
         fragment = ""
         if "#" in url:
             fragment = "#" + url.split("#", 1)[1]
         encoded = quote(target_path) if "%" in url or " " in target_path else target_path
-        rewrites += 1
-        return f"{match.group('embed')}[{match.group('text')}]({encoded}{fragment})"
+        rewritten = f"{match.group('embed')}[{match.group('text')}]({encoded}{fragment})"
+        if rewritten != match.group(0):
+            rewrites += 1
+        return rewritten
 
     content = _WIKILINK.sub(wikilink, content)
     content = _MDLINK.sub(mdlink, content)
@@ -271,13 +337,31 @@ def update_links_for_move(source: str, destination: str, *, dry_run: bool = Fals
         if not pairs:
             return summary
         unique_basenames = _basename_counts(pairs, before_move=dry_run)
-        moved_paths = {old if dry_run else new for old, new in pairs}
+        # The moved notes, by where the walk finds them: their old paths before a
+        # dry run's move, their new paths after a real one.
+        moved = {(old if dry_run else new): (old, new) for old, new in pairs}
+
+        def existed(target: str) -> bool:
+            """Whether a vault path named a file before the move, as written or with .md."""
+            for candidate in (target, f"{target}.md"):
+                if not dry_run:
+                    now = _after_move(candidate, source, destination)
+                    if now == candidate and _after_move(candidate, destination, source) != candidate:
+                        continue  # under the destination, which was empty before the move
+                    candidate = now
+                if (config.VAULT_PATH / candidate).is_file():
+                    return True
+            return False
 
         for path, rel in _iter_markdown_files():
-            if rel in moved_paths:
-                # A note may link to itself; its own links move with it and the
-                # target is the same file, so there is nothing to repoint.
-                continue
+            old_rel, new_rel = moved.get(rel, (rel, rel))
+            relink = None
+            if old_rel != new_rel:
+                # A moved note's own links: a self-link follows the rename like any
+                # other, and a relative link is re-expressed from the new folder.
+                def relink(url: str) -> str | None:
+                    target = _relative_link_target(url, old_rel, existed)
+                    return None if target is None else _after_move(target, source, destination)
             if path.is_symlink():
                 # The read paths' rule: a symlink may point outside the vault, and
                 # rewriting it would put that outside content into an ordinary vault file.
@@ -295,21 +379,21 @@ def update_links_for_move(source: str, destination: str, *, dry_run: bool = Fals
                 continue
 
             new_content, rewrites, ambiguous = _rewrite_content(
-                content, rel, pairs, unique_basenames
+                content, old_rel, pairs, unique_basenames, moved_to=new_rel, relink=relink
             )
             summary["ambiguous"].extend(ambiguous)
-            if not rewrites or new_content == content:
+            if not rewrites:
                 continue
             if dry_run:
                 size = len(new_content.encode("utf-8"))
                 if size > config.MAX_CONTENT_SIZE:
                     # write_file_atomic would refuse it; report what the real move would.
                     summary["failed"].append({
-                        "path": rel,
+                        "path": new_rel,
                         "error": f"Content size {size} bytes exceeds limit of {config.MAX_CONTENT_SIZE} bytes",
                     })
                     continue
-                summary["diffs"][rel] = _unified_diff(rel, content, new_content)
+                summary["diffs"][new_rel] = _unified_diff(new_rel, content, new_content)
             else:
                 try:
                     write_file_atomic(rel, new_content, create_dirs=False)
@@ -320,7 +404,7 @@ def update_links_for_move(source: str, destination: str, *, dry_run: bool = Fals
                     continue
             summary["files_updated"] += 1
             summary["links_updated"] += rewrites
-            summary["files"].append(rel)
+            summary["files"].append(new_rel)
     except Exception as e:  # pragma: no cover - defensive, the move already landed
         logger.error(f"update_links_for_move error: {e}")
         summary["error"] = str(e)
