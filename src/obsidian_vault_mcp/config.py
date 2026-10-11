@@ -220,6 +220,35 @@ def signed_upload_enabled() -> bool:
     path, and the bearer token should not double as the URL-signing key.
     """
     return bool(VAULT_UPLOAD_URL_SECRET)
+
+
+# Signed direct download (GET /download/{id}), the read counterpart of the signed upload.
+# Bearer-exempt for the same reason: the HMAC signature in the URL is the authorization.
+# The grant pins the file it was issued for (device, inode, size, mtime), so the route
+# serves exactly those bytes or nothing; the file is opened once and streamed from that
+# handle. VAULT_DOWNLOAD_MAX_BYTES bounds the hashing the tool does while it issues a URL.
+VAULT_DOWNLOAD_URL_SECRET = os.environ.get("VAULT_DOWNLOAD_URL_SECRET", "").strip()
+VAULT_DOWNLOAD_URL_TTL_SECONDS = _env_int("VAULT_DOWNLOAD_URL_TTL_SECONDS", 300)
+VAULT_DOWNLOAD_URL_MAX_TTL_SECONDS = _env_int("VAULT_DOWNLOAD_URL_MAX_TTL_SECONDS", 3600)
+VAULT_DOWNLOAD_MAX_BYTES = _env_int("VAULT_DOWNLOAD_MAX_BYTES", 100_000_000)
+DOWNLOAD_STAGING_DIR = Path(os.environ.get(
+    "VAULT_DOWNLOAD_STAGING_DIR",
+    Path.home() / ".local" / "share" / "vault-mcp" / "downloads",
+))
+# Reserved like UPLOAD_ROUTE_PREFIX, whether or not the feature is on.
+DOWNLOAD_ROUTE_PREFIX = "/download"
+
+
+def signed_download_enabled() -> bool:
+    """Whether the signed download path exists at all.
+
+    Off unless the operator sets VAULT_DOWNLOAD_URL_SECRET. No fallback to the upload
+    secret or VAULT_MCP_TOKEN: an upgrade must not open a tokenless read path, and turning
+    on uploads must not turn on downloads.
+    """
+    return bool(VAULT_DOWNLOAD_URL_SECRET)
+
+
 MAX_BATCH_SIZE = 20           # Max files per batch operation
 MAX_SEARCH_RESULTS = 50       # Max results per search
 DEFAULT_SEARCH_RESULTS = 20
@@ -268,7 +297,7 @@ def _validate_mcp_path(path: str) -> None:
     # Imported lazily: auth imports config, so a top-level import here would cycle.
     from .auth import _AUTH_EXEMPT_PATHS
 
-    reserved_prefixes = ("/oauth", "/.well-known", UPLOAD_ROUTE_PREFIX)
+    reserved_prefixes = ("/oauth", "/.well-known", UPLOAD_ROUTE_PREFIX, DOWNLOAD_ROUTE_PREFIX)
     collides = path in _AUTH_EXEMPT_PATHS or any(
         path == prefix or path.startswith(prefix + "/") for prefix in reserved_prefixes
     )
@@ -276,7 +305,7 @@ def _validate_mcp_path(path: str) -> None:
         raise ValueError(
             f"VAULT_MCP_PATH {path!r} collides with an authentication-exempt route; "
             "mounting there would serve the vault without auth. Choose a path that is "
-            "not /health and not under /oauth, /.well-known or /upload."
+            "not /health and not under /oauth, /.well-known, /upload or /download."
         )
 
 
@@ -351,6 +380,8 @@ def validate_config() -> None:
     if signed_upload_enabled():
         _validate_upload_settings()
     _validate_semantic_settings()
+    if signed_download_enabled():
+        _validate_download_settings()
     # Imported lazily: cf_access imports config, so a top-level import here would cycle.
     # A no-op unless Cloudflare Access mode is on (both settings set).
     from .cf_access import validate_cf_access_config
@@ -365,10 +396,25 @@ def _validate_upload_settings() -> None:
     typo, a non-positive value, or a staging directory inside the vault stops startup
     with the variable's name.
     """
+    _validate_signed_url_settings(
+        "UPLOAD", VAULT_UPLOAD_URL_TTL_SECONDS, VAULT_UPLOAD_URL_MAX_TTL_SECONDS,
+        VAULT_UPLOAD_MAX_BYTES, UPLOAD_STAGING_DIR,
+    )
+
+
+def _validate_download_settings() -> None:
+    """The same rules for the signed-download settings."""
+    _validate_signed_url_settings(
+        "DOWNLOAD", VAULT_DOWNLOAD_URL_TTL_SECONDS, VAULT_DOWNLOAD_URL_MAX_TTL_SECONDS,
+        VAULT_DOWNLOAD_MAX_BYTES, DOWNLOAD_STAGING_DIR,
+    )
+
+
+def _validate_signed_url_settings(kind: str, ttl: int, max_ttl: int, max_bytes: int, staging_dir: Path) -> None:
     for name, parsed in (
-        ("VAULT_UPLOAD_URL_TTL_SECONDS", VAULT_UPLOAD_URL_TTL_SECONDS),
-        ("VAULT_UPLOAD_URL_MAX_TTL_SECONDS", VAULT_UPLOAD_URL_MAX_TTL_SECONDS),
-        ("VAULT_UPLOAD_MAX_BYTES", VAULT_UPLOAD_MAX_BYTES),
+        (f"VAULT_{kind}_URL_TTL_SECONDS", ttl),
+        (f"VAULT_{kind}_URL_MAX_TTL_SECONDS", max_ttl),
+        (f"VAULT_{kind}_MAX_BYTES", max_bytes),
     ):
         raw = os.environ.get(name, "").strip()
         if raw:
@@ -380,20 +426,19 @@ def _validate_upload_settings() -> None:
             value = parsed
         if value <= 0:
             raise ValueError(f"{name} must be a positive integer, got {value}")
-    if VAULT_UPLOAD_URL_MAX_TTL_SECONDS < VAULT_UPLOAD_URL_TTL_SECONDS:
+    if max_ttl < ttl:
         raise ValueError(
-            "VAULT_UPLOAD_URL_MAX_TTL_SECONDS must not be smaller than "
-            f"VAULT_UPLOAD_URL_TTL_SECONDS ({VAULT_UPLOAD_URL_MAX_TTL_SECONDS} < "
-            f"{VAULT_UPLOAD_URL_TTL_SECONDS})"
+            f"VAULT_{kind}_URL_MAX_TTL_SECONDS must not be smaller than "
+            f"VAULT_{kind}_URL_TTL_SECONDS ({max_ttl} < {ttl})"
         )
-    staging = UPLOAD_STAGING_DIR.expanduser()
+    staging = staging_dir.expanduser()
     vault_root = VAULT_PATH.expanduser()
     try:
         staging.resolve().relative_to(vault_root.resolve())
     except ValueError:
         return
     raise ValueError(
-        f"VAULT_UPLOAD_STAGING_DIR resolves inside the vault ({staging}); the vault tools "
+        f"VAULT_{kind}_STAGING_DIR resolves inside the vault ({staging}); the vault tools "
         "could reach the grants. Choose a path outside VAULT_PATH."
     )
 

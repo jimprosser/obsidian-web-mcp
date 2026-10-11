@@ -157,6 +157,17 @@ class VaultRequestUploadUrlInput(BaseModel):
     )
 
 
+class VaultRequestDownloadUrlInput(BaseModel):
+    """Request a short-lived signed URL for a direct download of one vault file."""
+
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    path: str = Field(..., description="Relative path from vault root", min_length=1, max_length=500)
+    ttl_seconds: int | None = Field(
+        default=None, ge=1, description="Requested URL lifetime in seconds (clamped to the server max)"
+    )
+
+
 class VaultEditOperationInput(BaseModel):
     """Replace one exact text fragment inside a vault file."""
 
