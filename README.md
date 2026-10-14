@@ -156,7 +156,7 @@ When the mode is **on**:
 
 **The signed upload route is the one unauthenticated write path, it is off unless configured, and it is narrow.** It exists only when `VAULT_UPLOAD_URL_SECRET` is set. Only `POST /upload/<id>` with exactly one id segment skips the bearer check; the URL's HMAC signature is the authorization. The grant (id, signature, expiry, single use) is validated before a single body byte is read, the body streams to a temp file outside the vault and is cut off at the grant's size cap, and the grant is checked again immediately before the file is placed. `/upload` is reserved: `VAULT_MCP_PATH` cannot be mounted under it, and an extension route whose path is `/upload` or starts with `/upload/` is rejected at startup, literal or parameterized. Committed uploads are audited and fire write events; refused requests are only logged. The signature is redacted from the access log.
 
-**The signed download route is the one unauthenticated read path, it is off unless configured, and it is narrow.** It exists only when `VAULT_DOWNLOAD_URL_SECRET` is set, with no fallback to the upload secret or `VAULT_MCP_TOKEN`. Only `GET /download/<id>` with exactly one id segment skips the bearer check. The tool resolves the path with the same guard as `vault_read` and pins the file it was issued for (device, inode, size, mtime) in the signed grant; the route resolves the path again, opens the file once, and serves from that handle only if it is the same file, so a path swapped after the check serves nothing. Single use, with no HEAD and no Range, so a partial read cannot keep a URL alive. The response is always an attachment with `nosniff` and a sandboxing CSP, so a vault's HTML or SVG never renders on this origin. `/download` is reserved like `/upload`. Downloads are audited as reads when reads are audited. A signature is redacted from the access log on any path.
+**The signed download route is the one unauthenticated read path, it is off unless configured, and it is narrow.** It exists only when `VAULT_DOWNLOAD_URL_SECRET` is set, with no fallback to the upload secret or `VAULT_MCP_TOKEN`. Only `GET /download/<id>` with exactly one id segment skips the bearer check. The URL carries the whole grant, signed: the path, the file's identity (device, inode, size, mtime) and the expiry; the server keeps no state. The tool resolves the path with the same guard as `vault_read`; the route resolves it again, opens the file once, and serves from that handle only if it is the file the URL names, so a file replaced, moved or changed before the open serves nothing. The open handle does not freeze the contents: a write into the same file after the open is served as written. No HEAD and no Range. The response is always an attachment with `nosniff`, a sandboxing CSP and `no-store`, so a vault's HTML or SVG never renders on this origin. `/download` is reserved like `/upload`, and both signed routes sit ahead of extension routes, so a path of their shape always reaches the signed handler. Downloads are audited as reads when reads are audited. A signature is redacted from the access log on any path.
 
 **Hardlinked files are refused on read.** Files with more than one hardlink (`st_nlink > 1`) cannot be read or returned by text search, including frontmatter excerpts. Legitimate in-vault hardlinks are not supported.
 
@@ -172,7 +172,7 @@ Found a vulnerability? Please report it privately rather than opening a public i
 | `vault_batch_read` | Read multiple files in one call; handles missing files gracefully |
 | `vault_write` | Write a file with optional frontmatter merging; creates parent dirs; `overwrite: false` for create-only (never replaces, also under concurrent calls) |
 | `vault_request_upload_url` | Get a short-lived, single-use signed URL, then `POST` a file's raw bytes to it. For images and PDFs too large to send base64-encoded through `vault_write_binary`; the bytes never pass through the conversation. See [Signed uploads](#signed-uploads) |
-| `vault_request_download_url` | Get a short-lived, single-use signed URL, then `GET` a file's raw bytes from it (curl, a script). For images, PDFs and any other file `vault_read` can reach; the bytes never pass through the conversation. Returns size and sha256. See [Signed downloads](#signed-downloads) |
+| `vault_request_download_url` | Get a short-lived signed URL, then `GET` a file's raw bytes from it (curl, a script). For images, PDFs and any other file `vault_read` can reach; the bytes never pass through the conversation. Returns the size. See [Signed downloads](#signed-downloads) |
 | `vault_write_binary` | Write an allowed binary file (image/PDF) to the vault from base64 content; enforces a media-type allowlist (declared type/extension, not byte-sniffed) and size cap, writes atomically |
 | `vault_edit` | Patch a file with ordered exact text replacements (token-efficient partial edits); supports dry-run diff previews, and an opt-in `replace_all` per edit for renaming a term across a note |
 | `vault_append` | Append content to the end of a file without resending the existing body; creates the file when missing |
@@ -266,7 +266,7 @@ All configuration is via environment variables:
 | `VAULT_DOWNLOAD_URL_TTL_SECONDS` | No | `300` | Default lifetime of a download URL. |
 | `VAULT_DOWNLOAD_URL_MAX_TTL_SECONDS` | No | `3600` | Upper bound for a requested lifetime. |
 
-With signed uploads enabled, the upload lifetimes, size cap and staging directory are validated at startup: a value that is not a positive integer, a maximum lifetime below the default lifetime, or a staging directory inside the vault stops the server with the variable's name. With signed downloads enabled, the download settings are validated by the same rules.
+With signed uploads enabled, the upload lifetimes, size cap and staging directory are validated at startup: a value that is not a positive integer, a maximum lifetime below the default lifetime, or a staging directory inside the vault stops the server with the variable's name. With signed downloads enabled, the two download lifetimes are validated by the same rules.
 
 Generate secrets with: `python -c "import secrets; print(secrets.token_hex(32))"`
 
@@ -307,10 +307,10 @@ The URL is valid once, for the declared path, media type and size, until it expi
 
 `vault_read` returns text: it refuses an image or a spreadsheet, and gives a PDF only as extracted text. For a client that can run curl or a script, this hands out the file itself:
 
-1. The client calls `vault_request_download_url(path)` and gets `download_url`, `size` and `sha256`.
+1. The client calls `vault_request_download_url(path)` and gets `download_url` and `size`.
 2. It fetches the bytes: `curl -fsS -o file.pdf "<download_url>"`.
 
-The URL is valid once, for exactly the file it was issued for, until it expires. If the file changes, moves or is replaced in between, the URL answers 409 or 404 and serves nothing; request a new one. Set `VAULT_MCP_PUBLIC_URL` so the returned URL points at your public hostname. The signed URL is a credential while it lives: the server never logs the signature.
+The URL works for exactly the file it was issued for until it expires, and can be fetched again in that time; keep the lifetime short. If the file changes, moves or is replaced before a fetch opens it, the URL answers 409 or 404 and serves nothing; request a new one. A write into the file while it is being served is not detected. Set `VAULT_MCP_PUBLIC_URL` so the returned URL points at your public hostname. The signed URL is a credential while it lives: the server never logs the signature.
 
 ## Audit logging
 

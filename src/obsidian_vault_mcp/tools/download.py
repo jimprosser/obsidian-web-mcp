@@ -8,19 +8,17 @@ through the conversation.
 Two parts:
 
 - ``vault_request_download_url(path)``, an MCP tool: resolves the path with the same guard
-  ``vault_read`` uses, opens the file once, hashes it from that handle, and records its
-  identity (device, inode, size, mtime) in a grant signed together with the URL.
+  ``vault_read`` uses, opens the file and signs its identity (device, inode, size, mtime)
+  into the URL together with the path and the expiry.
 - the ``GET /download/{id}`` route in ``server.py``: bearer-exempt, because the signature
-  is the authorization. ``open_signed_download`` checks the grant, resolves the path
-  again, opens it once, and accepts the open handle only if it is the same file the grant
-  was issued for. The route streams from that handle, so a path swapped after the check
-  (a symlinked parent, a replaced file) cannot change what is served.
+  is the authorization. ``open_signed_download`` checks the signature and the expiry,
+  resolves the path again, opens it once, and accepts the open handle only if it is the
+  file the URL was issued for. The route streams from that handle, so a path swapped
+  after the check (a symlinked parent, a replaced file) serves nothing.
 
-Single use, enforced by an atomic claim. There is no HEAD and no Range: a request that
-reads part of a file without spending the URL would make "single use" a matter of how the
-client asks.
-
-The staging dir holds only grants, never file bytes, and lives outside the vault.
+The grant lives entirely in the URL; the server keeps no state. A URL can be fetched
+again until it expires, which a short lifetime bounds. The open handle does not freeze the
+file's contents: a write into the same file after the open is served as written.
 """
 
 import hashlib
@@ -30,7 +28,6 @@ import logging
 import mimetypes
 import os
 import re
-import shutil
 import stat
 import time
 import uuid
@@ -44,26 +41,14 @@ from ..vault import resolve_vault_read_path
 logger = logging.getLogger(__name__)
 
 AUDIT_OPERATION = "vault_download"
-_STALE_CLEANUP_SECONDS = 24 * 60 * 60
-_HASH_CHUNK = 1024 * 1024
-# uuid4 ids only. The sweep relies on this: it removes nothing that is not named like one.
+_CHUNK = 1024 * 1024
+# A random id per URL, signed with it: it names the URL in the server log, where the
+# query string is redacted. uuid4 only.
 _DOWNLOAD_ID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}")
-# The final component is opened without following a symlink. Not every platform has the
-# flag; there the identity check below still refuses a file that is not the granted one.
+_IDENTITY = ("device", "inode", "size", "mtime_ns")
+# The final component is opened without following a symlink; a symlink put in place of
+# the file after the guard resolved the path fails the open.
 _OPEN_FLAGS = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_BINARY", 0)
-
-
-def _download_root() -> Path:
-    # 0700: a grant names a vault path. None of that is for other users on the box.
-    root = config.DOWNLOAD_STAGING_DIR
-    root.mkdir(parents=True, exist_ok=True, mode=0o700)
-    return root
-
-
-def download_dir(download_id: str) -> Path:
-    if not isinstance(download_id, str) or _DOWNLOAD_ID.fullmatch(download_id) is None:
-        raise ValueError("Invalid download_id")
-    return _download_root() / download_id
 
 
 def _download_secret() -> str:
@@ -74,56 +59,15 @@ def _download_secret() -> str:
     return config.VAULT_DOWNLOAD_URL_SECRET
 
 
-def _canonical(metadata: dict, expires_at: int) -> str:
-    """The string the download URL signs: which file, exactly, and until when."""
-    return "\n".join(
-        [
-            metadata["download_id"],
-            metadata["path"],
-            str(metadata["size"]),
-            metadata["sha256"],
-            str(metadata["device"]),
-            str(metadata["inode"]),
-            str(metadata["mtime_ns"]),
-            str(expires_at),
-        ]
-    )
-
-
-def _signature(metadata: dict, expires_at: int) -> str:
-    payload = _canonical(metadata, expires_at).encode("utf-8")
+def _signature(grant: dict) -> str:
+    # JSON, not a joined string: a path may contain any character, a newline included,
+    # and the encoding must not let one field run into the next.
+    payload = json.dumps(
+        [grant["download_id"], grant["path"], *(grant[key] for key in _IDENTITY), grant["expires"]],
+        ensure_ascii=True,
+        separators=(",", ":"),
+    ).encode("ascii")
     return hmac.new(_download_secret().encode("utf-8"), payload, hashlib.sha256).hexdigest()
-
-
-def _write_json_atomic(path: Path, payload: dict) -> None:
-    tmp_path = path.with_suffix(path.suffix + ".tmp")
-    tmp_path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
-    try:
-        tmp_path.chmod(0o600)
-    except OSError:  # no-op where file modes are meaningless
-        pass
-    tmp_path.replace(path)
-
-
-def cleanup_stale_downloads(now: float | None = None) -> None:
-    """Remove grant dirs older than a day.
-
-    Only real directories named like a download id are candidates, and a symlink is never
-    followed or removed: the staging dir is operator-configurable.
-    """
-    cutoff = (now if now is not None else time.time()) - _STALE_CLEANUP_SECONDS
-    try:
-        entries = list(_download_root().iterdir())
-    except OSError:
-        return
-    for entry in entries:
-        if _DOWNLOAD_ID.fullmatch(entry.name) is None or entry.is_symlink() or not entry.is_dir():
-            continue
-        try:
-            if entry.lstat().st_mtime < cutoff:
-                shutil.rmtree(entry)
-        except OSError:
-            logger.warning("Could not remove stale download staging dir: %s", entry)
 
 
 def _identity(st: os.stat_result) -> dict:
@@ -133,8 +77,8 @@ def _identity(st: os.stat_result) -> dict:
 def _open_vault_file(path: str) -> tuple[int, os.stat_result]:
     """Open a vault file for reading through the vault_read guard; return (fd, fstat).
 
-    The guard resolves the path, refuses dotfiles, paths outside the vault and hardlinks.
-    The returned handle is checked again from fstat, which describes what was actually
+    The guard resolves the path and refuses dotfiles, paths outside the vault and
+    hardlinks. The handle is checked again from fstat, which describes what was actually
     opened rather than what the path pointed at a moment earlier.
     """
     resolved = resolve_vault_read_path(path)
@@ -157,64 +101,30 @@ def _media_type(path: str) -> str:
 
 
 def vault_request_download_url(path: str, ttl_seconds: int | None = None) -> str:
-    """Create a short-lived signed URL for one direct download."""
+    """Create a short-lived signed URL for downloading one vault file."""
     try:
-        cleanup_stale_downloads()
         fd, st = _open_vault_file(path)
-        try:
-            if st.st_size > config.VAULT_DOWNLOAD_MAX_BYTES:
-                return dumps(
-                    {
-                        "error": f"File is {st.st_size} bytes, over the {config.VAULT_DOWNLOAD_MAX_BYTES} bytes a download URL serves",
-                        "path": path,
-                    }
-                )
-            digest = hashlib.sha256()
-            while chunk := os.read(fd, _HASH_CHUNK):
-                digest.update(chunk)
-            after = os.fstat(fd)
-        finally:
-            os.close(fd)
-        if _identity(after) != _identity(st):
-            return dumps({"error": f"File changed while it was being read: {path}. Try again.", "path": path})
-
+        os.close(fd)
         requested_ttl = ttl_seconds if ttl_seconds is not None else config.VAULT_DOWNLOAD_URL_TTL_SECONDS
         effective_ttl = max(1, min(requested_ttl, max(1, config.VAULT_DOWNLOAD_URL_MAX_TTL_SECONDS)))
-        now = int(time.time())
-        expires_at = now + effective_ttl
-        download_id = str(uuid.uuid4())
-        staging = download_dir(download_id)
-        staging.mkdir(parents=True, exist_ok=False, mode=0o700)
-        metadata = {
-            "download_id": download_id,
-            "path": path,
-            "filename": Path(path).name,
-            "media_type": _media_type(path),
-            "sha256": digest.hexdigest(),
-            **_identity(st),
-            "created_at": now,
-            "expires_at": expires_at,
-            "completed_at": None,
-        }
-        _write_json_atomic(staging / "metadata.json", metadata)
-        signature = _signature(metadata, expires_at)
+        expires = int(time.time()) + effective_ttl
+        grant = {"download_id": str(uuid.uuid4()), "path": path, **_identity(st), "expires": expires}
+        query = urlencode({**{key: grant[key] for key in ("path", *_IDENTITY, "expires")}, "signature": _signature(grant)})
         base_url = (config.VAULT_MCP_PUBLIC_URL or f"http://127.0.0.1:{config.VAULT_MCP_PORT}").rstrip("/")
-        query = urlencode({"expires": str(expires_at), "signature": signature})
-        download_url = f"{base_url}{config.DOWNLOAD_ROUTE_PREFIX}/{download_id}?{query}"
+        download_url = f"{base_url}{config.DOWNLOAD_ROUTE_PREFIX}/{grant['download_id']}?{query}"
+        filename = Path(path).name
         return dumps(
             {
-                "download_id": download_id,
+                "download_id": grant["download_id"],
                 "download_url": download_url,
-                "expires_at": expires_at,
+                "expires_at": expires,
                 "expires_in_seconds": effective_ttl,
                 "path": path,
-                "filename": metadata["filename"],
-                "media_type": metadata["media_type"],
-                "size": metadata["size"],
-                "sha256": metadata["sha256"],
+                "filename": filename,
+                "media_type": _media_type(path),
+                "size": st.st_size,
                 "method": "GET",
-                "single_use": True,
-                "curl": f'curl -fsS -o "{metadata["filename"]}" "{download_url}"',
+                "curl": f'curl -fsS -o "{filename}" "{download_url}"',
             }
         )
     except FileNotFoundError:
@@ -226,82 +136,59 @@ def vault_request_download_url(path: str, ttl_seconds: int | None = None) -> str
         return dumps({"error": str(e), "path": path})
 
 
-def _load_metadata(download_id: str) -> tuple[dict, Path]:
-    metadata_path = download_dir(download_id) / "metadata.json"
-    if not metadata_path.is_file():
-        raise FileNotFoundError(download_id)
-    return json.loads(metadata_path.read_text(encoding="utf-8")), metadata_path
-
-
-def _check_grant(download_id: str, metadata: dict, expires: str, signature: str) -> tuple[dict, int] | None:
+def _read_grant(download_id: str, query) -> tuple[dict | None, tuple[dict, int] | None]:
+    """Parse the signed fields from the query string; (grant, None) or (None, refusal)."""
     try:
-        expires_at = int(expires)
-    except (TypeError, ValueError):
-        return {"error": "Invalid expires parameter", "download_id": download_id}, 400
-    expected_signature = _signature(metadata, int(metadata["expires_at"]))
-    # Compared as bytes: compare_digest raises TypeError on a non-ASCII str, which a client
-    # can put in the query string (signature=%C3%A9) and turn into a 500.
-    if (
-        expires_at != int(metadata["expires_at"])
-        or not signature
-        or not hmac.compare_digest(signature.encode("utf-8"), expected_signature.encode("ascii"))
-    ):
-        return {"error": "Invalid download signature", "download_id": download_id}, 403
-    if time.time() > expires_at:
-        return {"error": "Download URL has expired", "download_id": download_id}, 410
-    if metadata.get("completed_at"):
-        return {"error": "Download URL has already been used", "download_id": download_id}, 409
-    return None
+        grant = {
+            "download_id": download_id,
+            "path": query["path"],
+            **{key: int(query[key]) for key in (*_IDENTITY, "expires")},
+        }
+    except (KeyError, ValueError):
+        return None, ({"error": "Malformed download URL", "download_id": download_id}, 400)
+    return grant, None
 
 
-def open_signed_download(download_id: str, expires: str, signature: str) -> tuple[dict, int, int | None]:
-    """Check a signed download URL and open the granted file; return (payload, status, fd).
+def open_signed_download(download_id: str, query) -> tuple[dict, int, int | None]:
+    """Check a signed download URL and open its file; return (payload, status, fd).
 
-    On success the status is 200, the payload is the grant, and fd is an open handle on
-    exactly the file the grant was issued for; the caller streams from it and closes it.
-    On any refusal fd is None and nothing is left open. An unknown and a malformed id both
-    answer 404, so the route leaks nothing about which ids exist.
-
-    The URL is spent only once the file has been opened and matched: a refusal before that
-    (a bad signature, a file that changed) leaves an unused grant unused.
+    ``query`` is the request's query parameters. On success the status is 200, the payload
+    describes the file, and fd is an open handle on exactly the file the URL was issued
+    for; the caller streams from it and closes it. On any refusal fd is None and nothing
+    is left open.
     """
-    try:
-        metadata, metadata_path = _load_metadata(download_id)
-    except (ValueError, FileNotFoundError, OSError, json.JSONDecodeError):
+    if _DOWNLOAD_ID.fullmatch(download_id) is None:
         return {"error": "Unknown download id", "download_id": download_id}, 404, None
-    refusal = _check_grant(download_id, metadata, expires, signature)
+    grant, refusal = _read_grant(download_id, query)
     if refusal is not None:
         return (*refusal, None)
+    signature = query.get("signature", "")
+    # Compared as bytes: compare_digest raises TypeError on a non-ASCII str, which a client
+    # can put in the query string (signature=%C3%A9) and turn into a 500.
+    if not signature or not hmac.compare_digest(signature.encode("utf-8"), _signature(grant).encode("ascii")):
+        return {"error": "Invalid download signature", "download_id": download_id}, 403, None
+    if time.time() > grant["expires"]:
+        return {"error": "Download URL has expired", "download_id": download_id}, 410, None
 
     try:
-        fd, st = _open_vault_file(metadata["path"])
+        fd, st = _open_vault_file(grant["path"])
     except FileNotFoundError:
         return {"error": "File is no longer there", "download_id": download_id}, 404, None
     except (ValueError, OSError):
         # A policy refusal (now outside the vault, hardlinked, a symlink in place of the
-        # file) or an open that failed: not the file the grant was issued for.
+        # file) or an open that failed: not the file the URL was issued for.
         return {"error": "File changed since the URL was issued", "download_id": download_id}, 409, None
-    if _identity(st) != {key: metadata[key] for key in ("device", "inode", "size", "mtime_ns")}:
+    if _identity(st) != {key: grant[key] for key in _IDENTITY}:
         os.close(fd)
         return {"error": "File changed since the URL was issued", "download_id": download_id}, 409, None
-
-    # Claim the grant atomically: of two requests racing on one URL exactly one proceeds.
-    try:
-        (metadata_path.parent / "claimed").mkdir()
-    except FileExistsError:
-        os.close(fd)
-        return {"error": "Download URL has already been used", "download_id": download_id}, 409, None
-    except OSError:
-        os.close(fd)
-        return {"error": "Download could not be started", "download_id": download_id}, 500, None
-    metadata["completed_at"] = int(time.time())
-    try:
-        _write_json_atomic(metadata_path, metadata)
-    except OSError:
-        # The claim marker already spends the URL; the record is informational.
-        logger.warning("Could not record download completion: %s", download_id)
-    return metadata, 200, fd
+    return {
+        "download_id": download_id,
+        "path": grant["path"],
+        "filename": Path(grant["path"]).name,
+        "media_type": _media_type(grant["path"]),
+        "size": st.st_size,
+    }, 200, fd
 
 
-def read_chunk(fd: int, size: int = _HASH_CHUNK) -> bytes:
+def read_chunk(fd: int, size: int = _CHUNK) -> bytes:
     return os.read(fd, size)

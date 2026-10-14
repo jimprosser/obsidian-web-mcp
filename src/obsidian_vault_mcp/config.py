@@ -224,17 +224,11 @@ def signed_upload_enabled() -> bool:
 
 # Signed direct download (GET /download/{id}), the read counterpart of the signed upload.
 # Bearer-exempt for the same reason: the HMAC signature in the URL is the authorization.
-# The grant pins the file it was issued for (device, inode, size, mtime), so the route
-# serves exactly those bytes or nothing; the file is opened once and streamed from that
-# handle. VAULT_DOWNLOAD_MAX_BYTES bounds the hashing the tool does while it issues a URL.
+# The URL carries the whole grant (path, file identity, expiry); the server keeps no state.
+# The route opens the file once and serves only if it is the file the URL names.
 VAULT_DOWNLOAD_URL_SECRET = os.environ.get("VAULT_DOWNLOAD_URL_SECRET", "").strip()
 VAULT_DOWNLOAD_URL_TTL_SECONDS = _env_int("VAULT_DOWNLOAD_URL_TTL_SECONDS", 300)
 VAULT_DOWNLOAD_URL_MAX_TTL_SECONDS = _env_int("VAULT_DOWNLOAD_URL_MAX_TTL_SECONDS", 3600)
-VAULT_DOWNLOAD_MAX_BYTES = _env_int("VAULT_DOWNLOAD_MAX_BYTES", 100_000_000)
-DOWNLOAD_STAGING_DIR = Path(os.environ.get(
-    "VAULT_DOWNLOAD_STAGING_DIR",
-    Path.home() / ".local" / "share" / "vault-mcp" / "downloads",
-))
 # Reserved like UPLOAD_ROUTE_PREFIX, whether or not the feature is on.
 DOWNLOAD_ROUTE_PREFIX = "/download"
 
@@ -396,25 +390,10 @@ def _validate_upload_settings() -> None:
     typo, a non-positive value, or a staging directory inside the vault stops startup
     with the variable's name.
     """
-    _validate_signed_url_settings(
-        "UPLOAD", VAULT_UPLOAD_URL_TTL_SECONDS, VAULT_UPLOAD_URL_MAX_TTL_SECONDS,
-        VAULT_UPLOAD_MAX_BYTES, UPLOAD_STAGING_DIR,
-    )
-
-
-def _validate_download_settings() -> None:
-    """The same rules for the signed-download settings."""
-    _validate_signed_url_settings(
-        "DOWNLOAD", VAULT_DOWNLOAD_URL_TTL_SECONDS, VAULT_DOWNLOAD_URL_MAX_TTL_SECONDS,
-        VAULT_DOWNLOAD_MAX_BYTES, DOWNLOAD_STAGING_DIR,
-    )
-
-
-def _validate_signed_url_settings(kind: str, ttl: int, max_ttl: int, max_bytes: int, staging_dir: Path) -> None:
     for name, parsed in (
-        (f"VAULT_{kind}_URL_TTL_SECONDS", ttl),
-        (f"VAULT_{kind}_URL_MAX_TTL_SECONDS", max_ttl),
-        (f"VAULT_{kind}_MAX_BYTES", max_bytes),
+        ("VAULT_UPLOAD_URL_TTL_SECONDS", VAULT_UPLOAD_URL_TTL_SECONDS),
+        ("VAULT_UPLOAD_URL_MAX_TTL_SECONDS", VAULT_UPLOAD_URL_MAX_TTL_SECONDS),
+        ("VAULT_UPLOAD_MAX_BYTES", VAULT_UPLOAD_MAX_BYTES),
     ):
         raw = os.environ.get(name, "").strip()
         if raw:
@@ -426,21 +405,46 @@ def _validate_signed_url_settings(kind: str, ttl: int, max_ttl: int, max_bytes: 
             value = parsed
         if value <= 0:
             raise ValueError(f"{name} must be a positive integer, got {value}")
-    if max_ttl < ttl:
+    if VAULT_UPLOAD_URL_MAX_TTL_SECONDS < VAULT_UPLOAD_URL_TTL_SECONDS:
         raise ValueError(
-            f"VAULT_{kind}_URL_MAX_TTL_SECONDS must not be smaller than "
-            f"VAULT_{kind}_URL_TTL_SECONDS ({max_ttl} < {ttl})"
+            "VAULT_UPLOAD_URL_MAX_TTL_SECONDS must not be smaller than "
+            f"VAULT_UPLOAD_URL_TTL_SECONDS ({VAULT_UPLOAD_URL_MAX_TTL_SECONDS} < "
+            f"{VAULT_UPLOAD_URL_TTL_SECONDS})"
         )
-    staging = staging_dir.expanduser()
+    staging = UPLOAD_STAGING_DIR.expanduser()
     vault_root = VAULT_PATH.expanduser()
     try:
         staging.resolve().relative_to(vault_root.resolve())
     except ValueError:
         return
     raise ValueError(
-        f"VAULT_{kind}_STAGING_DIR resolves inside the vault ({staging}); the vault tools "
+        f"VAULT_UPLOAD_STAGING_DIR resolves inside the vault ({staging}); the vault tools "
         "could reach the grants. Choose a path outside VAULT_PATH."
     )
+
+
+def _validate_download_settings() -> None:
+    """Fail closed on the signed-download lifetimes, by the upload settings' rules."""
+    for name, parsed in (
+        ("VAULT_DOWNLOAD_URL_TTL_SECONDS", VAULT_DOWNLOAD_URL_TTL_SECONDS),
+        ("VAULT_DOWNLOAD_URL_MAX_TTL_SECONDS", VAULT_DOWNLOAD_URL_MAX_TTL_SECONDS),
+    ):
+        raw = os.environ.get(name, "").strip()
+        if raw:
+            try:
+                value = int(raw)
+            except ValueError:
+                raise ValueError(f"{name} must be an integer, got {raw!r}")
+        else:
+            value = parsed
+        if value <= 0:
+            raise ValueError(f"{name} must be a positive integer, got {value}")
+    if VAULT_DOWNLOAD_URL_MAX_TTL_SECONDS < VAULT_DOWNLOAD_URL_TTL_SECONDS:
+        raise ValueError(
+            "VAULT_DOWNLOAD_URL_MAX_TTL_SECONDS must not be smaller than "
+            f"VAULT_DOWNLOAD_URL_TTL_SECONDS ({VAULT_DOWNLOAD_URL_MAX_TTL_SECONDS} < "
+            f"{VAULT_DOWNLOAD_URL_TTL_SECONDS})"
+        )
 
 
 def _validate_semantic_settings() -> None:

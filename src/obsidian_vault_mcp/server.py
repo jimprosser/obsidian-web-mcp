@@ -342,9 +342,9 @@ def register_download_tool() -> None:
     @mcp.tool(
         name="vault_request_download_url",
         description=(
-            "Create a short-lived, single-use signed URL for downloading one vault file as raw bytes "
+            "Create a short-lived signed URL for downloading one vault file as raw bytes "
             "(an image, a PDF, any file vault_read can reach). The client GETs the URL itself, for example "
-            "with curl; the bytes never pass through the conversation. Returns size and sha256 to verify."
+            "with curl; the bytes never pass through the conversation. Returns the size to verify."
         ),
         annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": False, "openWorldHint": False},
     )
@@ -729,11 +729,11 @@ async def direct_upload(request):
 async def direct_download(request):
     """Serve the bytes for a signed download URL.
 
-    open_signed_download checks the grant, opens the file once and accepts the handle only
-    if it is the file the grant was issued for; the body streams from that handle, so what
-    is served cannot change after the check. Only GET reaches this tokenless (auth.py);
-    HEAD, which Starlette adds to every GET route, is refused here so that nothing but a
-    full read ever spends or probes a grant.
+    open_signed_download checks the URL, opens the file once and accepts the handle only
+    if it is the file the URL was issued for; the body streams from that handle, at most
+    the size checked at the open, so a path swapped after the check serves nothing. Only
+    GET reaches this tokenless (auth.py); HEAD, which Starlette adds to every GET route,
+    is refused here.
 
     The response is always an attachment, never rendered: a vault can hold HTML or SVG,
     and served inline from this origin it would run next to the OAuth login.
@@ -753,9 +753,7 @@ async def direct_download(request):
         return JSONResponse({"error": "Method not allowed"}, status_code=405, headers={"Allow": "GET"})
 
     download_id = request.path_params["download_id"]
-    expires = request.query_params.get("expires", "")
-    signature = request.query_params.get("signature", "")
-    grant, status, fd = await anyio.to_thread.run_sync(open_signed_download, download_id, expires, signature)
+    grant, status, fd = await anyio.to_thread.run_sync(open_signed_download, download_id, request.query_params)
     if status != 200:
         logger.warning("Download refused: %s (%s)", download_id, grant.get("error"))
         return JSONResponse(grant, status_code=status)
@@ -766,7 +764,7 @@ async def direct_download(request):
             build_audit_record(
                 operation=DOWNLOAD_AUDIT_OPERATION,
                 target_path=grant["path"],
-                before={"size": grant["size"], "checksum": grant["sha256"]},
+                before={"size": grant["size"], "checksum": None},
             )
         )
 
@@ -779,8 +777,12 @@ async def direct_download(request):
             os.close(fd)
 
     async def body():
+        # Never more than Content-Length: a file that grows after the open would
+        # otherwise break the response.
+        remaining = grant["size"]
         try:
-            while chunk := await anyio.to_thread.run_sync(read_chunk, fd):
+            while remaining > 0 and (chunk := await anyio.to_thread.run_sync(read_chunk, fd, min(remaining, 1024 * 1024))):
+                remaining -= len(chunk)
                 yield chunk
         finally:
             close()
@@ -896,18 +898,6 @@ def build_app(extensions=()):
 
     app.routes.insert(0, Route("/health", health, methods=["GET"]))
 
-    # Signed direct upload, only when the operator set VAULT_UPLOAD_URL_SECRET. Without
-    # it the route does not exist and auth.is_signed_upload_request answers False, so an
-    # upgrade adds no unauthenticated write path. Bearer-exempt for exactly
-    # POST /upload/<id>: the HMAC signature in the URL is the authorization.
-    if config.signed_upload_enabled():
-        app.routes.insert(0, Route(f"{config.UPLOAD_ROUTE_PREFIX}/{{upload_id}}", direct_upload, methods=["POST"]))
-
-    # Signed direct download, only when the operator set VAULT_DOWNLOAD_URL_SECRET.
-    # Bearer-exempt for exactly GET /download/<id>, by the same rule as the upload.
-    if config.signed_download_enabled():
-        app.routes.insert(0, Route(f"{config.DOWNLOAD_ROUTE_PREFIX}/{{download_id}}", direct_download, methods=["GET"]))
-
     # Extension routes (e.g. a localhost search endpoint), added before the auth
     # middleware so they are bearer-protected like the MCP transport.
     #
@@ -987,6 +977,24 @@ def build_app(extensions=()):
                         f"extension route {getattr(r, 'path', r)!r} is under the reserved "
                         f"{prefix!r} namespace of the signed {kind} route"
                     )
+    # The signed routes go in last and at the front, after the extensions. Their exemption
+    # is a family of paths (/upload/<any id>, /download/<any id>), and no probe can show
+    # that an extension route stays out of it: Route("/{area}/export") answers
+    # /download/export. Placed first, a path of the exempt shape always reaches the signed
+    # handler, which refuses it without a valid signature.
+    #
+    # Signed direct upload, only when the operator set VAULT_UPLOAD_URL_SECRET. Without
+    # it the route does not exist and auth.is_signed_upload_request answers False, so an
+    # upgrade adds no unauthenticated write path. Bearer-exempt for exactly
+    # POST /upload/<id>: the HMAC signature in the URL is the authorization.
+    if config.signed_upload_enabled():
+        app.routes.insert(0, Route(f"{config.UPLOAD_ROUTE_PREFIX}/{{upload_id}}", direct_upload, methods=["POST"]))
+
+    # Signed direct download, only when the operator set VAULT_DOWNLOAD_URL_SECRET.
+    # Bearer-exempt for exactly GET /download/<id>, by the same rule as the upload.
+    if config.signed_download_enabled():
+        app.routes.insert(0, Route(f"{config.DOWNLOAD_ROUTE_PREFIX}/{{download_id}}", direct_download, methods=["GET"]))
+
     # Cloudflare Access mode swaps the static-bearer middleware for CF JWT verification;
     # the static bearer is never checked in that mode.
     if cf_on:

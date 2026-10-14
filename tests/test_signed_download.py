@@ -2,13 +2,12 @@
 
 Every client-facing test requests the URL through the MCP tool registration and fetches the
 bytes through the app build_app() returns, bearer middleware included, with no
-Authorization header. The cases come from what reaches the route from outside: method,
-path shape, query string, the grant's state, and the file changing between the moment the
-URL is issued and the moment it is redeemed.
+Authorization header. The cases come from what reaches the route from outside (method,
+path shape, query string, each signed field) and from the file changing between the
+moment the URL is issued and the moment it is fetched.
 """
 
 import asyncio
-import hashlib
 import json
 import os
 import socket
@@ -16,7 +15,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
-from urllib.parse import urlparse
+from urllib.parse import parse_qsl, urlencode, urlparse
 
 import pytest
 from starlette.responses import JSONResponse
@@ -34,7 +33,6 @@ UNKNOWN_ID = "0f0e0d0c-0b0a-4908-8706-050403020100"
 
 @pytest.fixture(autouse=True)
 def download_env(vault_dir, tmp_path, monkeypatch):
-    monkeypatch.setattr(config, "DOWNLOAD_STAGING_DIR", tmp_path / "downloads")
     monkeypatch.setattr(config, "VAULT_DOWNLOAD_URL_SECRET", "download-secret")
     monkeypatch.setattr(auth_module, "VAULT_MCP_TOKEN", SECRET_TOKEN)
     (vault_dir / "bilder").mkdir()
@@ -63,6 +61,13 @@ def local_path(url: str) -> str:
     return f"{parsed.path}?{parsed.query}"
 
 
+def with_query(grant: dict, **replace) -> str:
+    parsed = urlparse(grant["download_url"])
+    params = dict(parse_qsl(parsed.query, keep_blank_values=True))
+    params.update(replace)
+    return parsed.path + "?" + urlencode(params)
+
+
 def client() -> TestClient:
     return TestClient(server.build_app(), raise_server_exceptions=False)
 
@@ -77,21 +82,20 @@ def test_download_through_build_app_serves_the_exact_bytes():
     assert response.status_code == 200, response.text
     assert response.content == PNG
     assert grant["size"] == len(PNG)
-    assert grant["sha256"] == hashlib.sha256(PNG).hexdigest()
     assert response.headers["content-type"] == "image/png"
     assert response.headers["content-length"] == str(len(PNG))
 
 
-def test_url_is_single_use():
+def test_the_url_can_be_fetched_again_until_it_expires():
+    """Stateless by design (review of #115): the short lifetime bounds a leaked URL."""
     grant = request_url()
     c = client()
 
     first = c.get(local_path(grant["download_url"]))
     second = c.get(local_path(grant["download_url"]))
 
-    assert first.status_code == 200
-    assert second.status_code == 409, second.text
-    assert second.content != PNG
+    assert first.status_code == second.status_code == 200
+    assert first.content == second.content == PNG
 
 
 def test_a_file_larger_than_one_chunk_streams_whole(vault_dir):
@@ -103,7 +107,6 @@ def test_a_file_larger_than_one_chunk_streams_whole(vault_dir):
 
     assert response.status_code == 200
     assert response.content == big
-    assert hashlib.sha256(response.content).hexdigest() == grant["sha256"]
 
 
 @pytest.mark.parametrize("name,content", [("seite.html", b"<script>alert(1)</script>"), ("bild.svg", b"<svg onload=alert(1)/>")])
@@ -121,6 +124,14 @@ def test_active_content_is_an_attachment_never_rendered(vault_dir, name, content
     assert "default-src 'none'" in response.headers["content-security-policy"]
 
 
+def test_the_response_is_not_cached():
+    grant = request_url()
+
+    response = client().get(local_path(grant["download_url"]))
+
+    assert response.headers["cache-control"] == "no-store"
+
+
 def test_a_non_ascii_filename_is_carried_without_breaking_the_header(vault_dir):
     (vault_dir / 'Prüfung "final".pdf').write_bytes(b"%PDF-1.4\n")
     grant = request_url('Prüfung "final".pdf')
@@ -133,15 +144,13 @@ def test_a_non_ascii_filename_is_carried_without_breaking_the_header(vault_dir):
     assert 'filename="Pr_fung _final_.pdf"' in disposition
 
 
-def test_a_range_header_does_not_buy_a_partial_read_that_keeps_the_url():
-    grant = request_url()
-    c = client()
+def test_a_path_with_a_newline_is_signed_unambiguously(vault_dir):
+    (vault_dir / "a\nb.txt").write_bytes(b"newline in the name")
+    grant = request_url("a\nb.txt")
 
-    ranged = c.get(local_path(grant["download_url"]), headers={"Range": "bytes=0-0"})
-    again = c.get(local_path(grant["download_url"]))
+    response = client().get(local_path(grant["download_url"]))
 
-    assert ranged.status_code == 200 and ranged.content == PNG
-    assert again.status_code == 409
+    assert response.status_code == 200 and response.content == b"newline in the name"
 
 
 # --- What the tool refuses -----------------------------------------------------------------
@@ -174,51 +183,132 @@ def test_the_tool_refuses_a_hardlinked_file(vault_dir, tmp_path):
     assert "error" in payload and "download_url" not in payload, payload
 
 
-def test_the_tool_refuses_a_file_over_the_cap(vault_dir, monkeypatch):
-    monkeypatch.setattr(config, "VAULT_DOWNLOAD_MAX_BYTES", len(PNG) - 1)
-
-    payload = call_tool(path="bilder/scan.png")
-
-    assert "error" in payload and "download_url" not in payload, payload
-
-
 def test_the_lifetime_is_clamped_to_the_maximum(monkeypatch):
     monkeypatch.setattr(config, "VAULT_DOWNLOAD_URL_MAX_TTL_SECONDS", 60)
 
     grant = request_url(ttl_seconds=86400)
 
     assert grant["expires_in_seconds"] == 60
+    assert grant["expires_at"] - time.time() <= 61
 
 
-# --- The grant ---------------------------------------------------------------------------------
+# --- The race the guard cannot see: the path changes after it was resolved -----------------
+#
+# The guard resolves the path, then the file is opened. Whatever sits at the resolved path
+# by the time of the open is what fstat describes. These tests put the swap exactly there,
+# by handing the open a path the guard would have refused.
 
-def _with_query(grant: dict, **replace) -> str:
-    parsed = urlparse(grant["download_url"])
-    params = dict(part.split("=", 1) for part in parsed.query.split("&"))
-    params.update(replace)
-    return parsed.path + "?" + "&".join(f"{k}={v}" for k, v in params.items())
+def _guard_resolves_to(monkeypatch, target):
+    monkeypatch.setattr(download_mod, "resolve_vault_read_path", lambda _path: target)
 
+
+def test_a_symlink_swapped_in_after_the_guard_is_not_followed(vault_dir, tmp_path, monkeypatch):
+    outside = tmp_path / "secret.txt"
+    outside.write_text("outside the vault", encoding="utf-8")
+    swapped = vault_dir / "swapped.txt"
+    swapped.symlink_to(outside)
+    _guard_resolves_to(monkeypatch, swapped)
+
+    payload = call_tool(path="swapped.txt")
+
+    assert "error" in payload and "download_url" not in payload, payload
+
+
+def test_a_hardlink_swapped_in_after_the_guard_is_refused_from_fstat(vault_dir, tmp_path, monkeypatch):
+    outside = tmp_path / "secret.txt"
+    outside.write_text("outside the vault", encoding="utf-8")
+    hard = vault_dir / "hard.txt"
+    os.link(outside, hard)
+    _guard_resolves_to(monkeypatch, hard)
+
+    payload = call_tool(path="hard.txt")
+
+    assert "error" in payload and "download_url" not in payload, payload
+
+
+def test_a_hardlink_made_after_issue_is_refused_from_fstat_at_the_route(vault_dir, tmp_path, monkeypatch):
+    """Same inode, size and mtime: only the link count tells, and only fstat sees it here."""
+    grant = request_url()
+    target = vault_dir / "bilder" / "scan.png"
+    os.link(target, tmp_path / "second-name.png")
+    _guard_resolves_to(monkeypatch, target)
+
+    response = client().get(local_path(grant["download_url"]))
+
+    assert response.status_code == 409, response.text
+
+
+def test_a_directory_swapped_in_after_the_guard_is_refused(vault_dir, monkeypatch):
+    _guard_resolves_to(monkeypatch, vault_dir / "bilder")
+
+    payload = call_tool(path="bilder/scan.png")
+
+    assert "error" in payload and "download_url" not in payload, payload
+
+
+@pytest.mark.skipif(not os.path.exists("/dev/null"), reason="needs a character device with one link")
+def test_a_device_swapped_in_after_the_guard_is_refused(monkeypatch):
+    """One link and not a directory, so only the regular-file check stands in the way."""
+    _guard_resolves_to(monkeypatch, "/dev/null")
+
+    payload = call_tool(path="bilder/scan.png")
+
+    assert "error" in payload and "download_url" not in payload, payload
+
+
+# --- Each signed field, the signature, and the expiry -----------------------------------------
 
 @pytest.mark.parametrize(
-    "replace,status",
+    "replace",
     [
-        ({"signature": "0" * 64}, 403),
-        ({"signature": "%C3%A9"}, 403),
-        ({"signature": ""}, 403),
-        ({"expires": "1"}, 403),
-        ({"expires": "soon"}, 400),
+        {"path": "test-note.md"},
+        {"device": "1"},
+        {"inode": "1"},
+        {"size": "1"},
+        {"mtime_ns": "1"},
+        {"expires": str(int(time.time()) + 86400)},
+        {"signature": "0" * 64},
+        {"signature": "%C3%A9"},
+        {"signature": "é"},
+        {"signature": ""},
     ],
 )
-def test_a_bad_grant_is_refused_and_does_not_spend_the_url(replace, status):
+def test_a_changed_field_or_a_bad_signature_is_403(replace):
     grant = request_url()
-    c = client()
 
-    refused = c.get(_with_query(grant, **replace))
-    good = c.get(local_path(grant["download_url"]))
+    response = client().get(with_query(grant, **replace))
 
-    assert refused.status_code == status, refused.text
-    assert refused.content != PNG
-    assert good.status_code == 200 and good.content == PNG
+    assert response.status_code == 403, response.text
+    assert response.content != PNG
+
+
+def test_the_id_is_signed_too():
+    grant = request_url()
+    other_id = with_query(grant).replace(grant["download_id"], UNKNOWN_ID)
+
+    response = client().get(other_id)
+
+    assert response.status_code == 403, response.text
+
+
+@pytest.mark.parametrize("drop", ["path", "device", "inode", "size", "mtime_ns", "expires"])
+def test_a_missing_field_is_400(drop):
+    grant = request_url()
+    parsed = urlparse(grant["download_url"])
+    params = {k: v for k, v in parse_qsl(parsed.query) if k != drop}
+
+    response = client().get(parsed.path + "?" + urlencode(params))
+
+    assert response.status_code == 400, response.text
+
+
+@pytest.mark.parametrize("field", ["device", "inode", "size", "mtime_ns", "expires"])
+def test_a_non_integer_field_is_400(field):
+    grant = request_url()
+
+    response = client().get(with_query(grant, **{field: "soon"}))
+
+    assert response.status_code == 400, response.text
 
 
 def test_an_encoded_signature_key_is_still_the_signature():
@@ -241,8 +331,8 @@ def test_an_expired_url_is_refused(monkeypatch):
     assert response.status_code == 410, response.text
 
 
-@pytest.mark.parametrize("download_id", [UNKNOWN_ID, "abc", "A" * 64])
-def test_an_unknown_or_malformed_id_is_404(download_id):
+@pytest.mark.parametrize("download_id", ["abc", "A" * 64, UNKNOWN_ID.upper()])
+def test_a_malformed_id_is_404(download_id):
     response = client().get(f"/download/{download_id}?expires=1&signature=x")
 
     assert response.status_code == 404, response.text
@@ -273,18 +363,15 @@ def test_only_get_on_one_id_segment_is_bearer_exempt(method, path):
     assert response.status_code == 401, (method, path, response.status_code)
 
 
-def test_a_head_with_a_bearer_token_neither_serves_nor_spends_the_url():
+def test_a_head_with_a_bearer_token_is_refused():
     grant = request_url()
-    c = client()
 
-    head = c.head(local_path(grant["download_url"]), headers={"Authorization": f"Bearer {SECRET_TOKEN}"})
-    get = c.get(local_path(grant["download_url"]))
+    head = client().head(local_path(grant["download_url"]), headers={"Authorization": f"Bearer {SECRET_TOKEN}"})
 
     assert head.status_code == 405
-    assert get.status_code == 200 and get.content == PNG
 
 
-# --- The file changes between issue and redemption ---------------------------------------------
+# --- The file changes between issue and fetch -------------------------------------------------
 
 def test_a_file_changed_in_place_is_not_served(vault_dir):
     grant = request_url()
@@ -299,7 +386,7 @@ def test_a_file_changed_in_place_is_not_served(vault_dir):
 
 
 def test_a_replacement_with_the_same_size_and_mtime_is_not_served(vault_dir):
-    """Only the inode differs: the pinned identity is the one thing that catches this."""
+    """Only the inode differs: the identity in the URL is the one thing that catches this."""
     grant = request_url()
     target = vault_dir / "bilder" / "scan.png"
     original = target.stat()
@@ -339,7 +426,6 @@ def test_a_file_swapped_for_a_symlink_out_of_the_vault_is_not_served(vault_dir, 
 
 
 def test_a_parent_swapped_for_a_symlink_is_not_served(vault_dir, tmp_path):
-    """Same name, same size, outside the vault: only the pinned identity tells them apart."""
     grant = request_url()
     elsewhere = tmp_path / "elsewhere"
     elsewhere.mkdir()
@@ -353,72 +439,63 @@ def test_a_parent_swapped_for_a_symlink_is_not_served(vault_dir, tmp_path):
     assert b"X" * 64 not in response.content
 
 
-def test_a_file_hardlinked_after_issue_is_not_served(vault_dir, tmp_path):
+def test_a_write_into_the_open_file_is_served_as_written(vault_dir, monkeypatch):
+    """The documented limit: an open handle does not freeze the contents."""
     grant = request_url()
-    os.link(vault_dir / "bilder" / "scan.png", tmp_path / "second-name.png")
+    target = vault_dir / "bilder" / "scan.png"
+    real_open = download_mod._open_vault_file
+
+    def open_then_write(path):
+        fd, st = real_open(path)
+        with open(target, "r+b") as f:
+            f.write(b"Z" * 16)
+        return fd, st
+
+    monkeypatch.setattr(download_mod, "_open_vault_file", open_then_write)
 
     response = client().get(local_path(grant["download_url"]))
 
-    assert response.status_code == 409, response.text
+    assert response.status_code == 200
+    assert response.content == b"Z" * 16 + PNG[16:]
 
 
-def test_a_refused_file_does_not_spend_the_url(vault_dir):
+def test_a_file_that_grows_after_the_open_is_served_at_its_checked_size(vault_dir, monkeypatch):
     grant = request_url()
     target = vault_dir / "bilder" / "scan.png"
-    target.rename(vault_dir / "weg.png")
+    real_open = download_mod._open_vault_file
 
-    gone = client().get(local_path(grant["download_url"]))
-    (vault_dir / "weg.png").rename(target)
-    back = client().get(local_path(grant["download_url"]))
+    def open_then_append(path):
+        fd, st = real_open(path)
+        with open(target, "ab") as f:
+            f.write(b"appended" * 1000)
+        return fd, st
 
-    assert gone.status_code == 404
-    assert back.status_code == 200 and back.content == PNG
+    monkeypatch.setattr(download_mod, "_open_vault_file", open_then_append)
 
+    response = client().get(local_path(grant["download_url"]))
 
-# --- Single use under a race, and the handle is closed --------------------------------------
-
-def test_two_racing_requests_get_the_file_once():
-    grant = request_url()
-    query = urlparse(grant["download_url"]).query
-    params = dict(part.split("=", 1) for part in query.split("&"))
-    results = []
-    barrier = threading.Barrier(8)
-
-    def redeem():
-        barrier.wait()
-        payload, status, fd = download_mod.open_signed_download(grant["download_id"], params["expires"], params["signature"])
-        if fd is not None:
-            os.close(fd)
-        results.append(status)
-
-    threads = [threading.Thread(target=redeem) for _ in range(8)]
-    for t in threads:
-        t.start()
-    for t in threads:
-        t.join()
-
-    assert sorted(results) == [200] + [409] * 7, results
+    assert response.status_code == 200
+    assert response.content == PNG
+    assert response.headers["content-length"] == str(len(PNG))
 
 
 @pytest.mark.skipif(not os.path.isdir("/proc/self/fd"), reason="needs /proc to count open descriptors")
 def test_the_file_handle_is_closed_after_serving_and_after_a_refusal(vault_dir):
     c = client()
+    target = vault_dir / "bilder" / "scan.png"
     before = len(os.listdir("/proc/self/fd"))
 
-    target = vault_dir / "bilder" / "scan.png"
     for i in range(5):
         grant = request_url()
         assert c.get(local_path(grant["download_url"])).status_code == 200
-        assert c.get(local_path(grant["download_url"])).status_code == 409
         # Refused after the file was opened: the identity no longer matches.
-        changed = request_url()
         os.utime(target, ns=(time.time_ns(), time.time_ns() + (i + 1) * 10_000_000))
-        assert c.get(local_path(changed["download_url"])).status_code == 409
+        assert c.get(local_path(grant["download_url"])).status_code == 409
 
     assert len(os.listdir("/proc/self/fd")) <= before
 
 
-# --- /download is reserved ----------------------------------------------------------------------
+# --- /download is reserved, and the signed routes come first -----------------------------------
 
 @pytest.mark.parametrize("path", ["/download", "/download/mcp", "/download/mcp/x"])
 def test_mcp_path_under_download_is_rejected(path):
@@ -442,16 +519,36 @@ def test_extension_route_in_the_download_namespace_is_rejected(route_path):
         server.build_app([DownloadSquatter()])
 
 
-# --- Staging, audit, sweep ------------------------------------------------------------------------
+@pytest.mark.parametrize(
+    "method,path,signed_answer",
+    [
+        ("GET", "/download/export", "Unknown download id"),
+        ("POST", "/upload/export", "Unknown upload id"),
+    ],
+)
+def test_a_parameterized_extension_route_cannot_answer_a_tokenless_path(method, path, signed_answer):
+    """Review of #115: Route("/{area}/export") passes the namespace check and, placed ahead
+    of the signed routes, answered GET /download/export and POST /upload/export with no
+    token and no signature. The signed routes now come first."""
 
-def test_staging_is_owner_only():
-    grant = request_url()
-    grant_dir = config.DOWNLOAD_STAGING_DIR / grant["download_id"]
+    class AreaExport(extensions.Extension):
+        def register_routes(self, app):
+            async def handler(request):
+                return JSONResponse({"vault": "contents"})
 
-    assert (config.DOWNLOAD_STAGING_DIR.stat().st_mode & 0o777) == 0o700
-    assert (grant_dir.stat().st_mode & 0o777) == 0o700
-    assert ((grant_dir / "metadata.json").stat().st_mode & 0o777) == 0o600
+            app.routes.insert(0, Route("/{area}/export", handler, methods=["GET", "POST"]))
 
+    app_client = TestClient(server.build_app([AreaExport()]), raise_server_exceptions=False)
+    response = app_client.request(method, path)
+    with_token = app_client.get("/notes/export", headers={"Authorization": f"Bearer {SECRET_TOKEN}"})
+
+    assert response.status_code == 404, response.text
+    assert signed_answer in response.text
+    assert "contents" not in response.text
+    assert with_token.status_code == 200 and "contents" in with_token.text, "negative control: the route is live"
+
+
+# --- Audit ----------------------------------------------------------------------------------------
 
 def _records(audit_log):
     if not audit_log.exists():
@@ -463,7 +560,7 @@ def test_issue_and_download_are_audited_as_reads_when_reads_are_audited(download
     monkeypatch.setattr(config, "VAULT_AUDIT_LOG_INCLUDE_READS", True)
     grant = request_url()
     client().get(local_path(grant["download_url"]))
-    client().get(local_path(grant["download_url"]))  # refused: not audited
+    client().get(with_query(grant, signature="0" * 64))  # refused: not audited
 
     ops = [(r["operation"], r["target_path"], r["operation_status"]) for r in _records(download_env)]
 
@@ -479,29 +576,6 @@ def test_nothing_is_audited_when_reads_are_not(download_env, monkeypatch):
     client().get(local_path(grant["download_url"]))
 
     assert _records(download_env) == []
-
-
-def test_stale_sweep_removes_old_grant_dirs_and_nothing_else(tmp_path):
-    root = config.DOWNLOAD_STAGING_DIR
-    root.mkdir(parents=True, exist_ok=True)
-    old = root / UNKNOWN_ID
-    old.mkdir()
-    other = root / "not-a-grant"
-    other.mkdir()
-    victim = tmp_path / "victim"
-    victim.mkdir()
-    (victim / "keep.txt").write_text("keep", encoding="utf-8")
-    link = root / "1f0e0d0c-0b0a-4908-8706-050403020100"
-    link.symlink_to(victim, target_is_directory=True)
-    stamp = time.time() - 3 * 24 * 3600
-    for entry in (old, other):
-        os.utime(entry, (stamp, stamp))
-
-    download_mod.cleanup_stale_downloads()
-
-    assert not old.exists()
-    assert other.exists()
-    assert (victim / "keep.txt").exists()
 
 
 # --- The signed URL stays out of the access log ---------------------------------------------------
@@ -525,9 +599,7 @@ def _serve_once_and_capture(log_config, capfd, target: str = f"/download/{UNKNOW
     assert uv.started, "uvicorn did not start"
     try:
         try:
-            urllib.request.urlopen(
-                f"http://127.0.0.1:{port}{target}?expires=1&%73ignature=SIGNATURE-VALUE-456", timeout=10
-            )
+            urllib.request.urlopen(f"http://127.0.0.1:{port}{target}?expires=1&%73ignature=SIGNATURE-VALUE-456", timeout=10)
         except urllib.error.HTTPError:
             pass
         time.sleep(0.3)
@@ -538,22 +610,10 @@ def _serve_once_and_capture(log_config, capfd, target: str = f"/download/{UNKNOW
     return out + err
 
 
-def test_access_log_does_not_record_the_download_signature(capfd):
-    from uvicorn.config import LOGGING_CONFIG
-
-    stock = _serve_once_and_capture(LOGGING_CONFIG, capfd)
-    assert "SIGNATURE-VALUE-456" in stock, f"negative control: stock access log did not show the URL: {stock!r}"
-
-    served = _serve_once_and_capture(server.uvicorn_log_config(), capfd)
-
-    assert "GET /download/" in served, f"the access line itself must survive: {served!r}"
-    assert "SIGNATURE-VALUE-456" not in served
-
-
-@pytest.mark.parametrize("target", [f"/{UNKNOWN_ID}", "/download-but-not-really/x", "/mcp"])
-def test_a_signature_on_another_path_is_kept_out_of_the_access_log(capfd, target):
-    """A mangled signed URL (a doubled slash read as a host, a base URL joined wrong) still
-    carries a live signature on a path outside both prefixes."""
+@pytest.mark.parametrize("target", [f"/download/{UNKNOWN_ID}", f"/{UNKNOWN_ID}", "/download-but-not-really/x", "/mcp"])
+def test_a_signature_is_kept_out_of_the_access_log_on_any_path(capfd, target):
+    """The download route, and a mangled signed URL (a doubled slash read as a host, a base
+    URL joined wrong) that still carries a live signature on a path under neither prefix."""
     from uvicorn.config import LOGGING_CONFIG
 
     stock = _serve_once_and_capture(LOGGING_CONFIG, capfd, target)
