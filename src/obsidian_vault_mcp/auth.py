@@ -110,10 +110,14 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
         # Constant-time compare: avoid leaking the token via response timing (#2). Bytes,
         # because hmac.compare_digest raises on str that is not ASCII.
         if hmac.compare_digest(token.encode(), VAULT_MCP_TOKEN.encode()):
-            # The static bearer names no client: a User-Agent-derived hint stands in.
+            # The static bearer names no client: a User-Agent-derived hint stands in. It is
+            # the operator's own token, so it always has full access.
             client = request.headers.get("user-agent", "").strip()[:200] or None
+            access = "write"
         elif (issued := _per_client_token(request, token)) is not None:
+            # Looked up on every request, so a changed access level applies to the next one.
             client = issued.client_id
+            access = issued.access
         else:
             # One answer for every refused token, so it does not tell which kind failed.
             return JSONResponse(
@@ -125,7 +129,9 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
         # Thread the authenticated principal (plus a request id and the client) to the tool
         # layer for the audit log. The raw token never leaves this context;
         # audit.build_audit_record stores only its SHA-256 hash.
-        ctx_token = set_request_context(principal=token, request_id=uuid.uuid4().hex, client=client)
+        ctx_token = set_request_context(
+            principal=token, request_id=uuid.uuid4().hex, client=client, access=access
+        )
         try:
             return await call_next(request)
         finally:

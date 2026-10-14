@@ -105,10 +105,10 @@ def test_redirect_repeated_in_one_registration_is_stored_once(state_path):
 def test_state_written_by_a_newer_version_is_refused(state_path):
     _open(state_path).close()
     connection = sqlite3.connect(state_path)
-    connection.execute("PRAGMA user_version = 2")
+    connection.execute("PRAGMA user_version = 3")
     connection.close()
 
-    with pytest.raises(OAuthStateError, match="schema version 2"):
+    with pytest.raises(OAuthStateError, match="schema version 3"):
         _open(state_path)
 
 
@@ -604,3 +604,161 @@ def test_import_does_not_overwrite_existing_client(state_path, legacy_path):
     assert reopened.get_client("vault-mcp-revoked").revoked_at is not None
     assert not reopened.client_redirect_uri_allowed("vault-mcp-revoked", REDIRECT)
     reopened.close()
+
+
+# --- Access levels -----------------------------------------------------------------------
+
+
+def test_access_level_is_read_from_the_client_on_every_lookup(state_path):
+    state = _open(state_path)
+    client_id = state.register_client([REDIRECT]).client.client_id
+    issued = state.issue_token_pair(client_id=client_id, resource=RESOURCE)
+
+    default = state.lookup_access_token(issued.access_token).access
+    changed = state.set_client_access(client_id, "read")
+    after = state.lookup_access_token(issued.access_token).access
+
+    assert (default, changed, after) == ("write", True, "read")
+    assert state.get_client(client_id).access == "read"
+    assert state.set_client_access("vault-mcp-unknown", "read") is False
+    with pytest.raises(ValueError, match="access must be one of"):
+        state.set_client_access(client_id, "admin")
+    assert state.get_client(client_id).access == "read"
+    state.close()
+
+
+# The schema main wrote at version 1 (#108), verbatim. A store on disk today looks like this.
+_V1_SCHEMA = """
+CREATE TABLE IF NOT EXISTS clients (
+    client_id TEXT PRIMARY KEY,
+    secret_verifier BLOB,
+    is_static INTEGER NOT NULL CHECK (is_static IN (0, 1)),
+    client_name TEXT NOT NULL,
+    created_at REAL NOT NULL,
+    last_authorized_at REAL,
+    revoked_at REAL
+);
+CREATE TABLE IF NOT EXISTS client_redirect_uris (
+    client_id TEXT NOT NULL REFERENCES clients(client_id) ON DELETE CASCADE,
+    redirect_uri TEXT NOT NULL,
+    PRIMARY KEY (client_id, redirect_uri)
+);
+CREATE TABLE IF NOT EXISTS access_tokens (
+    token_id TEXT PRIMARY KEY,
+    secret_verifier BLOB NOT NULL,
+    client_id TEXT NOT NULL REFERENCES clients(client_id) ON DELETE CASCADE,
+    resource TEXT NOT NULL,
+    issued_at REAL NOT NULL,
+    expires_at REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS refresh_tokens (
+    token_id TEXT PRIMARY KEY,
+    secret_verifier BLOB NOT NULL,
+    client_id TEXT NOT NULL REFERENCES clients(client_id) ON DELETE CASCADE,
+    access_token_id TEXT NOT NULL REFERENCES access_tokens(token_id) ON DELETE CASCADE,
+    resource TEXT NOT NULL,
+    issued_at REAL NOT NULL,
+    expires_at REAL NOT NULL,
+    consumed_at REAL
+);
+"""
+
+
+def _version_1_store(state_path: Path) -> None:
+    """A version 1 store holding a connected client with live tokens, a revoked client
+    and the operator's static client."""
+    from obsidian_vault_mcp.oauth_state import _secret_verifier
+
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    connection = sqlite3.connect(state_path)
+    connection.executescript(_V1_SCHEMA)
+    connection.executemany(
+        "INSERT INTO clients (client_id, secret_verifier, is_static, client_name, created_at, "
+        "last_authorized_at, revoked_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        [
+            ("vault-mcp-live", _secret_verifier("client", "live-secret"), 0, "Claude", 100.0, 150.0, None),
+            ("vault-mcp-gone", _secret_verifier("client", "gone-secret"), 0, "Old", 200.0, None, 250.0),
+            ("operator", None, 1, "Obsidian Vault MCP Static Client", 300.0, None, None),
+        ],
+    )
+    connection.execute("INSERT INTO client_redirect_uris VALUES ('vault-mcp-live', ?)", (REDIRECT,))
+    connection.execute(
+        "INSERT INTO access_tokens VALUES ('at', ?, 'vault-mcp-live', ?, 1000.0, 87400.0)",
+        (_secret_verifier("access-token", "at-secret"), RESOURCE),
+    )
+    connection.execute(
+        "INSERT INTO refresh_tokens VALUES ('rt', ?, 'vault-mcp-live', 'at', ?, 1000.0, 2593000.0, NULL)",
+        (_secret_verifier("refresh-token", "rt-secret"), RESOURCE),
+    )
+    connection.execute("PRAGMA user_version = 1")
+    connection.commit()
+    connection.close()
+
+
+def test_version_1_store_is_upgraded_in_place_and_every_client_keeps_write(state_path):
+    _version_1_store(state_path)
+
+    state = _open(state_path, now=[2_000.0])
+
+    clients = {client.client_id: client for client in state.list_clients()}
+    assert set(clients) == {"vault-mcp-live", "vault-mcp-gone", "operator"}
+    assert {client.access for client in clients.values()} == {"write"}
+    live = clients["vault-mcp-live"]
+    assert (live.client_name, live.created_at, live.last_authorized_at) == ("Claude", 100.0, 150.0)
+    assert live.redirect_uris == (REDIRECT,)
+    assert clients["vault-mcp-gone"].revoked_at == 250.0
+    assert clients["operator"].is_static is True
+    assert state.verify_client_secret("vault-mcp-live", "live-secret")
+    # The tokens a connected client holds keep working, now with its access level.
+    assert state.lookup_access_token("v1.at.at-secret").access == "write"
+    refreshed = state.redeem_refresh_token(
+        refresh_token="r1.rt.rt-secret", client_id="vault-mcp-live", resource_ok=lambda _r: True
+    )
+    assert refreshed.token.access == "write"
+    state.close()
+
+    connection = sqlite3.connect(state_path)
+    assert connection.execute("PRAGMA user_version").fetchone()[0] == 2
+    # The CHECK constraint came with the upgrade.
+    with pytest.raises(sqlite3.IntegrityError):
+        connection.execute("UPDATE clients SET access = 'admin' WHERE client_id = 'operator'")
+    connection.close()
+
+
+def test_two_stores_opening_a_version_1_file_at_once_upgrade_it_once(state_path):
+    _version_1_store(state_path)
+    # Hold the write lock so both openers are inside their open when it is released.
+    holder = sqlite3.connect(state_path, isolation_level=None)
+    holder.execute("BEGIN IMMEDIATE")
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        opening = [pool.submit(_open, state_path) for _ in range(2)]
+        threading.Event().wait(0.5)
+        holder.execute("ROLLBACK")
+        stores = [future.result(timeout=30) for future in opening]
+
+    assert [store.get_client("vault-mcp-live").access for store in stores] == ["write", "write"]
+    for store in stores:
+        store.close()
+    holder.close()
+
+
+def test_store_set_back_to_version_1_upgrades_again_with_its_access_levels(state_path):
+    state = _open(state_path)
+    reader = state.register_client([REDIRECT]).client.client_id
+    writer = state.register_client([REDIRECT]).client.client_id
+    state.set_client_access(reader, "read")
+    state.close()
+    # What README "Going back" tells an operator to do before running the version before.
+    connection = sqlite3.connect(state_path)
+    connection.execute("PRAGMA user_version = 1")
+    connection.close()
+
+    reopened = _open(state_path)
+
+    assert reopened.get_client(reader).access == "read"
+    assert reopened.get_client(writer).access == "write"
+    reopened.close()
+    connection = sqlite3.connect(state_path)
+    assert connection.execute("PRAGMA user_version").fetchone()[0] == 2
+    connection.close()

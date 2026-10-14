@@ -56,6 +56,11 @@ READ_OPERATIONS = {
     "vault_list",
     "vault_canvas_read",
     "vault_daily_note_read",
+    # Not run through run_audited, so never in the log; named here so that a read-only
+    # client may call them.
+    "vault_daily_note_path",
+    "vault_analytics_summary",
+    "vault_analytics_findings",
 }
 
 # Mutations whose result reports per-file outcomes; audited one record per file.
@@ -346,6 +351,9 @@ def run_audited(operation: str, func, **context) -> str:
     ``func`` must be synchronous. An awaitable result raises TypeError on every path,
     including with auditing off, so the mistake shows in development and not first in a
     deployment that turns the log on.
+
+    A read-only caller never gets here for anything but a read: every MCP tool call is
+    checked at dispatch first (server.AccessCheckedFastMCP).
     """
     if not should_audit_operation(operation):
         return _call_synchronously(operation, func)
@@ -384,6 +392,27 @@ def run_audited(operation: str, func, **context) -> str:
         )
     write_audit_record(record)
     return result
+
+
+def read_only_refusal(operation: str, context: dict) -> str | None:
+    """None when the caller may run the operation; otherwise the error it gets instead.
+
+    A caller without write access may run only operations whose kind is "read". Anything
+    else, including an operation the log does not know, is refused (fail closed), and the
+    refusal is recorded like the operation's outcome when the operation is audited.
+    """
+    may_write = current_request_context().get("access", "write") == "write"
+    if may_write or operation_kind(operation) == "read":
+        return None
+    error = f"This client is read-only: {operation} is not a read operation, so it was refused"
+    if should_audit_operation(operation):
+        write_audit_record(build_audit_record(
+            operation=operation,
+            target_path=infer_target_path(operation, context) or context.get("paths"),
+            operation_status="error",
+            error=error,
+        ))
+    return dumps({"error": error})
 
 
 def _run_audited_batch(operation: str, func, context: dict) -> str:
