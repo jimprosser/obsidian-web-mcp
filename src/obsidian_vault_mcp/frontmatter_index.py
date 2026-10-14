@@ -10,6 +10,7 @@ from watchdog.events import FileSystemEvent, FileSystemEventHandler
 from watchdog.observers import Observer
 
 from . import config
+from .vault import resolve_vault_read_path
 
 logger = logging.getLogger(__name__)
 
@@ -132,7 +133,17 @@ class FrontmatterIndex:
         return bool(config.EXCLUDED_DIRS & set(path.relative_to(config.VAULT_PATH).parts))
 
     def _parse_frontmatter(self, path: Path) -> dict | None:
-        """Parse YAML frontmatter from a markdown file. Returns None on failure."""
+        """Parse YAML frontmatter from a markdown file. Returns None on failure.
+
+        Also None for a file vault_read refuses (a symlink out of the vault, a hardlink, a
+        dot path): vault_search_frontmatter returns what the index holds, so the index must
+        not hold what the read guard hides. Used by rebuild and by the watcher alike.
+        """
+        try:
+            path = resolve_vault_read_path(str(path.relative_to(config.VAULT_PATH)))
+        except (ValueError, OSError, RuntimeError):
+            # RuntimeError: a symlink loop, on Python 3.12 (3.13 raises OSError).
+            return None
         try:
             post = frontmatter.load(str(path))
             return dict(post.metadata)
