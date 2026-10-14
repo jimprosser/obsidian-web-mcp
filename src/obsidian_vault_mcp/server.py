@@ -924,6 +924,17 @@ def serve(extensions=()):
     if not cf_on and not VAULT_MCP_TOKEN:
         logger.warning("VAULT_MCP_TOKEN is not set -- auth will reject all requests")
 
+    # Semantic search is opt-in: fail CLOSED without its extra; while off, import nothing of it.
+    if config.semantic_search_enabled():
+        from .semantic import require_dependencies
+        try:
+            require_dependencies()
+        except Exception as e:
+            logger.error(str(e))
+            sys.exit(1)
+        from .semantic.extension import SemanticExtension
+        extensions = (SemanticExtension(), *extensions)
+
     # Open the OAuth store before serving, so the legacy registry import and the file
     # modes happen at startup rather than on the first request. Not in Cloudflare Access
     # mode: no OAuth route or bearer check is mounted there, so it would only leave files

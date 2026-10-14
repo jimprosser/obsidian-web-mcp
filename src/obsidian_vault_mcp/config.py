@@ -167,6 +167,20 @@ VAULT_AUDIT_LOG_INCLUDE_READS = os.environ.get(
     "VAULT_AUDIT_LOG_INCLUDE_READS", ""
 ).strip().lower() in {"1", "true", "yes", "on"}
 
+# Semantic search (opt-in; needs the `semantic` extra). The index holds an excerpt of every
+# note, so it must resolve outside the vault. Both settings are checked in validate_config().
+VAULT_SEMANTIC_SEARCH = os.environ.get("VAULT_SEMANTIC_SEARCH", "").strip()
+VAULT_SEMANTIC_DB_PATH = Path(os.environ.get(
+    "VAULT_SEMANTIC_DB_PATH",
+    Path.home() / ".local" / "share" / "vault-mcp" / "embeddings.db",
+))
+
+
+def semantic_search_enabled() -> bool:
+    """Whether the operator switched on vault_semantic_search."""
+    return VAULT_SEMANTIC_SEARCH.lower() in {"1", "true", "yes", "on"}
+
+
 # Safety limits
 MAX_CONTENT_SIZE = 1_000_000  # 1MB max write size
 MAX_BINARY_SIZE = 10_000_000  # 10MB max binary write size (images/PDFs run larger than text)
@@ -336,6 +350,7 @@ def validate_config() -> None:
     parse_extra_binary_media_types(os.environ.get("VAULT_EXTRA_BINARY_MEDIA_TYPES_JSON", "").strip())
     if signed_upload_enabled():
         _validate_upload_settings()
+    _validate_semantic_settings()
     # Imported lazily: cf_access imports config, so a top-level import here would cycle.
     # A no-op unless Cloudflare Access mode is on (both settings set).
     from .cf_access import validate_cf_access_config
@@ -381,3 +396,27 @@ def _validate_upload_settings() -> None:
         f"VAULT_UPLOAD_STAGING_DIR resolves inside the vault ({staging}); the vault tools "
         "could reach the grants. Choose a path outside VAULT_PATH."
     )
+
+
+def _validate_semantic_settings() -> None:
+    """Fail closed on the semantic-search settings.
+
+    A value that is neither on nor off stops startup, so a typo cannot leave the operator
+    believing the feature is on. With it on, the index must resolve outside the vault, the
+    same rule as the audit log: it holds an excerpt of every note, and inside the vault the
+    vault tools could reach it.
+    """
+    if VAULT_SEMANTIC_SEARCH.lower() not in {"", "0", "false", "no", "off", "1", "true", "yes", "on"}:
+        raise ValueError(
+            "VAULT_SEMANTIC_SEARCH must be on (1/true/yes/on) or off (0/false/no/off), "
+            f"got {VAULT_SEMANTIC_SEARCH!r}"
+        )
+    if not semantic_search_enabled():
+        return
+    db = VAULT_SEMANTIC_DB_PATH.expanduser().resolve()
+    vault = VAULT_PATH.expanduser().resolve()
+    if db == vault or vault in db.parents:
+        raise ValueError(
+            f"VAULT_SEMANTIC_DB_PATH resolves inside the vault ({db}); the vault tools could "
+            "reach the index. Choose a path outside VAULT_PATH."
+        )
