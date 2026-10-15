@@ -220,6 +220,29 @@ def signed_upload_enabled() -> bool:
     path, and the bearer token should not double as the URL-signing key.
     """
     return bool(VAULT_UPLOAD_URL_SECRET)
+
+
+# Signed direct download (GET /download/{id}), the read counterpart of the signed upload.
+# Bearer-exempt for the same reason: the HMAC signature in the URL is the authorization.
+# The URL carries the whole grant (path, file identity, expiry); the server keeps no state.
+# The route opens the file once and serves only if it is the file the URL names.
+VAULT_DOWNLOAD_URL_SECRET = os.environ.get("VAULT_DOWNLOAD_URL_SECRET", "").strip()
+VAULT_DOWNLOAD_URL_TTL_SECONDS = _env_int("VAULT_DOWNLOAD_URL_TTL_SECONDS", 300)
+VAULT_DOWNLOAD_URL_MAX_TTL_SECONDS = _env_int("VAULT_DOWNLOAD_URL_MAX_TTL_SECONDS", 3600)
+# Reserved like UPLOAD_ROUTE_PREFIX, whether or not the feature is on.
+DOWNLOAD_ROUTE_PREFIX = "/download"
+
+
+def signed_download_enabled() -> bool:
+    """Whether the signed download path exists at all.
+
+    Off unless the operator sets VAULT_DOWNLOAD_URL_SECRET. No fallback to the upload
+    secret or VAULT_MCP_TOKEN: an upgrade must not open a tokenless read path, and turning
+    on uploads must not turn on downloads.
+    """
+    return bool(VAULT_DOWNLOAD_URL_SECRET)
+
+
 MAX_BATCH_SIZE = 20           # Max files per batch operation
 MAX_SEARCH_RESULTS = 50       # Max results per search
 DEFAULT_SEARCH_RESULTS = 20
@@ -268,7 +291,7 @@ def _validate_mcp_path(path: str) -> None:
     # Imported lazily: auth imports config, so a top-level import here would cycle.
     from .auth import _AUTH_EXEMPT_PATHS
 
-    reserved_prefixes = ("/oauth", "/.well-known", UPLOAD_ROUTE_PREFIX)
+    reserved_prefixes = ("/oauth", "/.well-known", UPLOAD_ROUTE_PREFIX, DOWNLOAD_ROUTE_PREFIX)
     collides = path in _AUTH_EXEMPT_PATHS or any(
         path == prefix or path.startswith(prefix + "/") for prefix in reserved_prefixes
     )
@@ -276,7 +299,7 @@ def _validate_mcp_path(path: str) -> None:
         raise ValueError(
             f"VAULT_MCP_PATH {path!r} collides with an authentication-exempt route; "
             "mounting there would serve the vault without auth. Choose a path that is "
-            "not /health and not under /oauth, /.well-known or /upload."
+            "not /health and not under /oauth, /.well-known, /upload or /download."
         )
 
 
@@ -351,6 +374,8 @@ def validate_config() -> None:
     if signed_upload_enabled():
         _validate_upload_settings()
     _validate_semantic_settings()
+    if signed_download_enabled():
+        _validate_download_settings()
     # Imported lazily: cf_access imports config, so a top-level import here would cycle.
     # A no-op unless Cloudflare Access mode is on (both settings set).
     from .cf_access import validate_cf_access_config
@@ -396,6 +421,30 @@ def _validate_upload_settings() -> None:
         f"VAULT_UPLOAD_STAGING_DIR resolves inside the vault ({staging}); the vault tools "
         "could reach the grants. Choose a path outside VAULT_PATH."
     )
+
+
+def _validate_download_settings() -> None:
+    """Fail closed on the signed-download lifetimes, by the upload settings' rules."""
+    for name, parsed in (
+        ("VAULT_DOWNLOAD_URL_TTL_SECONDS", VAULT_DOWNLOAD_URL_TTL_SECONDS),
+        ("VAULT_DOWNLOAD_URL_MAX_TTL_SECONDS", VAULT_DOWNLOAD_URL_MAX_TTL_SECONDS),
+    ):
+        raw = os.environ.get(name, "").strip()
+        if raw:
+            try:
+                value = int(raw)
+            except ValueError:
+                raise ValueError(f"{name} must be an integer, got {raw!r}")
+        else:
+            value = parsed
+        if value <= 0:
+            raise ValueError(f"{name} must be a positive integer, got {value}")
+    if VAULT_DOWNLOAD_URL_MAX_TTL_SECONDS < VAULT_DOWNLOAD_URL_TTL_SECONDS:
+        raise ValueError(
+            "VAULT_DOWNLOAD_URL_MAX_TTL_SECONDS must not be smaller than "
+            f"VAULT_DOWNLOAD_URL_TTL_SECONDS ({VAULT_DOWNLOAD_URL_MAX_TTL_SECONDS} < "
+            f"{VAULT_DOWNLOAD_URL_TTL_SECONDS})"
+        )
 
 
 def _validate_semantic_settings() -> None:

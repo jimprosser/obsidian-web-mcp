@@ -56,6 +56,8 @@ READ_OPERATIONS = {
     "vault_list",
     "vault_canvas_read",
     "vault_daily_note_read",
+    "vault_request_download_url",
+    "vault_download",
     # Not run through run_audited, so never in the log; named here so that a read-only
     # client may call them.
     "vault_daily_note_path",

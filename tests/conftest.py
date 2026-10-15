@@ -6,11 +6,13 @@ from pathlib import Path
 
 import pytest
 
-# Signed uploads are off unless VAULT_UPLOAD_URL_SECRET is set, and the tool is registered
-# at import time, so the in-process suite needs the secret before obsidian_vault_mcp.server
-# is imported. The off-by-default behaviour is covered separately, in a child process
-# started without it (tests/test_signed_upload.py).
+# Signed uploads and downloads are off unless their secrets are set, and the tools are
+# registered at import time, so the in-process suite needs the secrets before
+# obsidian_vault_mcp.server is imported. The off-by-default behaviour is covered separately,
+# in child processes started without them (tests/test_signed_upload_opt_in.py,
+# tests/test_signed_download_opt_in.py).
 os.environ.setdefault("VAULT_UPLOAD_URL_SECRET", "suite-upload-secret")
+os.environ.setdefault("VAULT_DOWNLOAD_URL_SECRET", "suite-download-secret")
 
 
 @pytest.fixture(autouse=True)
