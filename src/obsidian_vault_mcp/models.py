@@ -210,6 +210,39 @@ class VaultEditInput(BaseModel):
     )
 
 
+class VaultEditSectionInput(BaseModel):
+    """Patch a file, scoped to one heading's section, with exact text replacements."""
+
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    path: str = Field(
+        ...,
+        description="Relative path from vault root",
+        min_length=1,
+        max_length=500,
+    )
+    heading: str = Field(
+        ...,
+        description=(
+            "Exact ATX heading line, markers included (e.g. '## Track 2'); must be "
+            "unique in the file. Edits are scoped to its section -- up to the next "
+            "heading of the same or shallower level, or end of file."
+        ),
+        min_length=1,
+        max_length=500,
+    )
+    edits: list[VaultEditOperationInput] = Field(
+        ...,
+        description="Ordered exact text replacements; each old_text only needs to be unique within the heading's section",
+        min_length=1,
+        max_length=MAX_BATCH_SIZE,
+    )
+    dry_run: bool = Field(
+        default=False,
+        description="Preview the patch and diff without writing the file",
+    )
+
+
 class VaultAppendInput(BaseModel):
     """Append content to a file without resending the existing body."""
 
@@ -234,6 +267,15 @@ class VaultAppendInput(BaseModel):
     create_dirs: bool = Field(
         default=True,
         description="Create parent directories if they don't exist",
+    )
+    heading: str | None = Field(
+        default=None,
+        description=(
+            "Exact ATX heading line, markers included (e.g. '## Track 2'). When set, "
+            "appends at the end of that heading's section instead of end-of-file; the "
+            "file and heading must already exist."
+        ),
+        max_length=500,
     )
 
 
