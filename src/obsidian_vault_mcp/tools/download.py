@@ -28,6 +28,7 @@ import logging
 import mimetypes
 import os
 import re
+import shlex
 import stat
 import time
 import uuid
@@ -124,7 +125,9 @@ def vault_request_download_url(path: str, ttl_seconds: int | None = None) -> str
                 "media_type": _media_type(path),
                 "size": st.st_size,
                 "method": "GET",
-                "curl": f'curl -fsS -o "{filename}" "{download_url}"',
+                # Quoted for a POSIX shell: a note may be named $(id).txt, and an agent
+                # runs this line as given.
+                "curl": f"curl -fsS -o {shlex.quote(filename)} {shlex.quote(download_url)}",
             }
         )
     except FileNotFoundError:

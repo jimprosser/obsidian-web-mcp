@@ -351,11 +351,22 @@ def register_download_tool() -> None:
     def vault_request_download_url(path: str, ttl_seconds: int | None = None) -> str:
         """Return a short-lived signed direct-download URL."""
         inp = VaultRequestDownloadUrlInput(path=path, ttl_seconds=ttl_seconds)
-        return run_audited(
-            "vault_request_download_url",
-            lambda: _vault_request_download_url(inp.path, inp.ttl_seconds),
-            path=inp.path,
-        )
+        result = _vault_request_download_url(inp.path, inp.ttl_seconds)
+        # Audited like the serve in direct_download: path and size, no checksum.
+        # run_audited would snapshot a read's target with a checksum of the whole file,
+        # which is the hashing the stateless grant took out of issuing a URL.
+        if should_audit_operation("vault_request_download_url"):
+            parsed = json.loads(result)
+            write_audit_record(
+                build_audit_record(
+                    operation="vault_request_download_url",
+                    target_path=inp.path,
+                    before={"size": parsed.get("size"), "checksum": None},
+                    operation_status="error" if "error" in parsed else "success",
+                    error=parsed.get("error"),
+                )
+            )
+        return result
 
 if config.signed_download_enabled():
     register_download_tool()

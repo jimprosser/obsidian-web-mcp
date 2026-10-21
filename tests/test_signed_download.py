@@ -562,12 +562,56 @@ def test_issue_and_download_are_audited_as_reads_when_reads_are_audited(download
     client().get(local_path(grant["download_url"]))
     client().get(with_query(grant, signature="0" * 64))  # refused: not audited
 
-    ops = [(r["operation"], r["target_path"], r["operation_status"]) for r in _records(download_env)]
+    ops = [(r["operation"], r["target_path"], r["operation_status"], r["size_before"], r["checksum_before"])
+           for r in _records(download_env)]
 
     assert ops == [
-        ("vault_request_download_url", "bilder/scan.png", "success"),
-        ("vault_download", "bilder/scan.png", "success"),
+        ("vault_request_download_url", "bilder/scan.png", "success", len(PNG), None),
+        ("vault_download", "bilder/scan.png", "success", len(PNG), None),
     ], ops
+
+
+def test_issuing_a_url_with_read_auditing_on_never_hashes_the_file(download_env, monkeypatch):
+    """Review of #115: run_audited snapshots a read's target with a checksum of the whole
+    file, which would bring back the hash the stateless grant took out."""
+    from obsidian_vault_mcp import audit
+
+    snapshots = []
+    real_snapshot = audit.snapshot_path
+    monkeypatch.setattr(audit, "snapshot_path", lambda p: snapshots.append(p) or real_snapshot(p))
+    monkeypatch.setattr(config, "VAULT_AUDIT_LOG_INCLUDE_READS", True)
+
+    request_url()
+    call_tool(path="missing.png")
+
+    assert snapshots == []
+    records = _records(download_env)
+    assert [(r["operation_status"], r["checksum_before"]) for r in records] == [("success", None), ("error", None)]
+    assert "missing.png" in (records[1]["error"] or "")
+
+
+# --- the curl line is safe to run as given ----------------------------------------------------
+
+@pytest.mark.skipif(not os.path.exists("/bin/sh"), reason="needs a POSIX shell")
+@pytest.mark.parametrize("name", ["$(touch PWNED).txt", "`touch PWNED`.txt", "it's \"quoted\" $HOME.txt", "a\nb.txt"])
+def test_the_curl_line_runs_no_command_from_the_file_name(vault_dir, tmp_path, name):
+    """Review of #115: a note named $(id).txt ran id on whoever ran the curl line. Obsidian
+    allows $, parentheses and backticks in names, and an agent runs the line as given."""
+    import subprocess
+
+    (vault_dir / name).write_bytes(b"x")
+    grant = request_url(name)
+    workdir = tmp_path / "client"
+    workdir.mkdir()
+
+    # A real shell runs the line; curl is a function that prints its arguments, one per NUL.
+    shown = subprocess.run(
+        ["/bin/sh", "-c", 'curl() { printf "%s\\0" "$@"; }; ' + grant["curl"]],
+        cwd=workdir, capture_output=True, check=True,
+    ).stdout.decode("utf-8").split("\0")[:-1]
+
+    assert shown == ["-fsS", "-o", name, grant["download_url"]], shown
+    assert list(workdir.iterdir()) == [], "a command from the file name ran"
 
 
 def test_nothing_is_audited_when_reads_are_not(download_env, monkeypatch):
