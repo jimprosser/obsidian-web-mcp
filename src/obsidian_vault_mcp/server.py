@@ -7,6 +7,7 @@ Designed to run behind Cloudflare Tunnel for secure remote access.
 import atexit
 import json
 import logging
+import os
 import sys
 import threading
 import time
@@ -170,6 +171,12 @@ from .tools.upload import (
     validate_upload_grant,
     vault_request_upload_url as _vault_request_upload_url,
 )
+from .tools.download import (
+    AUDIT_OPERATION as DOWNLOAD_AUDIT_OPERATION,
+    open_signed_download,
+    read_chunk,
+    vault_request_download_url as _vault_request_download_url,
+)
 from .tools.search import vault_search as _vault_search, vault_search_frontmatter as _vault_search_frontmatter
 from .tools.manage import vault_list as _vault_list, vault_move as _vault_move, vault_delete as _vault_delete
 from .tools.canvas import (
@@ -193,6 +200,7 @@ from .models import (
     VaultWriteInput,
     VaultWriteBinaryInput,
     VaultRequestUploadUrlInput,
+    VaultRequestDownloadUrlInput,
     VaultEditInput,
     VaultEditOperationInput,
     VaultAppendInput,
@@ -322,6 +330,46 @@ def register_upload_tool() -> None:
 
 if config.signed_upload_enabled():
     register_upload_tool()
+
+
+def register_download_tool() -> None:
+    """Register vault_request_download_url only when signed downloads are configured.
+
+    The tool hands out URLs for a route that answers without a bearer token. With
+    VAULT_DOWNLOAD_URL_SECRET unset that route does not exist, so the tool must not be
+    advertised either.
+    """
+    @mcp.tool(
+        name="vault_request_download_url",
+        description=(
+            "Create a short-lived signed URL for downloading one vault file as raw bytes "
+            "(an image, a PDF, any file vault_read can reach). The client GETs the URL itself, for example "
+            "with curl; the bytes never pass through the conversation. Returns the size to verify."
+        ),
+        annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": False, "openWorldHint": False},
+    )
+    def vault_request_download_url(path: str, ttl_seconds: int | None = None) -> str:
+        """Return a short-lived signed direct-download URL."""
+        inp = VaultRequestDownloadUrlInput(path=path, ttl_seconds=ttl_seconds)
+        result = _vault_request_download_url(inp.path, inp.ttl_seconds)
+        # Audited like the serve in direct_download: path and size, no checksum.
+        # run_audited would snapshot a read's target with a checksum of the whole file,
+        # which is the hashing the stateless grant took out of issuing a URL.
+        if should_audit_operation("vault_request_download_url"):
+            parsed = json.loads(result)
+            write_audit_record(
+                build_audit_record(
+                    operation="vault_request_download_url",
+                    target_path=inp.path,
+                    before={"size": parsed.get("size"), "checksum": None},
+                    operation_status="error" if "error" in parsed else "success",
+                    error=parsed.get("error"),
+                )
+            )
+        return result
+
+if config.signed_download_enabled():
+    register_download_tool()
 
 
 @mcp.tool(
@@ -689,8 +737,81 @@ async def direct_upload(request):
     return JSONResponse(result, status_code=status)
 
 
+async def direct_download(request):
+    """Serve the bytes for a signed download URL.
+
+    open_signed_download checks the URL, opens the file once and accepts the handle only
+    if it is the file the URL was issued for; the body streams from that handle, at most
+    the size checked at the open, so a path swapped after the check serves nothing. Only
+    GET reaches this tokenless (auth.py); HEAD, which Starlette adds to every GET route,
+    is refused here.
+
+    The response is always an attachment, never rendered: a vault can hold HTML or SVG,
+    and served inline from this origin it would run next to the OAuth login.
+
+    Refused requests are logged, not audited: an unauthenticated flood must not be able to
+    grow the audit log. A served download is audited as a read when reads are audited.
+    """
+    from urllib.parse import quote
+
+    import anyio
+    from starlette.background import BackgroundTask
+    from starlette.responses import JSONResponse, StreamingResponse
+
+    from .audit import build_audit_record, should_audit_operation, write_audit_record
+
+    if request.method != "GET":
+        return JSONResponse({"error": "Method not allowed"}, status_code=405, headers={"Allow": "GET"})
+
+    download_id = request.path_params["download_id"]
+    grant, status, fd = await anyio.to_thread.run_sync(open_signed_download, download_id, request.query_params)
+    if status != 200:
+        logger.warning("Download refused: %s (%s)", download_id, grant.get("error"))
+        return JSONResponse(grant, status_code=status)
+
+    logger.info("Download served: %s -> %s (%s bytes)", download_id, grant["path"], grant["size"])
+    if should_audit_operation(DOWNLOAD_AUDIT_OPERATION):
+        write_audit_record(
+            build_audit_record(
+                operation=DOWNLOAD_AUDIT_OPERATION,
+                target_path=grant["path"],
+                before={"size": grant["size"], "checksum": None},
+            )
+        )
+
+    closed = False
+
+    def close():
+        nonlocal closed
+        if not closed:
+            closed = True
+            os.close(fd)
+
+    async def body():
+        # Never more than Content-Length: a file that grows after the open would
+        # otherwise break the response.
+        remaining = grant["size"]
+        try:
+            while remaining > 0 and (chunk := await anyio.to_thread.run_sync(read_chunk, fd, min(remaining, 1024 * 1024))):
+                remaining -= len(chunk)
+                yield chunk
+        finally:
+            close()
+
+    filename = grant["filename"]
+    ascii_name = "".join(c if c.isascii() and c.isprintable() and c not in '"\\' else "_" for c in filename)
+    headers = {
+        "Content-Length": str(grant["size"]),
+        "Content-Disposition": f"attachment; filename=\"{ascii_name}\"; filename*=UTF-8''{quote(filename, safe='')}",
+        "X-Content-Type-Options": "nosniff",
+        "Content-Security-Policy": "default-src 'none'; sandbox",
+        "Cache-Control": "no-store",
+    }
+    return StreamingResponse(body(), media_type=grant["media_type"], headers=headers, background=BackgroundTask(close))
+
+
 class _RedactUploadSignature(logging.Filter):
-    """Keep signed upload URLs out of the access log.
+    """Keep signed upload and download URLs out of the access log.
 
     A logged URL is a usable credential until it expires or is used, and a request refused
     for a wrong Content-Type does not burn the grant. uvicorn's access record carries the
@@ -698,14 +819,25 @@ class _RedactUploadSignature(logging.Filter):
     whole query string goes, rather than a pattern for "signature=". Matching the literal
     key was bypassable: Starlette decodes query keys, so %73ignature=<sig> was accepted as
     the signature and logged in full.
+
+    On any path, the query string also goes when a key decodes to "signature", decoded the
+    way Starlette decodes it. That covers the download route, and a signed URL a client
+    mangles on the way (a doubled slash read as a host, a base URL joined wrong): it still
+    carries a live signature, on a path under neither prefix.
     """
 
     def filter(self, record: logging.LogRecord) -> bool:
+        from urllib.parse import parse_qsl
+
         args = record.args
         if isinstance(args, tuple) and len(args) >= 3 and isinstance(args[2], str):
             target = args[2]
-            path, sep, _query = target.partition("?")
-            if sep and (path == config.UPLOAD_ROUTE_PREFIX or path.startswith(config.UPLOAD_ROUTE_PREFIX + "/")):
+            path, sep, query = target.partition("?")
+            if sep and (
+                path == config.UPLOAD_ROUTE_PREFIX
+                or path.startswith(config.UPLOAD_ROUTE_PREFIX + "/")
+                or any(key == "signature" for key, _ in parse_qsl(query, keep_blank_values=True))
+            ):
                 record.args = args[:2] + (path + "?REDACTED",) + args[3:]
         return True
 
@@ -777,13 +909,6 @@ def build_app(extensions=()):
 
     app.routes.insert(0, Route("/health", health, methods=["GET"]))
 
-    # Signed direct upload, only when the operator set VAULT_UPLOAD_URL_SECRET. Without
-    # it the route does not exist and auth.is_signed_upload_request answers False, so an
-    # upgrade adds no unauthenticated write path. Bearer-exempt for exactly
-    # POST /upload/<id>: the HMAC signature in the URL is the authorization.
-    if config.signed_upload_enabled():
-        app.routes.insert(0, Route(f"{config.UPLOAD_ROUTE_PREFIX}/{{upload_id}}", direct_upload, methods=["POST"]))
-
     # Extension routes (e.g. a localhost search endpoint), added before the auth
     # middleware so they are bearer-protected like the MCP transport.
     #
@@ -842,23 +967,45 @@ def build_app(extensions=()):
                     f"extension route {getattr(r, 'path', r)!r} covers auth-exempt "
                     f"{m} {p!r}; it would be served without bearer authentication"
                 )
-        # The upload namespace belongs to the upload route. Probes alone cannot reserve
-        # it: a literal Route("/upload/export") matches no probe path, yet the exemption
-        # regex matches its path, so it would be served with neither a token nor a
-        # signature. The declared path is checked directly, and the probes stay for
+        # The upload and download namespaces belong to the signed routes. Probes alone
+        # cannot reserve them: a literal Route("/upload/export") matches no probe path, yet
+        # the exemption regex matches its path, so it would be served with neither a token
+        # nor a signature. The declared path is checked directly, and the probes stay for
         # parameterized and mounted shapes.
         declared = getattr(r, "path", "") or ""
-        if declared == config.UPLOAD_ROUTE_PREFIX or declared.startswith(config.UPLOAD_ROUTE_PREFIX + "/"):
-            raise ValueError(
-                f"extension route {declared!r} is under the reserved "
-                f"{config.UPLOAD_ROUTE_PREFIX!r} namespace of the signed upload route"
-            )
-        for probe in ("", "/probe-id", "/probe-id/deeper"):
-            if _covers(r, "POST", config.UPLOAD_ROUTE_PREFIX + probe) is not Match.NONE:
+        for prefix, method, kind in (
+            (config.UPLOAD_ROUTE_PREFIX, "POST", "upload"),
+            (config.DOWNLOAD_ROUTE_PREFIX, "GET", "download"),
+        ):
+            if declared == prefix or declared.startswith(prefix + "/"):
                 raise ValueError(
-                    f"extension route {getattr(r, 'path', r)!r} is under the reserved "
-                    f"{config.UPLOAD_ROUTE_PREFIX!r} namespace of the signed upload route"
+                    f"extension route {declared!r} is under the reserved "
+                    f"{prefix!r} namespace of the signed {kind} route"
                 )
+            for probe in ("", "/probe-id", "/probe-id/deeper"):
+                if _covers(r, method, prefix + probe) is not Match.NONE:
+                    raise ValueError(
+                        f"extension route {getattr(r, 'path', r)!r} is under the reserved "
+                        f"{prefix!r} namespace of the signed {kind} route"
+                    )
+    # The signed routes go in last and at the front, after the extensions. Their exemption
+    # is a family of paths (/upload/<any id>, /download/<any id>), and no probe can show
+    # that an extension route stays out of it: Route("/{area}/export") answers
+    # /download/export. Placed first, a path of the exempt shape always reaches the signed
+    # handler, which refuses it without a valid signature.
+    #
+    # Signed direct upload, only when the operator set VAULT_UPLOAD_URL_SECRET. Without
+    # it the route does not exist and auth.is_signed_upload_request answers False, so an
+    # upgrade adds no unauthenticated write path. Bearer-exempt for exactly
+    # POST /upload/<id>: the HMAC signature in the URL is the authorization.
+    if config.signed_upload_enabled():
+        app.routes.insert(0, Route(f"{config.UPLOAD_ROUTE_PREFIX}/{{upload_id}}", direct_upload, methods=["POST"]))
+
+    # Signed direct download, only when the operator set VAULT_DOWNLOAD_URL_SECRET.
+    # Bearer-exempt for exactly GET /download/<id>, by the same rule as the upload.
+    if config.signed_download_enabled():
+        app.routes.insert(0, Route(f"{config.DOWNLOAD_ROUTE_PREFIX}/{{download_id}}", direct_download, methods=["GET"]))
+
     # Cloudflare Access mode swaps the static-bearer middleware for CF JWT verification;
     # the static bearer is never checked in that mode.
     if cf_on:

@@ -51,6 +51,22 @@ def is_signed_upload_request(method: str, path: str) -> bool:
     return method == "POST" and _SIGNED_UPLOAD_PATH.fullmatch(path) is not None
 
 
+# The signed download, by the same rule: GET to exactly one id segment under /download.
+# HEAD, /download/a/b and /download itself still need a bearer token.
+_SIGNED_DOWNLOAD_PATH = re.compile(r"/download/[A-Za-z0-9-]{1,64}")
+
+
+def is_signed_download_request(method: str, path: str) -> bool:
+    """Whether this is the one request shape the signed download route serves tokenless.
+
+    False whenever the feature is off, so a server without VAULT_DOWNLOAD_URL_SECRET has no
+    bearer-exempt read path at all.
+    """
+    if not config.signed_download_enabled():
+        return False
+    return method == "GET" and _SIGNED_DOWNLOAD_PATH.fullmatch(path) is not None
+
+
 def _www_authenticate(request: Request, error: str) -> str:
     """RFC 9728 challenge header pointing clients at the protected-resource metadata.
 
@@ -90,6 +106,9 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
             return await call_next(request)
 
         if is_signed_upload_request(request.method, path):
+            return await call_next(request)
+
+        if is_signed_download_request(request.method, path):
             return await call_next(request)
 
         if not VAULT_MCP_TOKEN:
