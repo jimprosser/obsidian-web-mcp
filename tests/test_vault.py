@@ -114,6 +114,51 @@ def test_list_excludes_dotdirs(vault_dir):
     assert "test-note.md" in names
 
 
+def test_list_propagates_permission_error(vault_dir, monkeypatch):
+    """An unreadable vault must not be reported as an empty directory."""
+    original_iterdir = Path.iterdir
+
+    def denied_at_root(path):
+        if path == vault_dir.resolve():
+            raise PermissionError("denied")
+        return original_iterdir(path)
+
+    monkeypatch.setattr(Path, "iterdir", denied_at_root)
+
+    with pytest.raises(PermissionError, match="Permission denied listing directory"):
+        list_directory("")
+
+
+def test_vault_list_tool_surfaces_permission_error(vault_dir, monkeypatch):
+    """The seam: the MCP tool must carry the failure to the client, not an empty listing.
+
+    A remote client (Claude, ChatGPT) only ever sees the tool result. Before this fix a
+    vault the process was not allowed to read (macOS TCC, a mis-set ACL) came back as
+    "no entries", indistinguishable from a genuinely empty vault.
+    """
+    import asyncio
+    import json
+
+    from obsidian_vault_mcp import server
+
+    original_iterdir = Path.iterdir
+
+    def denied_at_root(path):
+        if path == vault_dir.resolve():
+            raise PermissionError("denied")
+        return original_iterdir(path)
+
+    monkeypatch.setattr(Path, "iterdir", denied_at_root)
+
+    result = asyncio.run(server.mcp.call_tool("vault_list", {"path": ""}))
+    if isinstance(result, tuple):
+        result = result[0]
+    answer = json.loads("".join(getattr(block, "text", "") for block in result))
+
+    assert "items" not in answer, f"an unreadable vault was reported as a listing: {answer}"
+    assert "Permission denied listing directory" in answer.get("error", ""), answer
+
+
 def test_move_file(vault_dir):
     """Move a file and verify old path is gone, new path exists."""
     write_file_atomic("source.md", "Move me.")

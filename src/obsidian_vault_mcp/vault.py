@@ -356,8 +356,11 @@ def list_directory(
 
         try:
             entries = sorted(dir_path.iterdir(), key=lambda p: p.name.lower())
-        except PermissionError:
-            return
+        except PermissionError as exc:
+            # An unreadable directory is not an empty directory. Propagate the
+            # failure so remote clients can distinguish a TCC/permission issue
+            # from a genuinely empty vault.
+            raise PermissionError(f"Permission denied listing directory: {dir_path}") from exc
 
         for entry in entries:
             # Skip excluded directories at every level
