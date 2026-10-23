@@ -37,6 +37,7 @@ MUTATION_OPERATIONS = {
     "vault_write",
     "vault_write_binary",
     "vault_edit",
+    "vault_edit_section",
     "vault_append",
     "vault_batch_frontmatter_update",
     "vault_move",
