@@ -125,8 +125,12 @@ def test_list_propagates_permission_error(vault_dir, monkeypatch):
 
     monkeypatch.setattr(Path, "iterdir", denied_at_root)
 
-    with pytest.raises(PermissionError, match="Permission denied listing directory"):
+    with pytest.raises(PermissionError) as info:
         list_directory("")
+    # Relative wording, never the server's absolute path (the sibling errors name the
+    # path the client sent; an iCloud vault path would include the account name).
+    assert str(info.value) == "Permission denied listing directory: the vault root"
+    assert str(vault_dir) not in str(info.value)
 
 
 def test_vault_list_tool_surfaces_permission_error(vault_dir, monkeypatch):
@@ -156,7 +160,44 @@ def test_vault_list_tool_surfaces_permission_error(vault_dir, monkeypatch):
     answer = json.loads("".join(getattr(block, "text", "") for block in result))
 
     assert "items" not in answer, f"an unreadable vault was reported as a listing: {answer}"
-    assert "Permission denied listing directory" in answer.get("error", ""), answer
+    assert answer.get("error") == "Permission denied listing directory: the vault root", answer
+
+
+def test_vault_list_tool_names_unreadable_subfolder(vault_dir, monkeypatch):
+    """Readable root, locked subfolder: a deep listing fails and names that subfolder.
+
+    Before this fix the subfolder silently dropped out of the listing. depth=1 does
+    not descend into it and still succeeds, so a shallow listing is unaffected.
+    """
+    import asyncio
+    import json
+
+    from obsidian_vault_mcp import server
+
+    locked = (vault_dir / "subfolder").resolve()
+    original_iterdir = Path.iterdir
+
+    def denied_in_subfolder(path):
+        if path == locked:
+            raise PermissionError("denied")
+        return original_iterdir(path)
+
+    monkeypatch.setattr(Path, "iterdir", denied_in_subfolder)
+
+    def call(depth):
+        result = asyncio.run(server.mcp.call_tool("vault_list", {"path": "", "depth": depth}))
+        if isinstance(result, tuple):
+            result = result[0]
+        return json.loads("".join(getattr(block, "text", "") for block in result))
+
+    deep = call(2)
+    assert "items" not in deep, deep
+    assert deep.get("error") == "Permission denied listing directory: subfolder", deep
+    assert str(vault_dir) not in deep.get("error", "")
+
+    shallow = call(1)
+    assert "error" not in shallow, shallow
+    assert any(item.get("path") == "subfolder" for item in shallow["items"]), shallow
 
 
 def test_move_file(vault_dir):

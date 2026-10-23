@@ -359,8 +359,12 @@ def list_directory(
         except PermissionError as exc:
             # An unreadable directory is not an empty directory. Propagate the
             # failure so remote clients can distinguish a TCC/permission issue
-            # from a genuinely empty vault.
-            raise PermissionError(f"Permission denied listing directory: {dir_path}") from exc
+            # from a genuinely empty vault. Name the directory relative to the
+            # vault, like the sibling errors do: the absolute path would hand the
+            # client the server's filesystem layout (and, on iCloud, the account).
+            rel = dir_path.relative_to(vault_root)
+            where = "the vault root" if str(rel) == "." else str(rel)
+            raise PermissionError(f"Permission denied listing directory: {where}") from exc
 
         for entry in entries:
             # Skip excluded directories at every level
