@@ -114,6 +114,92 @@ def test_list_excludes_dotdirs(vault_dir):
     assert "test-note.md" in names
 
 
+def test_list_propagates_permission_error(vault_dir, monkeypatch):
+    """An unreadable vault must not be reported as an empty directory."""
+    original_iterdir = Path.iterdir
+
+    def denied_at_root(path):
+        if path == vault_dir.resolve():
+            raise PermissionError("denied")
+        return original_iterdir(path)
+
+    monkeypatch.setattr(Path, "iterdir", denied_at_root)
+
+    with pytest.raises(PermissionError) as info:
+        list_directory("")
+    # Relative wording, never the server's absolute path (the sibling errors name the
+    # path the client sent; an iCloud vault path would include the account name).
+    assert str(info.value) == "Permission denied listing directory: the vault root"
+    assert str(vault_dir) not in str(info.value)
+
+
+def test_vault_list_tool_surfaces_permission_error(vault_dir, monkeypatch):
+    """The seam: the MCP tool must carry the failure to the client, not an empty listing.
+
+    A remote client (Claude, ChatGPT) only ever sees the tool result. Before this fix a
+    vault the process was not allowed to read (macOS TCC, a mis-set ACL) came back as
+    "no entries", indistinguishable from a genuinely empty vault.
+    """
+    import asyncio
+    import json
+
+    from obsidian_vault_mcp import server
+
+    original_iterdir = Path.iterdir
+
+    def denied_at_root(path):
+        if path == vault_dir.resolve():
+            raise PermissionError("denied")
+        return original_iterdir(path)
+
+    monkeypatch.setattr(Path, "iterdir", denied_at_root)
+
+    result = asyncio.run(server.mcp.call_tool("vault_list", {"path": ""}))
+    if isinstance(result, tuple):
+        result = result[0]
+    answer = json.loads("".join(getattr(block, "text", "") for block in result))
+
+    assert "items" not in answer, f"an unreadable vault was reported as a listing: {answer}"
+    assert answer.get("error") == "Permission denied listing directory: the vault root", answer
+
+
+def test_vault_list_tool_names_unreadable_subfolder(vault_dir, monkeypatch):
+    """Readable root, locked subfolder: a deep listing fails and names that subfolder.
+
+    Before this fix the subfolder silently dropped out of the listing. depth=1 does
+    not descend into it and still succeeds, so a shallow listing is unaffected.
+    """
+    import asyncio
+    import json
+
+    from obsidian_vault_mcp import server
+
+    locked = (vault_dir / "subfolder").resolve()
+    original_iterdir = Path.iterdir
+
+    def denied_in_subfolder(path):
+        if path == locked:
+            raise PermissionError("denied")
+        return original_iterdir(path)
+
+    monkeypatch.setattr(Path, "iterdir", denied_in_subfolder)
+
+    def call(depth):
+        result = asyncio.run(server.mcp.call_tool("vault_list", {"path": "", "depth": depth}))
+        if isinstance(result, tuple):
+            result = result[0]
+        return json.loads("".join(getattr(block, "text", "") for block in result))
+
+    deep = call(2)
+    assert "items" not in deep, deep
+    assert deep.get("error") == "Permission denied listing directory: subfolder", deep
+    assert str(vault_dir) not in deep.get("error", "")
+
+    shallow = call(1)
+    assert "error" not in shallow, shallow
+    assert any(item.get("path") == "subfolder" for item in shallow["items"]), shallow
+
+
 def test_move_file(vault_dir):
     """Move a file and verify old path is gone, new path exists."""
     write_file_atomic("source.md", "Move me.")
