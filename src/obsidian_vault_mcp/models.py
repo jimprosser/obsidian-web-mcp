@@ -359,6 +359,14 @@ class VaultSearchInput(BaseModel):
         le=10,
         description="Number of lines of context to show around each match",
     )
+    include_excluded: bool = Field(
+        default=False,
+        description=(
+            "Also search the folders the operator excludes by default (see the tool "
+            "description). Not needed when path_prefix already points at, inside or above "
+            "an excluded folder."
+        ),
+    )
 
 
 class VaultSearchFrontmatterInput(BaseModel):
@@ -391,6 +399,14 @@ class VaultSearchFrontmatterInput(BaseModel):
         ge=1,
         le=MAX_SEARCH_RESULTS,
         description="Maximum number of matching files to return",
+    )
+    include_excluded: bool = Field(
+        default=False,
+        description=(
+            "Also search the folders the operator excludes by default (see the tool "
+            "description). Not needed when path_prefix already points at, inside or above "
+            "an excluded folder."
+        ),
     )
 
 

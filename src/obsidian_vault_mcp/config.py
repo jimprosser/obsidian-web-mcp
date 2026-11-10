@@ -181,6 +181,131 @@ def semantic_search_enabled() -> bool:
     return VAULT_SEMANTIC_SEARCH.lower() in {"1", "true", "yes", "on"}
 
 
+# Default search exclusions (opt-in). VAULT_MCP_SEARCH_EXCLUSIONS_FILE names a YAML file
+# listing vault-relative folder prefixes that vault_search and vault_search_frontmatter
+# skip when the caller gives no path_prefix (bulk imports, raw dumps and the like that
+# would otherwise drown out real notes). Empty (the default) means no exclusions, so the
+# stock behaviour is byte-identical. The file is read ONCE, by validate_config() at
+# startup, and a bad value fails the server closed; it is never re-read, so a change needs
+# a restart. A path_prefix at, inside or above an excluded folder, or include_excluded=true,
+# turns the exclusion off for that call -- see active_search_exclusions().
+VAULT_MCP_SEARCH_EXCLUSIONS_FILE = os.environ.get("VAULT_MCP_SEARCH_EXCLUSIONS_FILE", "").strip()
+
+_search_exclusions_cache: list[str] | None = None
+
+
+def _normalise_folder(prefix: str | None) -> str:
+    """Vault-relative folder with "/" separators and no leading or trailing slash."""
+    return (prefix or "").strip().replace("\\", "/").strip("/")
+
+
+def load_search_exclusions(path: str | Path) -> list[str]:
+    """Parse a search-exclusions file into normalised folder prefixes.
+
+    Expected shape::
+
+        exclude_prefixes:
+          - "Archive/Raw Imports"
+
+    Raises ValueError (naming the variable) for a missing or unreadable file, malformed
+    YAML, a wrong shape, a non-string entry, an entry that is empty once normalised (it
+    would exclude the whole vault), or one containing a "." / ".." segment or a NUL.
+    """
+    from ruamel.yaml import YAML
+    from ruamel.yaml.error import YAMLError
+
+    name = "VAULT_MCP_SEARCH_EXCLUSIONS_FILE"
+    file_path = Path(path).expanduser()
+    try:
+        data = YAML(typ="safe").load(file_path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        raise ValueError(f"{name}: no such file: {file_path}")
+    except (OSError, UnicodeDecodeError, YAMLError) as e:
+        raise ValueError(f"{name}: cannot read {file_path}: {type(e).__name__}")
+    if data is None:
+        data = {}
+    entries = data.get("exclude_prefixes") if isinstance(data, dict) else None
+    if entries is None and isinstance(data, dict):
+        entries = []
+    if not isinstance(entries, list):
+        raise ValueError(
+            f"{name}: {file_path} must be a mapping with an 'exclude_prefixes' list of "
+            "vault-relative folders"
+        )
+    prefixes: list[str] = []
+    for raw in entries:
+        if not isinstance(raw, str):
+            raise ValueError(f"{name}: exclude_prefixes entries must be strings, got {raw!r}")
+        norm = _normalise_folder(raw)
+        if not norm:
+            raise ValueError(
+                f"{name}: entry {raw!r} is empty; it would exclude the whole vault"
+            )
+        if "\x00" in norm or any(seg in (".", "..") for seg in norm.split("/")):
+            raise ValueError(f"{name}: entry {raw!r} must not contain '.', '..' or NUL segments")
+        if norm not in prefixes:
+            prefixes.append(norm)
+    return prefixes
+
+
+def search_exclusions() -> list[str]:
+    """The configured exclusion prefixes ([] when unset), loaded once and cached."""
+    global _search_exclusions_cache
+    if _search_exclusions_cache is None:
+        _search_exclusions_cache = (
+            load_search_exclusions(VAULT_MCP_SEARCH_EXCLUSIONS_FILE)
+            if VAULT_MCP_SEARCH_EXCLUSIONS_FILE
+            else []
+        )
+    return list(_search_exclusions_cache)
+
+
+def active_search_exclusions(path_prefix: str | None = None, include_excluded: bool = False) -> list[str]:
+    """The exclusions that apply to one search call.
+
+    None when include_excluded is set. Otherwise every configured exclusion except those
+    that overlap the caller's path_prefix (equal, inside, or above it, compared by whole
+    path segment): searching an excluded folder directly, or a parent of it, must work.
+    """
+    if include_excluded:
+        return []
+    configured = search_exclusions()
+    wanted = _normalise_folder(path_prefix)
+    if not wanted:
+        return configured
+    return [
+        e for e in configured
+        if not (wanted == e or wanted.startswith(e + "/") or e.startswith(wanted + "/"))
+    ]
+
+
+def is_search_excluded(rel_path: str, exclusions: list[str]) -> bool:
+    """True if a vault-relative path is at, or under, one of the exclusion folders."""
+    rel = rel_path.replace("\\", "/").lstrip("/")
+    return any(rel == e or rel.startswith(e + "/") for e in exclusions)
+
+
+def search_exclusions_note() -> str:
+    """Sentence for the search tool descriptions naming the live exclusions ("" if none).
+
+    Called while the tools are registered, before validate_config() runs, so an invalid
+    file yields "" here and is reported (fail closed) by validate_config() instead.
+    """
+    try:
+        configured = search_exclusions()
+    except ValueError:
+        return ""
+    if not configured:
+        return ""
+    listed = ", ".join(f'"{e}"' for e in configured)
+    return (
+        f" Default exclusions: files under these vault folders are skipped when path_prefix "
+        f"is not set: {listed}. Passing a path_prefix at, inside or above an excluded folder "
+        "searches it normally; pass include_excluded=true to search everything. "
+        "(Changed in the operator's exclusions file; applied at server startup.)"
+    )
+
+
 # Safety limits
 MAX_CONTENT_SIZE = 1_000_000  # 1MB max write size
 MAX_BINARY_SIZE = 10_000_000  # 10MB max binary write size (images/PDFs run larger than text)
@@ -374,6 +499,7 @@ def validate_config() -> None:
     if signed_upload_enabled():
         _validate_upload_settings()
     _validate_semantic_settings()
+    _validate_search_exclusions_settings()
     if signed_download_enabled():
         _validate_download_settings()
     # Imported lazily: cf_access imports config, so a top-level import here would cycle.
@@ -444,6 +570,27 @@ def _validate_download_settings() -> None:
             "VAULT_DOWNLOAD_URL_MAX_TTL_SECONDS must not be smaller than "
             f"VAULT_DOWNLOAD_URL_TTL_SECONDS ({VAULT_DOWNLOAD_URL_MAX_TTL_SECONDS} < "
             f"{VAULT_DOWNLOAD_URL_TTL_SECONDS})"
+        )
+
+
+def _validate_search_exclusions_settings() -> None:
+    """Fail closed on the search-exclusions file, and prime the cache from it.
+
+    Only runs when VAULT_MCP_SEARCH_EXCLUSIONS_FILE is set. A missing or malformed file
+    stops startup rather than quietly searching everything. The file must resolve outside
+    the vault: inside it, a note write through the vault tools could rewrite the policy
+    for the next restart.
+    """
+    global _search_exclusions_cache
+    if not VAULT_MCP_SEARCH_EXCLUSIONS_FILE:
+        return
+    _search_exclusions_cache = load_search_exclusions(VAULT_MCP_SEARCH_EXCLUSIONS_FILE)
+    path = Path(VAULT_MCP_SEARCH_EXCLUSIONS_FILE).expanduser().resolve()
+    vault = VAULT_PATH.expanduser().resolve()
+    if vault in path.parents:
+        raise ValueError(
+            f"VAULT_MCP_SEARCH_EXCLUSIONS_FILE resolves inside the vault ({path}); the vault "
+            "tools could rewrite it. Choose a path outside VAULT_PATH."
         )
 
 
