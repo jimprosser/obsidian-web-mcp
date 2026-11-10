@@ -431,7 +431,7 @@ def vault_batch_frontmatter_update(updates: list[dict]) -> str:
 
 @mcp.tool(
     name="vault_search",
-    description="Search for text across vault files, matching note names/paths as well as contents. Filename matches are returned first (match_type 'filename'), then content matches (match_type 'content') with context lines and frontmatter excerpts.",
+    description="Search for text across vault files, matching note names/paths as well as contents. Filename matches are returned first (match_type 'filename'), then content matches (match_type 'content') with context lines and frontmatter excerpts." + config.search_exclusions_note(),
     annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False},
 )
 def vault_search(
@@ -440,18 +440,19 @@ def vault_search(
     file_pattern: str | None = None,
     max_results: int = 20,
     context_lines: int = 2,
+    include_excluded: bool = False,
 ) -> str:
     """Search vault note names/paths and file contents."""
-    inp = VaultSearchInput(query=query, path_prefix=path_prefix, file_pattern=file_pattern, max_results=max_results, context_lines=context_lines)
+    inp = VaultSearchInput(query=query, path_prefix=path_prefix, file_pattern=file_pattern, max_results=max_results, context_lines=context_lines, include_excluded=include_excluded)
     return run_audited(
         "vault_search",
-        lambda: _vault_search(inp.query, inp.path_prefix, inp.file_pattern, inp.max_results, inp.context_lines),
+        lambda: _vault_search(inp.query, inp.path_prefix, inp.file_pattern, inp.max_results, inp.context_lines, inp.include_excluded),
     )
 
 
 @mcp.tool(
     name="vault_search_frontmatter",
-    description="Search vault files by YAML frontmatter field values. Queries an in-memory index for fast results. Supports exact match, contains, and field-exists queries.",
+    description="Search vault files by YAML frontmatter field values. Queries an in-memory index for fast results. Supports exact match, contains, and field-exists queries." + config.search_exclusions_note(),
     annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False},
 )
 def vault_search_frontmatter(
@@ -460,12 +461,13 @@ def vault_search_frontmatter(
     match_type: str = "exact",
     path_prefix: str | None = None,
     max_results: int = 20,
+    include_excluded: bool = False,
 ) -> str:
     """Search by frontmatter fields."""
-    inp = VaultSearchFrontmatterInput(field=field, value=value, match_type=match_type, path_prefix=path_prefix, max_results=max_results)
+    inp = VaultSearchFrontmatterInput(field=field, value=value, match_type=match_type, path_prefix=path_prefix, max_results=max_results, include_excluded=include_excluded)
     return run_audited(
         "vault_search_frontmatter",
-        lambda: _vault_search_frontmatter(inp.field, inp.value, inp.match_type, inp.path_prefix, inp.max_results),
+        lambda: _vault_search_frontmatter(inp.field, inp.value, inp.match_type, inp.path_prefix, inp.max_results, inp.include_excluded),
     )
 
 

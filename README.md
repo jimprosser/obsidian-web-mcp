@@ -177,8 +177,8 @@ Found a vulnerability? Please report it privately rather than opening a public i
 | `vault_edit` | Patch a file with ordered exact text replacements (token-efficient partial edits); supports dry-run diff previews, and an opt-in `replace_all` per edit for renaming a term across a note |
 | `vault_append` | Append content to the end of a file without resending the existing body; creates the file when missing |
 | `vault_batch_frontmatter_update` | Update YAML frontmatter fields on multiple files without touching body content |
-| `vault_search` | Full-text search across vault files, matching note names/paths as well as contents (uses ripgrep if available, falls back to Python) |
-| `vault_search_frontmatter` | Query the in-memory frontmatter index by field value, substring, or field existence |
+| `vault_search` | Full-text search across vault files, matching note names/paths as well as contents (uses ripgrep if available, falls back to Python). Skips any [default search exclusions](#default-search-exclusions) unless `include_excluded` is set |
+| `vault_search_frontmatter` | Query the in-memory frontmatter index by field value, substring, or field existence. Honors the same [default search exclusions](#default-search-exclusions) |
 | `vault_semantic_search` | **Off by default.** Find notes by meaning rather than keyword, ranked by similarity, with each note's title and an excerpt; runs a local embedding model. See [Semantic search](#semantic-search) |
 | `vault_list` | List directory contents with recursion depth, glob filtering, and file/dir toggles |
 | `vault_move` | Move or rename a file or directory within the vault, repointing the links that pointed at it the way Obsidian does on a rename; `dry_run` previews the link rewrites with a diff per file |
@@ -250,6 +250,7 @@ All configuration is via environment variables:
 | `VAULT_DAILY_NOTES_FOLDER` | No | (none) | Folder for the daily-note tools; empty means the vault root |
 | `VAULT_DAILY_NOTES_FORMAT` | No | `%Y-%m-%d` | `strftime` pattern for the daily-note filename |
 | `VAULT_DAILY_NOTES_TEMPLATE` | No | (none) | `strftime` template prepended when a daily note is first created |
+| `VAULT_MCP_SEARCH_EXCLUSIONS_FILE` | No | (none) | Path to a YAML file listing vault folders that `vault_search` and `vault_search_frontmatter` skip by default. Unset means no exclusions. Read once at startup (a restart applies edits); a missing or malformed file, or one inside the vault, stops startup. See [Default search exclusions](#default-search-exclusions). |
 | `VAULT_MCP_HEARTBEAT_URL` | No | (none) | Optional push URL for an uptime monitor (Uptime Kuma, Healthchecks.io, ...). When set, a daemon thread GETs it on an interval. Must be `http(s)`; redirects are not followed and the URL is treated as a secret (never logged in full). Empty = disabled. |
 | `VAULT_MCP_HEARTBEAT_INTERVAL` | No | `60` | Seconds between heartbeat pings. Must be a positive integer; a bad value fails closed at startup. Only used when `VAULT_MCP_HEARTBEAT_URL` is set. |
 | `VAULT_AUDIT_LOG_PATH` | No | (none) | Append-only JSONL audit log of vault mutations. When set, every mutation appends one record; empty disables auditing. The raw bearer token is never written -- only its SHA-256 hash. Must resolve **outside** the vault and be writable; otherwise the server **fails closed** at startup. See [Audit logging](#audit-logging). |
@@ -343,6 +344,24 @@ partial failure is never recorded as a whole-batch success. The unauthenticated 
 endpoint reports only `{"status": "ok", "audit": {"enabled": <bool>}}` — it deliberately does
 not expose the log path or write counters (which would leak host filesystem layout and a
 vault-activity side-channel to anonymous callers over the tunnel).
+
+## Default search exclusions
+
+**Off by default.** Bulk imports, raw dumps and archives can drown real notes in search results. Point `VAULT_MCP_SEARCH_EXCLUSIONS_FILE` at a YAML file (outside the vault) to have `vault_search` and `vault_search_frontmatter` skip chosen folders:
+
+```yaml
+# search_exclusions.yaml
+exclude_prefixes:
+  - "Archive/Raw Imports"
+  - "Clippings/Bulk"
+```
+
+- Entries are vault-relative folders (`/` separators, matched case-sensitively, whole path segments: `Raw/Dump` does not exclude `Raw/Dump2`). The tool descriptions list the active exclusions, so a client knows they exist.
+- The exclusion only applies when no `path_prefix` is given. A `path_prefix` at, inside or above an excluded folder searches it normally.
+- `include_excluded=true` on either tool searches everything.
+- It affects search only: `vault_read`, `vault_list` and every other tool still reach those folders.
+- The file is read once, at startup. After editing it, restart the server. A missing file, malformed YAML, an empty entry (it would exclude the whole vault) or a `.` / `..` segment stops startup, and so does a file that resolves inside the vault.
+- Not covered: `vault_semantic_search`, which has its own index.
 
 ## Semantic search
 

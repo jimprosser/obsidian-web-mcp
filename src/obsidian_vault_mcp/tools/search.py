@@ -16,14 +16,23 @@ from ..vault import resolve_vault_path, resolve_vault_read_path
 logger = logging.getLogger(__name__)
 
 
+def _escape_glob(text: str) -> str:
+    """Backslash-escape ripgrep (gitignore-style) glob metacharacters in a literal path."""
+    return "".join("\\" + c if c in "*?[]{}\\!" else c for c in text)
+
+
 def _search_ripgrep(
     query: str,
     search_path: Path,
     file_pattern: list[str] | str,
     max_results: int,
     context_lines: int,
+    exclusions: list[str] | None = None,
 ) -> list[dict]:
-    """Search using ripgrep for performance. file_pattern: one glob or several (any match)."""
+    """Search using ripgrep for performance. file_pattern: one glob or several (any match).
+
+    exclusions: vault-relative folders to skip (see config.active_search_exclusions).
+    """
     file_patterns = [file_pattern] if isinstance(file_pattern, str) else list(file_pattern)
     cmd = [
         "rg",
@@ -37,6 +46,13 @@ def _search_ripgrep(
     for excluded in config.EXCLUDED_DIRS:
         cmd.append(f"--glob=!{excluded}/")
 
+    # Default search exclusions. ripgrep anchors a leading-path glob at its working
+    # directory, so with exclusions the child runs from the vault root (below); the
+    # folder name is a literal, so glob metacharacters in it are escaped. These are argv
+    # elements, never a shell string.
+    for folder in exclusions or []:
+        cmd.append(f"--glob=!{_escape_glob(folder)}/**")
+
     # Pass the user-supplied query with `-e` so a value beginning with "-"
     # (e.g. "--pre=/bin/sh", a ripgrep preprocessor flag that executes an
     # arbitrary program per searched file) is parsed as a SEARCH PATTERN, not
@@ -44,8 +60,9 @@ def _search_ripgrep(
     # that allowed remote code execution via the vault_search query argument.
     cmd += ["-e", query, str(search_path)]
 
+    run_kwargs = {"cwd": config.VAULT_PATH} if exclusions else {}
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30, **run_kwargs)
     except (subprocess.TimeoutExpired, FileNotFoundError):
         return []
 
@@ -106,10 +123,15 @@ def _search_ripgrep(
     return matches
 
 
-def _iter_vault_files(search_path: Path, file_pattern: list[str] | str):
+def _iter_vault_files(
+    search_path: Path,
+    file_pattern: list[str] | str,
+    exclusions: list[str] | None = None,
+):
     """Yield files under search_path, honoring EXCLUDED_DIRS and the glob pattern(s).
 
     file_pattern is one glob or several; a file matching any of them is yielded.
+    exclusions are vault-relative folders pruned without descending into them.
 
     Excluded and dot-prefixed directories are pruned without descending into
     them (a vault's .git can dwarf the vault itself), and symlinks are never
@@ -131,6 +153,10 @@ def _iter_vault_files(search_path: Path, file_pattern: list[str] | str):
                 continue
             if entry.is_symlink():
                 continue
+            if exclusions and config.is_search_excluded(
+                Path(entry.path).relative_to(config.VAULT_PATH).as_posix(), exclusions
+            ):
+                continue
             if entry.is_dir(follow_symlinks=False):
                 yield from walk(entry.path)
             elif entry.is_file(follow_symlinks=False) and any(
@@ -147,12 +173,13 @@ def _search_python(
     file_pattern: list[str] | str,
     max_results: int,
     context_lines: int,
+    exclusions: list[str] | None = None,
 ) -> list[dict]:
     """Fallback Python-based search. file_pattern: one glob or several (any match)."""
     query_lower = query.lower()
     matches = []
 
-    for file_path in _iter_vault_files(search_path, file_pattern):
+    for file_path in _iter_vault_files(search_path, file_pattern, exclusions):
         try:
             rel_path = str(file_path.relative_to(config.VAULT_PATH))
             safe_path = resolve_vault_read_path(rel_path)
@@ -184,12 +211,13 @@ def _search_filenames(
     search_path: Path,
     file_pattern: str,
     max_results: int,
+    exclusions: list[str] | None = None,
 ) -> list[dict]:
     """Match the query against vault-relative file paths (case-insensitive)."""
     query_lower = query.lower()
     matches = []
 
-    for file_path in _iter_vault_files(search_path, file_pattern):
+    for file_path in _iter_vault_files(search_path, file_pattern, exclusions):
         try:
             rel_path = str(file_path.relative_to(config.VAULT_PATH))
         except ValueError:
@@ -230,8 +258,12 @@ def vault_search(
     file_pattern: str | None = None,
     max_results: int = 20,
     context_lines: int = 2,
+    include_excluded: bool = False,
 ) -> str:
     """Search for text across vault file names and contents.
+
+    Folders in the operator's search-exclusions file are skipped unless path_prefix is at,
+    inside or above one (that exclusion then does not apply) or include_excluded is true.
 
     file_pattern=None means the default. Contents: notes plus the patterns extensions
     registered (content_extractors.register_search_pattern). Names: notes only, because a
@@ -252,16 +284,22 @@ def vault_search(
         if not search_path.is_dir():
             return dumps({"error": f"Search path is not a directory: {path_prefix}"})
 
-        name_candidates = _search_filenames(query, search_path, name_pattern, max_results)
+        exclusions = config.active_search_exclusions(path_prefix, include_excluded)
+
+        name_candidates = _search_filenames(query, search_path, name_pattern, max_results, exclusions)
 
         # Content matches keep a guaranteed share of the budget: a query that
         # is also a folder or date token can match many names, and those must
         # not starve the body hits clients relied on before name matching.
         content_budget = max_results - min(len(name_candidates), max_results // 2)
         if shutil.which("rg"):
-            content_matches = _search_ripgrep(query, search_path, content_patterns, content_budget, context_lines)
+            content_matches = _search_ripgrep(
+                query, search_path, content_patterns, content_budget, context_lines, exclusions
+            )
         else:
-            content_matches = _search_python(query, search_path, content_patterns, content_budget, context_lines)
+            content_matches = _search_python(
+                query, search_path, content_patterns, content_budget, context_lines, exclusions
+            )
 
         # Only content hits get the frontmatter excerpt. Name-only hits are
         # never read at all: the path locates the note, and reading it would
@@ -282,11 +320,14 @@ def vault_search(
 
         truncated = len(matches) >= max_results
 
-        return dumps({
+        response = {
             "results": matches,
             "total_matches": len(matches),
             "truncated": truncated,
-        })
+        }
+        if exclusions:
+            response["excluded_prefixes"] = exclusions
+        return dumps(response)
     except ValueError as e:
         return dumps({"error": str(e)})
     except Exception as e:
@@ -300,16 +341,22 @@ def vault_search_frontmatter(
     match_type: str = "exact",
     path_prefix: str | None = None,
     max_results: int = 20,
+    include_excluded: bool = False,
 ) -> str:
-    """Search vault files by frontmatter field values using the in-memory index."""
+    """Search vault files by frontmatter field values using the in-memory index.
+
+    Honors the search-exclusions file the same way vault_search does.
+    """
     from ..server import frontmatter_index
 
     try:
+        exclusions = config.active_search_exclusions(path_prefix, include_excluded)
         results = frontmatter_index.search_by_field(
             field=field,
             value=value,
             match_type=match_type,
             path_prefix=path_prefix,
+            exclude_prefixes=exclusions,
         )
 
         formatted = []
@@ -325,11 +372,14 @@ def vault_search_frontmatter(
 
         truncated = len(results) > max_results
 
-        return dumps({
+        response = {
             "results": formatted,
             "total": len(formatted),
             "truncated": truncated,
-        })
+        }
+        if exclusions:
+            response["excluded_prefixes"] = exclusions
+        return dumps(response)
     except Exception as e:
         logger.error(f"vault_search_frontmatter error: {e}")
         return dumps({"error": str(e)})

@@ -98,6 +98,7 @@ class FrontmatterIndex:
         value: str,
         match_type: str,
         path_prefix: str | None = None,
+        exclude_prefixes: list[str] | None = None,
     ) -> list[dict]:
         """Search frontmatter index by field.
 
@@ -106,6 +107,9 @@ class FrontmatterIndex:
             value: Value to compare (ignored for match_type "exists").
             match_type: One of "exact", "contains", "exists".
             path_prefix: If set, only return files whose relative path starts with this.
+            exclude_prefixes: Vault-relative folders to skip. The caller resolves which
+                default exclusions apply (config.active_search_exclusions); excluded notes
+                stay in the index so a search that opts back in still finds them.
 
         Returns:
             List of {"path": relative_path, "frontmatter": dict}.
@@ -114,6 +118,8 @@ class FrontmatterIndex:
         with self._lock:
             for rel_path, fm in self._index.items():
                 if path_prefix and not rel_path.startswith(path_prefix):
+                    continue
+                if exclude_prefixes and config.is_search_excluded(rel_path, exclude_prefixes):
                     continue
                 if match_type == "exists":
                     if field in fm:
