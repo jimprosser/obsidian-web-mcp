@@ -184,6 +184,103 @@ def semantic_search_enabled() -> bool:
     return VAULT_SEMANTIC_SEARCH.lower() in {"1", "true", "yes", "on"}
 
 
+# Default search exclusions (opt-in). VAULT_MCP_SEARCH_EXCLUDE_PREFIXES_JSON is a JSON
+# array of vault-relative folders that vault_search and vault_search_frontmatter skip when
+# the caller gives no path_prefix (bulk imports, raw dumps and the like that would
+# otherwise drown out real notes), e.g. '["Archive/Raw Imports"]'. Empty (the default)
+# means no exclusions, so the stock behaviour is byte-identical. Read from the environment
+# at import, parsed leniently here (a bad value means no exclusions) and strictly in
+# validate_config(), which stops startup with the variable's name. A path_prefix at or
+# inside an excluded folder, or include_excluded=true, turns the exclusion off for that
+# call -- see active_search_exclusions().
+VAULT_MCP_SEARCH_EXCLUDE_PREFIXES_JSON = os.environ.get("VAULT_MCP_SEARCH_EXCLUDE_PREFIXES_JSON", "").strip()
+
+
+def _normalise_folder(prefix: str | None) -> str:
+    """Vault-relative folder with "/" separators and no leading or trailing slash."""
+    return (prefix or "").strip().replace("\\", "/").strip("/")
+
+
+def parse_search_exclude_prefixes(raw: str) -> list[str]:
+    """Parse VAULT_MCP_SEARCH_EXCLUDE_PREFIXES_JSON into normalised folder prefixes.
+
+    Expected shape: a JSON array of strings, e.g. ``["Archive/Raw Imports"]``.
+
+    Raises ValueError (naming the variable) for invalid JSON, a non-array, a non-string
+    entry, an entry that is empty once normalised (it would exclude the whole vault), or
+    one containing a "." / ".." segment or a NUL.
+    """
+    name = "VAULT_MCP_SEARCH_EXCLUDE_PREFIXES_JSON"
+    if not raw:
+        return []
+    try:
+        data = json.loads(raw)
+    except ValueError as e:
+        raise ValueError(f"{name} is not valid JSON: {e}")
+    if not isinstance(data, list):
+        raise ValueError(f"{name} must be a JSON array of vault-relative folders")
+    prefixes: list[str] = []
+    for entry in data:
+        if not isinstance(entry, str):
+            raise ValueError(f"{name}: entries must be strings, got {entry!r}")
+        norm = _normalise_folder(entry)
+        if not norm:
+            raise ValueError(f"{name}: entry {entry!r} is empty; it would exclude the whole vault")
+        if "\x00" in norm or any(seg in (".", "..") for seg in norm.split("/")):
+            raise ValueError(f"{name}: entry {entry!r} must not contain '.', '..' or NUL segments")
+        if norm not in prefixes:
+            prefixes.append(norm)
+    return prefixes
+
+
+try:
+    SEARCH_EXCLUDE_PREFIXES = parse_search_exclude_prefixes(VAULT_MCP_SEARCH_EXCLUDE_PREFIXES_JSON)
+except ValueError:
+    SEARCH_EXCLUDE_PREFIXES = []  # validate_config() refuses to start with this value
+
+
+def search_exclusions() -> list[str]:
+    """The configured exclusion prefixes ([] when unset)."""
+    return list(SEARCH_EXCLUDE_PREFIXES)
+
+
+def active_search_exclusions(path_prefix: str | None = None, include_excluded: bool = False) -> list[str]:
+    """The exclusions that apply to one search call.
+
+    None when include_excluded is set. Otherwise every configured exclusion except those
+    the caller's path_prefix is at or inside (compared by whole path segment): searching
+    an excluded folder directly must work. A path_prefix above an excluded folder keeps
+    the exclusion, so a search of "Archive" still skips "Archive/Raw Imports".
+    """
+    if include_excluded:
+        return []
+    configured = search_exclusions()
+    wanted = _normalise_folder(path_prefix)
+    if not wanted:
+        return configured
+    return [e for e in configured if not (wanted == e or wanted.startswith(e + "/"))]
+
+
+def is_search_excluded(rel_path: str, exclusions: list[str]) -> bool:
+    """True if a vault-relative path is at, or under, one of the exclusion folders."""
+    rel = rel_path.replace("\\", "/").lstrip("/")
+    return any(rel == e or rel.startswith(e + "/") for e in exclusions)
+
+
+def search_exclusions_note() -> str:
+    """Sentence for the search tool descriptions naming the live exclusions ("" if none)."""
+    configured = search_exclusions()
+    if not configured:
+        return ""
+    listed = ", ".join(f'"{e}"' for e in configured)
+    return (
+        f" Default exclusions: files under these vault folders are skipped when path_prefix "
+        f"is not set: {listed}. Passing a path_prefix at or inside an excluded folder "
+        "searches it normally; pass include_excluded=true to search everything. "
+        "(Set by the operator; applied at server startup.)"
+    )
+
+
 # Safety limits
 MAX_CONTENT_SIZE = 1_000_000  # 1MB max write size
 MAX_BINARY_SIZE = 10_000_000  # 10MB max binary write size (images/PDFs run larger than text)
@@ -377,6 +474,7 @@ def validate_config() -> None:
     if signed_upload_enabled():
         _validate_upload_settings()
     _validate_semantic_settings()
+    parse_search_exclude_prefixes(os.environ.get("VAULT_MCP_SEARCH_EXCLUDE_PREFIXES_JSON", "").strip())
     if signed_download_enabled():
         _validate_download_settings()
     # Imported lazily: cf_access imports config, so a top-level import here would cycle.

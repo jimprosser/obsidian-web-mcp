@@ -52,6 +52,17 @@ def isolated_semantic_search(tmp_path, monkeypatch):
     monkeypatch.setattr(config, "VAULT_SEMANTIC_DB_PATH", tmp_path / "semantic" / "embeddings.db")
 
 
+@pytest.fixture(autouse=True)
+def isolated_search_exclusions(monkeypatch):
+    """The exclusions are read from the environment at import. Off here unless a test sets
+    them, so an exported VAULT_MCP_SEARCH_EXCLUDE_PREFIXES_JSON cannot hide notes from every
+    search test."""
+    from obsidian_vault_mcp import config
+
+    monkeypatch.setattr(config, "VAULT_MCP_SEARCH_EXCLUDE_PREFIXES_JSON", "")
+    monkeypatch.setattr(config, "SEARCH_EXCLUDE_PREFIXES", [])
+
+
 @pytest.fixture
 def vault_dir(tmp_path, monkeypatch):
     """Create a temporary vault directory with sample files."""
