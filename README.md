@@ -174,7 +174,7 @@ Found a vulnerability? Please report it privately rather than opening a public i
 | `vault_request_upload_url` | Get a short-lived, single-use signed URL, then `POST` a file's raw bytes to it. For images and PDFs too large to send base64-encoded through `vault_write_binary`; the bytes never pass through the conversation. See [Signed uploads](#signed-uploads) |
 | `vault_request_download_url` | Get a short-lived signed URL, then `GET` a file's raw bytes from it (curl, a script). For images, PDFs and any other file `vault_read` can reach; the bytes never pass through the conversation. Returns the size. See [Signed downloads](#signed-downloads) |
 | `vault_write_binary` | Write an allowed binary file (image/PDF) to the vault from base64 content; enforces a media-type allowlist (declared type/extension, not byte-sniffed) and size cap, writes atomically |
-| `vault_edit` | Patch a file with ordered exact text replacements (token-efficient partial edits); supports dry-run diff previews, and an opt-in `replace_all` per edit for renaming a term across a note |
+| `vault_edit` | Patch a file with ordered exact text replacements (token-efficient partial edits); supports dry-run diff previews, and an opt-in `replace_all` per edit for renaming a term across a note; `include_diff: false` leaves the diff out of an applied edit's result (a dry run always shows it) |
 | `vault_append` | Append content to the end of a file without resending the existing body; creates the file when missing |
 | `vault_batch_frontmatter_update` | Update YAML frontmatter fields on multiple files without touching body content |
 | `vault_search` | Full-text search across vault files, matching note names/paths as well as contents (uses ripgrep if available, falls back to Python) |

@@ -379,19 +379,26 @@ if config.signed_download_enabled():
         "when only small fragments change; supports dry-run diff previews and avoids resending the full file. "
         "Each edit is an object {old_text, new_text}; old_text must match exactly once. Edits apply in order, "
         "and dry_run simulates that same in-order apply (each old_text is matched against the running document "
-        "the earlier edits produce), so its diff and match counts predict the real apply, including chained edits."
+        "the earlier edits produce), so its diff and match counts predict the real apply, including chained edits. "
+        "Set include_diff=false to leave the diff out of the result when you don't need to see the change; "
+        "a dry run always shows it."
     ),
     annotations={"readOnlyHint": False, "destructiveHint": True, "idempotentHint": False, "openWorldHint": False},
 )
-def vault_edit(path: str, edits: list[VaultEditOperationInput], dry_run: bool = False) -> str:
+def vault_edit(
+    path: str,
+    edits: list[VaultEditOperationInput],
+    dry_run: bool = False,
+    include_diff: bool = True,
+) -> str:
     """Patch a file with exact text replacements."""
-    inp = VaultEditInput(path=path, edits=edits, dry_run=dry_run)
+    inp = VaultEditInput(path=path, edits=edits, dry_run=dry_run, include_diff=include_diff)
     if inp.dry_run:
         # A dry run writes nothing; don't record it as a mutation.
-        return _vault_edit(inp.path, [edit.model_dump() for edit in inp.edits], inp.dry_run)
+        return _vault_edit(inp.path, [edit.model_dump() for edit in inp.edits], inp.dry_run, inp.include_diff)
     return run_audited(
         "vault_edit",
-        lambda: _vault_edit(inp.path, [edit.model_dump() for edit in inp.edits], inp.dry_run),
+        lambda: _vault_edit(inp.path, [edit.model_dump() for edit in inp.edits], inp.dry_run, inp.include_diff),
         path=inp.path,
     )
 

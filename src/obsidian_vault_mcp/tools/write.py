@@ -361,8 +361,12 @@ def _dry_run_report(path: str, original_content: str, normalized_edits: list[dic
     return dumps(report)
 
 
-def vault_edit(path: str, edits: list[dict], dry_run: bool = False) -> str:
-    """Apply exact text replacements to an existing file without resending the full body."""
+def vault_edit(path: str, edits: list[dict], dry_run: bool = False, include_diff: bool = True) -> str:
+    """Apply exact text replacements to an existing file without resending the full body.
+
+    include_diff=False leaves the diff out of an applied edit's result, for a caller
+    that already knows what it sent. A dry run always returns its diff.
+    """
     try:
         content, _ = read_file(path)
         original_content = content
@@ -430,7 +434,7 @@ def vault_edit(path: str, edits: list[dict], dry_run: bool = False) -> str:
             content = content.replace(old_text, new_text) if replace_all else content.replace(old_text, new_text, 1)
             replacements += count if replace_all else 1
 
-        diff = _unified_diff(path, original_content, content)
+        diff = _unified_diff(path, original_content, content) if include_diff else None
         size = len(content.encode("utf-8"))
 
         changed = content != original_content
@@ -438,15 +442,13 @@ def vault_edit(path: str, edits: list[dict], dry_run: bool = False) -> str:
             write_file_atomic(path, content, create_dirs=False)
             fire_write("updated", [path])
 
-        return dumps({
-            "path": path,
-            "changed": changed,
-            "dry_run": False,
-            "diff": diff,
-            "edits_applied": len(edits),
-            "replacements": replacements,
-            "size": size,
-        })
+        result = {"path": path, "changed": changed, "dry_run": False}
+        if include_diff:
+            result["diff"] = diff
+        result["edits_applied"] = len(edits)
+        result["replacements"] = replacements
+        result["size"] = size
+        return dumps(result)
     except ValueError as e:
         return dumps({
             "error": str(e),

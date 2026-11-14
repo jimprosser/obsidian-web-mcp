@@ -219,6 +219,10 @@ class VaultEditInput(BaseModel):
         default=False,
         description="Preview the patch and diff without writing the file",
     )
+    include_diff: bool = Field(
+        default=True,
+        description="If false, leave the diff out of an applied edit's result; a dry run always includes it",
+    )
 
 
 class VaultAppendInput(BaseModel):
