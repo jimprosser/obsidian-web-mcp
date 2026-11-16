@@ -4,7 +4,10 @@ import re
 from pathlib import Path
 
 # Vault configuration
-VAULT_PATH = Path(os.environ.get("VAULT_PATH", os.path.expanduser("~/Obsidian/MyVault")))
+# Resolved once, here: every path the tools compare against it (resolve_vault_path,
+# ripgrep's output, a walk under a resolved search path) is resolved, so a VAULT_PATH
+# reached through a symlink must be too, or relative_to() fails and files drop silently.
+VAULT_PATH = Path(os.environ.get("VAULT_PATH", os.path.expanduser("~/Obsidian/MyVault"))).expanduser().resolve()
 VAULT_MCP_TOKEN = os.environ.get("VAULT_MCP_TOKEN", "")
 VAULT_MCP_PORT = int(os.environ.get("VAULT_MCP_PORT", "8420"))
 
