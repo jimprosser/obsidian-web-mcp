@@ -168,7 +168,7 @@ Found a vulnerability? Please report it privately rather than opening a public i
 
 | Tool | Description |
 |------|-------------|
-| `vault_read` | Read a file, returning content, metadata, and parsed YAML frontmatter |
+| `vault_read` | Read a file, returning content, metadata, and parsed YAML frontmatter; `heading` reads one section of a Markdown note, `outline` lists its headings |
 | `vault_batch_read` | Read multiple files in one call; handles missing files gracefully |
 | `vault_write` | Write a file with optional frontmatter merging; creates parent dirs; `overwrite: false` for create-only (never replaces, also under concurrent calls) |
 | `vault_request_upload_url` | Get a short-lived, single-use signed URL, then `POST` a file's raw bytes to it. For images and PDFs too large to send base64-encoded through `vault_write_binary`; the bytes never pass through the conversation. See [Signed uploads](#signed-uploads) |

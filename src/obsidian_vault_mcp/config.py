@@ -251,6 +251,8 @@ MAX_SEARCH_RESULTS = 50       # Max results per search
 DEFAULT_SEARCH_RESULTS = 20
 MAX_LIST_DEPTH = 5            # Max directory recursion depth
 CONTEXT_LINES = 2             # Default lines of context in search results
+MAX_HEADING_LENGTH = 1_000    # Max length of vault_read's heading, a path of headings included
+MAX_HEADING_MATCHES = 50      # Max matches vault_read lists for a heading that names several sections
 
 # Directories to never expose or modify
 EXCLUDED_DIRS = {".obsidian", ".trash", ".git", ".DS_Store"}

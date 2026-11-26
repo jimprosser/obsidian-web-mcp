@@ -15,6 +15,7 @@ from .config import (
     MAX_BATCH_SIZE,
     MAX_BINARY_SIZE,
     MAX_CONTENT_SIZE,
+    MAX_HEADING_LENGTH,
     MAX_LIST_DEPTH,
     MAX_SEARCH_RESULTS,
 )
@@ -31,6 +32,32 @@ class VaultReadInput(BaseModel):
         min_length=1,
         max_length=500,
     )
+    heading: str | None = Field(
+        default=None,
+        description=(
+            "Read one section, its subheadings included: the heading as written ('## Setup'), "
+            "its text alone ('Setup'), or a path from a parent ('# Guide > ## Setup')"
+        ),
+        max_length=MAX_HEADING_LENGTH,
+    )
+    outline: bool = Field(
+        default=False,
+        description="Return the note's headings, each with its line and its section's size, instead of its content",
+    )
+
+    @field_validator("heading")
+    @classmethod
+    def _blank_heading_is_no_heading(cls, value: str | None) -> str | None:
+        # Clients often send an unused optional string as "", which names no section.
+        return value or None
+
+    @model_validator(mode="after")
+    def _one_way_to_read(self) -> "VaultReadInput":
+        given = [name for name, on in (("heading", self.heading is not None), ("outline", self.outline)) if on]
+        if len(given) > 1:
+            joined = ", ".join(f"'{name}'" for name in given)
+            raise ValueError(f"Use only one of {joined}, not several")
+        return self
 
 
 class VaultWriteInput(BaseModel):
