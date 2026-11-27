@@ -222,13 +222,20 @@ from .models import (
 
 @mcp.tool(
     name="vault_read",
-    description="Read a file from the Obsidian vault, returning content, metadata, and parsed YAML frontmatter.",
+    description=(
+        "Read a file from the Obsidian vault, returning content, metadata, and parsed YAML frontmatter. "
+        "Pass heading to read one section of a Markdown note, its subheadings included: '## Setup', "
+        "'Setup' (at any level), or '# Guide > ## Setup' when it repeats. Set outline=true for the "
+        "note's headings instead of its content."
+    ),
     annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False},
 )
-def vault_read(path: str) -> str:
-    """Read a file from the vault."""
-    inp = VaultReadInput(path=path)
-    return run_audited("vault_read", lambda: _vault_read(inp.path), path=inp.path)
+def vault_read(path: str, heading: str | None = None, outline: bool = False) -> str:
+    """Read a file from the vault, or one section of it."""
+    inp = VaultReadInput(path=path, heading=heading, outline=outline)
+    return run_audited(
+        "vault_read", lambda: _vault_read(inp.path, inp.heading, inp.outline), path=inp.path,
+    )
 
 
 @mcp.tool(

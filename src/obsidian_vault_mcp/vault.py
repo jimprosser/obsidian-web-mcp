@@ -2,14 +2,17 @@
 
 import fnmatch
 import os
+import re
 import shutil
 import stat
 import tempfile
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
 from . import config
 from .content_extractors import apply_content_extractors
+from .frontmatter_io import _is_fence
 
 
 def _publish_mode(target: Path, tmp_fd: int) -> None:
@@ -407,3 +410,247 @@ def list_directory(
 
     _walk(root, 1)
     return results
+
+
+# --- Headings and sections of a Markdown note ---
+#
+# One reading of a note's headings, for everything that addresses part of a note by
+# its heading: vault_read's heading and outline, and heading-scoped edits after them
+# (#109). The rule is the one from the #109 review:
+#
+# - An ATX heading is 1 to 6 '#' after at most three spaces, then a space, a tab or
+#   the end of the line. A closing run of '#' is dropped only after a space, so
+#   "## C#" keeps its '#'.
+# - Fenced code (``` or ~~~, closed by the same character repeated at least as many
+#   times, with nothing after it but spaces) and the leading frontmatter hold no
+#   headings. An unclosed fence runs to the end of the note; an opening '---' with no
+#   closing line is not frontmatter.
+# - A setext heading, a '===' (level 1) or '---' (level 2) line under a paragraph,
+#   ends a section but is not a heading to read: it is not in the outline. Under a
+#   list item, a block quote or a table, such a line is a thematic break instead.
+# - Lines are split on '\n' only: str.splitlines() also splits on U+2028, form feed
+#   and a few others, which would put a heading where Obsidian shows none. A CRLF
+#   line's '\r' is ignored for matching and kept in the content.
+
+_BOM = "\ufeff"
+# Every pattern here is anchored and can't backtrack over a run of whitespace, so a line
+# is read in time linear in its length: a note is untrusted input, and Python's re
+# backtracks, so a pattern like "(.*?)[ \t]*" takes time quadratic in a crafted line.
+_ATX_OPENING = re.compile(r" {0,3}(#{1,6})(?=[ \t]|$)")
+# A fence may open on a list item's own line ("- ```bash"); its closer is then indented
+# like the item's content, so the closer's indent is counted from the opening fence.
+_FENCE_OPEN = re.compile(r"( {0,3}(?:(?:[-+*]|\d{1,9}[.)])[ \t]+)?)(`{3,}|~{3,})(.*)")
+_FENCE_CLOSE = re.compile(r"( *)(`{3,}|~{3,})[ \t]*")
+_SETEXT_UNDERLINE = re.compile(r" {0,3}(?:=+|-+)[ \t]*")
+_THEMATIC_BREAK = re.compile(r" {0,3}(?:(?:\*[ \t]*){3,}|(?:-[ \t]*){3,}|(?:_[ \t]*){3,})")
+_LIST_OR_QUOTE = re.compile(r" {0,3}(?:(?:[-+*]|\d{1,9}[.)])(?:[ \t]|$)|>)")
+_TABLE_CELL = re.compile(r":?-+:?")
+_ESCAPED = re.compile(r"\\.")
+_INDENTED_CODE = re.compile(r"(?: {4}|\t| {1,3}\t)")
+
+
+@dataclass(frozen=True)
+class MarkdownSection:
+    """An ATX heading and the section it opens.
+
+    ``line`` and ``end_line`` are 1-based and inclusive, counted from the file's first
+    line, frontmatter included, as ``grep -n`` counts them. ``start`` and ``end`` are
+    character offsets: ``content[start:end]`` is the section from its heading line through
+    the line before the next heading of the same or a higher level (or the end of the
+    note), newline included, subsections included. ``heading`` is the line as written,
+    without its indentation or trailing whitespace; ``path`` is the headings of the
+    sections it sits in, outermost first, then its own.
+    """
+
+    line: int
+    end_line: int
+    level: int
+    heading: str
+    path: tuple[str, ...]
+    start: int
+    end: int
+
+
+def parse_atx_heading(line: str) -> tuple[int, str] | None:
+    """Return (level, text) for an ATX heading line, or None if the line isn't one.
+
+    ``text`` is the heading as Obsidian shows it: no '#' markers, no closing run of
+    '#', no surrounding spaces.
+    """
+    match = _ATX_OPENING.match(line)
+    if match is None:
+        return None
+    text = line[match.end():].strip(" \t")
+    # A closing run of '#' counts only when a space comes before it, or it is all there is.
+    before = text.rstrip("#")
+    if before != text and (not before or before[-1] in " \t"):
+        text = before.rstrip(" \t")
+    return len(match.group(1)), text
+
+
+def _table_cells(row: str) -> list[str]:
+    # An escaped pipe ("\|", as in a wiki link's alias, [[note\|alias]]) is part of a cell, not a border.
+    row = _ESCAPED.sub("..", row.strip(" \t"))
+    return row.removeprefix("|").removesuffix("|").split("|")
+
+
+def _is_table_delimiter(line: str, header: str) -> bool:
+    """A table's delimiter row under its header: cells of '-', each with an optional ':' at
+    either end, split by '|', as many as the header has; with another count it is no table."""
+    if "|" not in line:
+        return False
+    cells = _table_cells(line)
+    return len(cells) == len(_table_cells(header)) and all(
+        _TABLE_CELL.fullmatch(cell.strip(" \t")) for cell in cells
+    )
+
+
+def _frontmatter_end(lines: list[str]) -> int:
+    """Index of the first line after the leading frontmatter, or 0 when there is none."""
+    if lines and _is_fence(lines[0].removeprefix(_BOM)):
+        for index in range(1, len(lines)):
+            if _is_fence(lines[index]):
+                return index + 1
+    return 0
+
+
+def markdown_lines(content: str) -> list[str]:
+    """The note's lines, split on '\\n' only, without their newlines.
+
+    A last line with no newline counts; the empty piece after a final newline doesn't.
+    """
+    lines = content.split("\n")
+    if lines[-1] == "":
+        lines.pop()
+    return lines
+
+
+def markdown_sections(content: str) -> list[MarkdownSection]:
+    """Every ATX heading of a Markdown note, in order, with the section it opens."""
+    lines = markdown_lines(content)
+    offsets = [0]
+    for line in lines:
+        offsets.append(offsets[-1] + len(line) + 1)
+    offsets[-1] = len(content)  # the last line may have no newline
+
+    # (line index, level, heading as written); None for a setext heading, which ends
+    # sections but opens none.
+    marks: list[tuple[int, int, str | None]] = []
+    fence: tuple[str, int, int] | None = None  # the open fence's character, length, closer's indent
+    block = None  # None, "paragraph", or "other": a list item, block quote or table
+    paragraph_start = 0
+    for index in range(_frontmatter_end(lines), len(lines)):
+        line = lines[index].removesuffix("\r")
+        if index == 0:
+            line = line.removeprefix(_BOM)
+        if fence is not None:
+            close = _FENCE_CLOSE.fullmatch(line)
+            if (
+                close and len(close.group(1)) <= fence[2]
+                and close.group(2)[0] == fence[0] and len(close.group(2)) >= fence[1]
+            ):
+                fence = None
+            continue
+        opening = _FENCE_OPEN.fullmatch(line)
+        if opening and not (opening.group(2)[0] == "`" and "`" in opening.group(3)):
+            in_item = opening.group(1).strip(" \t") != ""
+            fence = (opening.group(2)[0], len(opening.group(2)), len(opening.group(1)) + 3 if in_item else 3)
+            block = None
+            continue
+        if not line.strip(" \t"):
+            block = None
+            continue
+        atx = parse_atx_heading(line)
+        if atx is not None:
+            marks.append((index, atx[0], line.strip(" \t")))
+            block = None
+        elif block == "paragraph" and _SETEXT_UNDERLINE.fullmatch(line):
+            marks.append((paragraph_start, 1 if "=" in line else 2, None))
+            block = None
+        elif _THEMATIC_BREAK.fullmatch(line):
+            block = None
+        elif _LIST_OR_QUOTE.match(line) or (
+            block == "paragraph" and _is_table_delimiter(line, lines[index - 1].removesuffix("\r"))
+        ):
+            block = "other"
+        elif block is None and not _INDENTED_CODE.match(line):
+            block = "paragraph"
+            paragraph_start = index
+
+    # One pass over the marks: a mark closes every open section of the same or a deeper
+    # level, so each section's end is known when the next such mark comes, and the open
+    # ones, at most six deep, are the path of the next heading.
+    ends: dict[int, int] = {}
+    paths: dict[int, tuple[str, ...]] = {}
+    open_marks: list[int] = []
+    for position, (index, level, heading) in enumerate(marks):
+        while open_marks and marks[open_marks[-1]][1] >= level:
+            ends[open_marks.pop()] = index
+        if heading is not None:
+            paths[position] = tuple(marks[open_][2] for open_ in open_marks) + (heading,)
+            open_marks.append(position)
+
+    sections = []
+    for position, (index, level, heading) in enumerate(marks):
+        if heading is None:
+            continue
+        end = ends.get(position, len(lines))
+        sections.append(MarkdownSection(
+            line=index + 1, end_line=end, level=level, heading=heading, path=paths[position],
+            start=offsets[index], end=offsets[end],
+        ))
+    return sections
+
+
+def heading_key(heading: str) -> tuple[int, str]:
+    """What a heading line is matched on: its level, and its text stripped of any whitespace,
+    as the input model strips what a caller sends (a trailing no-break space included). The
+    line is stripped before it is parsed, so a closing run of '#' before such a space is cut."""
+    level, text = parse_atx_heading(heading.strip())
+    return level, text.strip()
+
+
+def _wanted(part: str) -> tuple[int | None, str]:
+    part = part.strip()
+    atx = parse_atx_heading(part)
+    return (atx[0], atx[1].strip()) if atx is not None else (None, part)
+
+
+def find_sections(sections: list[MarkdownSection], heading: str) -> list[MarkdownSection]:
+    """The sections that ``heading`` names, in note order.
+
+    ``heading`` is a heading as written ("## Setup": that level and text), its text
+    alone ("Setup": that text at any level), or a path from a parent heading, its parts
+    joined by " > " ("# Guide > ## Setup"), each part either way and each inside the one
+    before, at any depth. A heading whose own text holds " > " is tried whole first, so
+    one copied from the outline names itself. When a path matches several sections, the
+    ones whose full path it names level by level win over those it reaches by skipping
+    levels. Matching is a plain, case-sensitive comparison of strings.
+    """
+    keys: dict[int, tuple[int, str]] = {}  # each heading parsed once, however many paths hold it
+
+    def matches(wanted: tuple[int | None, str], written: str) -> bool:
+        key = keys.get(id(written))
+        if key is None:
+            key = keys[id(written)] = heading_key(written)
+        return key[1] == wanted[1] and wanted[0] in (None, key[0])
+
+    if " > " in heading:
+        literal = _wanted(heading)
+        whole = [s for s in sections if matches(literal, s.heading)]
+        if whole:
+            return whole
+
+    wanted = [_wanted(part) for part in heading.split(" > ")]
+    *outer, own = wanted
+
+    def inside(path: tuple[str, ...]) -> bool:
+        parents = iter(path)
+        return all(any(matches(part, parent) for parent in parents) for part in outer)
+
+    found = [s for s in sections if matches(own, s.heading) and inside(s.path[:-1])]
+    if len(found) > 1 and outer:
+        exact = [s for s in found if len(s.path) == len(wanted) and all(map(matches, wanted, s.path))]
+        if exact:
+            return exact
+    return found
